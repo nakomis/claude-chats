@@ -2,15 +2,15 @@
 
 Records Claude Code conversations to PostgreSQL with vector embeddings for semantic search, exposed via an MCP server.
 
-At the end of every Claude Code session, a hook fires and saves the full transcript to Postgres. Each message is embedded using your chosen provider so the MCP tools can do similarity search across all past conversations.
+A hook fires on every user message and again at session end, saving new messages to Postgres incrementally. Each message is embedded using your chosen provider so the MCP tools can do similarity search across all past conversations.
 
 ## How it works
 
 ```
-Claude Code session ends
+User sends a message / session ends
         │
         ▼
-  Stop hook fires
+  Hook fires (UserPromptSubmit + Stop)
   (hook/record.py)
         │
         ├─ reads ~/.claude/projects/.../conversations/*.jsonl
