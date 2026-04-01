@@ -205,7 +205,7 @@ case "$PROVIDER" in
         ;;
 esac
 
-claude mcp add conversation-memory "${MCP_ENV_ARGS[@]}" -- "${MCP_CMD_ARGS[@]}"
+claude mcp add conversation-memory --scope user "${MCP_ENV_ARGS[@]}" -- "${MCP_CMD_ARGS[@]}"
 ok "MCP 'conversation-memory' registered"
 
 # ---------------------------------------------------------------------------
