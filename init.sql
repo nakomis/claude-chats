@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     started_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Idempotent upgrade: add columns introduced after initial release
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS name TEXT;
+
 CREATE INDEX IF NOT EXISTS conversations_project_path_idx ON conversations (project_path);
 CREATE INDEX IF NOT EXISTS conversations_started_at_idx   ON conversations (started_at DESC);
 
