@@ -1,8 +1,10 @@
 """
 Claude Code Stop hook.
 
-Reads the session transcript, embeds any new messages via Ollama, and persists
-them to PostgreSQL.  Always exits 0 so Claude is never blocked from stopping.
+Reads the session transcript, embeds any new messages, and persists them to
+PostgreSQL.  Always exits 0 so Claude is never blocked from stopping.
+
+Embedding provider is configured via CLAUDE_CHATS_PROVIDER — see embed.py.
 """
 
 import json
@@ -10,31 +12,16 @@ import os
 import sys
 from datetime import datetime, timezone
 
-import httpx
 import psycopg
 
-OLLAMA_BASE  = os.environ.get("OLLAMA_BASE_URL",      "http://localhost:11434")
-EMBED_MODEL  = os.environ.get("CLAUDE_CHATS_MODEL",   "mxbai-embed-large")
-DB_URL       = os.environ.get("CLAUDE_CHATS_DB_URL",  "postgresql://claude:claude@localhost:5433/claude_chats")
+from hook.embed import get_embedding
+
+DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _embed(text: str) -> list[float] | None:
-    """Return a 1024-dimensional embedding from Ollama, or None on failure."""
-    try:
-        r = httpx.post(
-            f"{OLLAMA_BASE}/api/embeddings",
-            json={"model": EMBED_MODEL, "prompt": text[:8192]},
-            timeout=60.0,
-        )
-        r.raise_for_status()
-        return r.json()["embedding"]
-    except Exception:
-        return None
-
 
 def _vec_str(embedding: list[float]) -> str:
     """Format a Python list as a PostgreSQL vector literal '[x,y,…]'."""
@@ -44,9 +31,8 @@ def _vec_str(embedding: list[float]) -> str:
 def _extract_text(content) -> str:
     """Extract plain text from a message content value.
 
-    Content may be:
-    - a plain string
-    - a list of content blocks (text / tool_use / tool_result / …)
+    Content may be a plain string or a list of content blocks
+    (text / tool_use / tool_result / …).
     """
     if isinstance(content, str):
         return content.strip()
@@ -59,7 +45,6 @@ def _extract_text(content) -> str:
             if btype == "text":
                 parts.append(block.get("text", ""))
             elif btype == "tool_result":
-                # Include tool result text so searches can find it
                 inner = block.get("content", "")
                 if isinstance(inner, str):
                     parts.append(inner)
@@ -97,7 +82,6 @@ def main() -> None:  # noqa: C901
     except Exception:
         sys.exit(0)
 
-    # Keep only entries that represent actual user/assistant turns
     messages = [
         e for e in entries
         if isinstance(e.get("message"), dict)
@@ -110,7 +94,6 @@ def main() -> None:  # noqa: C901
     try:
         with psycopg.connect(DB_URL, autocommit=False) as conn:
             with conn.cursor() as cur:
-                # Upsert the conversation row
                 cur.execute(
                     """
                     INSERT INTO conversations (session_id, project_path, git_branch)
@@ -125,7 +108,6 @@ def main() -> None:  # noqa: C901
                 )
                 conv_id = cur.fetchone()[0]
 
-                # Which message UUIDs are already stored?
                 cur.execute(
                     "SELECT message_uuid FROM messages WHERE conversation_id = %s",
                     (conv_id,),
@@ -152,7 +134,10 @@ def main() -> None:  # noqa: C901
                         else datetime.now(timezone.utc)
                     )
 
-                    embedding = _embed(content)
+                    try:
+                        embedding = get_embedding(content)
+                    except Exception:
+                        embedding = None
 
                     if embedding:
                         cur.execute(
@@ -181,7 +166,6 @@ def main() -> None:  # noqa: C901
                 conn.commit()
 
     except Exception:
-        # Never block Claude from stopping because of our errors
         pass
 
     sys.exit(0)

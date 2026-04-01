@@ -3,17 +3,18 @@ Conversation Memory MCP server.
 
 Provides semantic search and retrieval over Claude Code conversations that
 have been recorded by the Stop hook.
+
+Embedding provider is configured via CLAUDE_CHATS_PROVIDER — see embed.py.
 """
 
 import os
 
-import httpx
 import psycopg
 from mcp.server.fastmcp import FastMCP
 
-OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL",     "http://localhost:11434")
-EMBED_MODEL = os.environ.get("CLAUDE_CHATS_MODEL",  "mxbai-embed-large")
-DB_URL      = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
+from conversation_memory_mcp.embed import get_embedding
+
+DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
 
 CONTEXT_WINDOW = 2  # messages either side of a search hit
 
@@ -23,16 +24,6 @@ mcp = FastMCP("conversation-memory")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _embed(text: str) -> list[float]:
-    r = httpx.post(
-        f"{OLLAMA_BASE}/api/embeddings",
-        json={"model": EMBED_MODEL, "prompt": text[:8192]},
-        timeout=60.0,
-    )
-    r.raise_for_status()
-    return r.json()["embedding"]
-
 
 def _vec(embedding: list[float]) -> str:
     return "[" + ",".join(str(v) for v in embedding) + "]"
@@ -63,7 +54,7 @@ def search_memory(
         limit:        Number of results to return (default 5).
         project_path: If supplied, restrict results to that project directory.
     """
-    vec = _vec(_embed(query))
+    vec = _vec(get_embedding(query, for_query=True))
 
     with _conn() as conn:
         with conn.cursor() as cur:
