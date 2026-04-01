@@ -235,7 +235,7 @@ if [[ ! -f "$SETTINGS_FILE" ]]; then
 fi
 
 if grep -qF "record-conversation" "$SETTINGS_FILE" 2>/dev/null; then
-    ok "Stop hook already present in ${SETTINGS_FILE} — skipping"
+    ok "Hooks already present in ${SETTINGS_FILE} — skipping"
 else
     python3 - "$SETTINGS_FILE" "$HOOK_CMD" <<PYEOF
 import json, sys
@@ -253,14 +253,14 @@ hook_entry = {
 hook_group = {"matcher": "", "hooks": [hook_entry]}
 
 hooks = data.setdefault("hooks", {})
-stop  = hooks.setdefault("Stop", [])
-stop.append(hook_group)
+hooks.setdefault("Stop", []).append(hook_group)
+hooks.setdefault("UserPromptSubmit", []).append(hook_group)
 
 with open(settings_path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PYEOF
-    ok "Stop hook appended to ${SETTINGS_FILE}"
+    ok "Stop + UserPromptSubmit hooks appended to ${SETTINGS_FILE}"
 fi
 
 # ---------------------------------------------------------------------------
