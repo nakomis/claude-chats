@@ -41,8 +41,10 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOK_CMD="uv run --project \"${REPO_DIR}/hook\" record-conversation"
-MCP_CMD="uv run --project \"${REPO_DIR}/mcp\" conversation-memory-mcp"
+_SSL_PREFIX=""
+[[ -n "${SSL_CERT_FILE:-}" ]] && _SSL_PREFIX="SSL_CERT_FILE=${SSL_CERT_FILE} "
+HOOK_CMD="${_SSL_PREFIX}uv run --project \"${REPO_DIR}/hook\" record-conversation"
+MCP_CMD_ARGS=(uv run --project "${REPO_DIR}/mcp" conversation-memory-mcp)
 
 PROVIDER="${CLAUDE_CHATS_PROVIDER:-ollama}"
 DIMENSIONS="${CLAUDE_CHATS_DIMENSIONS:-1024}"
@@ -186,6 +188,9 @@ MCP_ENV_ARGS=(
     --env "CLAUDE_CHATS_DIMENSIONS=${DIMENSIONS}"
 )
 
+# Propagate SSL_CERT_FILE if set — needed on networks with TLS inspection
+[[ -n "${SSL_CERT_FILE:-}" ]] && MCP_ENV_ARGS+=(--env "SSL_CERT_FILE=${SSL_CERT_FILE}")
+
 case "$PROVIDER" in
     ollama)
         MCP_ENV_ARGS+=(--env "OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}")
@@ -200,7 +205,7 @@ case "$PROVIDER" in
         ;;
 esac
 
-claude mcp add conversation-memory "${MCP_ENV_ARGS[@]}" -- $MCP_CMD
+claude mcp add conversation-memory "${MCP_ENV_ARGS[@]}" -- "${MCP_CMD_ARGS[@]}"
 ok "MCP 'conversation-memory' registered"
 
 # ---------------------------------------------------------------------------
@@ -232,16 +237,17 @@ fi
 if grep -qF "record-conversation" "$SETTINGS_FILE" 2>/dev/null; then
     ok "Stop hook already present in ${SETTINGS_FILE} — skipping"
 else
-    python3 - "$SETTINGS_FILE" <<PYEOF
+    python3 - "$SETTINGS_FILE" "$HOOK_CMD" <<PYEOF
 import json, sys
 
 settings_path = sys.argv[1]
+hook_cmd = sys.argv[2]
 with open(settings_path) as f:
     data = json.load(f)
 
 hook_entry = {
     "type": "command",
-    "command": "${HOOK_CMD}",
+    "command": hook_cmd,
     "timeout": 120,
 }
 hook_group = {"matcher": "", "hooks": [hook_entry]}

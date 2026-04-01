@@ -38,7 +38,11 @@ def get_embedding(text: str, *, for_query: bool = False) -> list[float]:
                    distinguishes between document and query inputs (Cohere on
                    Bedrock).  Ignored by Ollama, Titan, and OpenAI.
     """
-    text = text[:8192]
+    # mxbai-embed-large has a 512-token context; dense content (file paths etc.)
+    # tokenizes at ~2 chars/token, so cap at 1000 chars to stay safely under.
+    # OpenAI 3-series supports up to 8192 tokens, so 8192 chars is fine there.
+    max_chars = 800 if PROVIDER == "ollama" else 8192
+    text = text[:max_chars]
     if PROVIDER == "ollama":
         return _ollama(text)
     if PROVIDER == "bedrock":
