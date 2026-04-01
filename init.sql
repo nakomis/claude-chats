@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     session_id  TEXT        NOT NULL UNIQUE,
     project_path TEXT       NOT NULL DEFAULT '',
     git_branch  TEXT        NOT NULL DEFAULT '',
+    name        TEXT,
     started_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
