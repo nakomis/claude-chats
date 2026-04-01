@@ -134,14 +134,14 @@ def get_conversation(
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, project_path, git_branch, started_at FROM conversations WHERE session_id = %s",
+                "SELECT id, project_path, git_branch, started_at, name FROM conversations WHERE session_id = %s",
                 (session_id,),
             )
             row = cur.fetchone()
             if not row:
                 return {"error": f"No conversation found for session_id '{session_id}'"}
 
-            conv_id, project_path, git_branch, started_at = row
+            conv_id, project_path, git_branch, started_at, name = row
 
             cur.execute(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = %s",
@@ -173,6 +173,7 @@ def get_conversation(
 
             return {
                 "session_id":    session_id,
+                "name":          name,
                 "project_path":  project_path,
                 "git_branch":    git_branch,
                 "started_at":    str(started_at),
@@ -197,6 +198,7 @@ def list_recent_sessions(
         with conn.cursor() as cur:
             sql = """
                 SELECT   c.session_id, c.project_path, c.git_branch, c.started_at,
+                         c.name,
                          COUNT(m.id)       AS message_count,
                          MAX(m.created_at) AS last_message_at
                 FROM     conversations c
@@ -208,7 +210,7 @@ def list_recent_sessions(
                 sql += " WHERE c.project_path = %s"
                 params.append(project_path)
 
-            sql += " GROUP BY c.session_id, c.project_path, c.git_branch, c.started_at"
+            sql += " GROUP BY c.session_id, c.project_path, c.git_branch, c.started_at, c.name"
             sql += " ORDER BY c.started_at DESC LIMIT %s"
             params.append(limit)
 
@@ -217,13 +219,14 @@ def list_recent_sessions(
             return [
                 {
                     "session_id":     sid,
+                    "name":           name,
                     "project_path":   pp,
                     "git_branch":     gb,
                     "started_at":     str(sa),
                     "message_count":  mc,
                     "last_message_at": str(lm) if lm else None,
                 }
-                for sid, pp, gb, sa, mc, lm in cur.fetchall()
+                for sid, pp, gb, sa, name, mc, lm in cur.fetchall()
             ]
 
 

@@ -88,7 +88,23 @@ def main() -> None:  # noqa: C901
         and e["message"].get("role") in ("user", "assistant")
     ]
 
-    if not messages:
+    # Extract the most recent /rename value if present
+    name: str | None = None
+    for entry in reversed(entries):
+        content = entry.get("content", "")
+        if (
+            entry.get("type") == "system"
+            and entry.get("subtype") == "local_command"
+            and isinstance(content, str)
+            and "<command-name>/rename</command-name>" in content
+        ):
+            args_start = content.find("<command-args>") + len("<command-args>")
+            args_end = content.find("</command-args>")
+            if args_start > -1 and args_end > -1:
+                name = content[args_start:args_end].strip() or None
+            break
+
+    if not messages and name is None:
         sys.exit(0)
 
     try:
@@ -102,6 +118,11 @@ def main() -> None:  # noqa: C901
                     """,
                     (session_id, cwd, git_branch),
                 )
+                if name:
+                    cur.execute(
+                        "UPDATE conversations SET name = %s WHERE session_id = %s",
+                        (name, session_id),
+                    )
                 cur.execute(
                     "SELECT id FROM conversations WHERE session_id = %s",
                     (session_id,),
