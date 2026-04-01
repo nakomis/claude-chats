@@ -216,28 +216,11 @@ step "Configuring Stop hook in ~/.claude/settings.json"
 SETTINGS_FILE="${HOME}/.claude/settings.json"
 mkdir -p "$(dirname "$SETTINGS_FILE")"
 
-# Build env overrides to bake into the hook command environment.
-# The hook inherits the shell environment at the time Claude Code fires it,
-# but explicit env vars in settings.json ensure they survive shell restarts.
-HOOK_ENV_JSON=$(python3 - <<PYEOF
-import json
-env = {
-    "CLAUDE_CHATS_DB_URL":    "postgresql://claude:claude@localhost:5433/claude_chats",
-    "CLAUDE_CHATS_PROVIDER":  "${PROVIDER}",
-    "CLAUDE_CHATS_MODEL":     "${MODEL}",
-    "CLAUDE_CHATS_DIMENSIONS":"${DIMENSIONS}",
-}
-PYEOF
-)
-
 if [[ ! -f "$SETTINGS_FILE" ]]; then
-    echo '{"hooks":{"Stop":[]}}' > "$SETTINGS_FILE"
+    echo '{}' > "$SETTINGS_FILE"
 fi
 
-if grep -qF "record-conversation" "$SETTINGS_FILE" 2>/dev/null; then
-    ok "Hooks already present in ${SETTINGS_FILE} — skipping"
-else
-    python3 - "$SETTINGS_FILE" "$HOOK_CMD" <<PYEOF
+python3 - "$SETTINGS_FILE" "$HOOK_CMD" <<'PYEOF'
 import json, sys
 
 settings_path = sys.argv[1]
@@ -253,15 +236,25 @@ hook_entry = {
 hook_group = {"matcher": "", "hooks": [hook_entry]}
 
 hooks = data.setdefault("hooks", {})
-hooks.setdefault("Stop", []).append(hook_group)
-hooks.setdefault("UserPromptSubmit", []).append(hook_group)
+
+# Remove any stale record-conversation entries so re-runs stay idempotent
+for event in ("Stop", "UserPromptSubmit"):
+    existing = hooks.get(event, [])
+    cleaned = [
+        g for g in existing
+        if not any(
+            isinstance(h, dict) and "record-conversation" in h.get("command", "")
+            for h in g.get("hooks", [])
+        )
+    ]
+    cleaned.append(hook_group)
+    hooks[event] = cleaned
 
 with open(settings_path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PYEOF
-    ok "Stop + UserPromptSubmit hooks appended to ${SETTINGS_FILE}"
-fi
+ok "Stop + UserPromptSubmit hooks updated in ${SETTINGS_FILE}"
 
 # ---------------------------------------------------------------------------
 # Done
