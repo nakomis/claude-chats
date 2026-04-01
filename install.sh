@@ -176,10 +176,9 @@ ok "MCP deps installed"
 # ---------------------------------------------------------------------------
 step "Registering MCP server with Claude Code"
 
-# Always re-register so env vars stay current
-if claude mcp list 2>/dev/null | grep -q 'conversation-memory'; then
-    claude mcp remove conversation-memory 2>/dev/null || true
-fi
+# Always re-register so env vars stay current — remove from all scopes to avoid stale entries
+claude mcp remove conversation-memory --scope user  2>/dev/null || true
+claude mcp remove conversation-memory --scope local 2>/dev/null || true
 
 MCP_ENV_ARGS=(
     --env "CLAUDE_CHATS_DB_URL=postgresql://claude:claude@localhost:5433/claude_chats"
