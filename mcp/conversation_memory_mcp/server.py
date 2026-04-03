@@ -49,8 +49,25 @@ def search_memory(
     so you can understand what was being discussed.  Useful for recovering
     context lost to compaction, or for finding how a problem was solved before.
 
+    Search strategy — HyDE (Hypothetical Document Embeddings):
+        A bare keyword query ("umbrella", "climatology") often scores poorly
+        because the indexed messages use natural conversational language.
+        For best results, write the query as a short hypothetical sentence or
+        exchange that *would appear* in the conversation you're looking for,
+        e.g. "It's raining, should I bring an umbrella?" rather than just
+        "umbrella".  This is especially important when:
+
+        - A first keyword search returns no results, OR
+        - The user insists that 'we' discussed something or says they are sure
+          the conversation happened.
+
+        In those cases, you MUST ask the user for any keywords or extra context
+        they can recall BEFORE retrying — do not guess at a HyDE sentence
+        without that input.  Once you have their keywords, construct a HyDE
+        sentence from that detail and then call this tool again.
+
     Args:
-        query:        Natural-language description of what you are looking for.
+        query:        Natural-language description or HyDE sentence for what you are looking for.
         limit:        Number of results to return (default 5).
         project_path: If supplied, restrict results to that project directory.
     """
