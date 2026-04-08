@@ -4,6 +4,12 @@ Records Claude Code conversations to PostgreSQL with vector embeddings for seman
 
 A hook fires on every user message and again at session end, saving new messages to Postgres incrementally. Each message is embedded using your chosen provider so the MCP tools can do similarity search across all past conversations.
 
+## Support
+
+If you find this useful, please consider buying me a coffee:
+
+[![Donate with PayPal](https://www.paypalobjects.com/en_GB/i/btn/btn_donate_SM.gif)](https://www.paypal.com/donate?hosted_button_id=Q3BESC73EWVNN)
+
 ## How it works
 
 ```
@@ -117,3 +123,9 @@ Note: HyDE is most beneficial when using a model with a long context window. Wit
 ```bash
 ollama pull nomic-embed-text
 ```
+
+## Support
+
+If you find this useful, please consider buying me a coffee:
+
+[![Donate with PayPal](https://www.paypalobjects.com/en_GB/i/btn/btn_donate_SM.gif)](https://www.paypal.com/donate?hosted_button_id=Q3BESC73EWVNN)
