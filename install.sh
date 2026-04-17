@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# install.sh — set up claude-chats on a new machine
+# install.sh — set up claude-chats in single-machine mode
+#
+# Everything (PostgreSQL, Ollama, hook, MCP) runs on this machine.
+# For client-server mode (offload DB/Ollama to a second machine), see:
+#   server/install.sh   — run on the server
+#   install-client.sh   — run on this machine instead of this script
 #
 # What this script does:
 #   1. Checks prerequisites (docker, docker compose, uv, claude, python 3.11+)
@@ -125,7 +130,7 @@ esac
 # ---------------------------------------------------------------------------
 step "Starting PostgreSQL container"
 
-cd "$REPO_DIR"
+cd "${REPO_DIR}/server"
 
 if docker ps --format '{{.Names}}' | grep -q '^claude-chats-db$'; then
     ok "Container 'claude-chats-db' already running"
@@ -269,5 +274,6 @@ echo "  Hook         : fires on every Claude Code session stop"
 echo "  MCP tools    : search_memory · get_conversation · list_recent_sessions"
 echo ""
 echo "  To switch provider, re-run with CLAUDE_CHATS_PROVIDER=bedrock|openai|ollama"
-echo "  To stop the database:  docker compose -f ${REPO_DIR}/docker-compose.yml down"
-echo "  To start it again:     docker compose -f ${REPO_DIR}/docker-compose.yml up -d"
+echo "  To stop the database:  docker compose -f ${REPO_DIR}/server/docker-compose.yml down"
+echo "  To start it again:     docker compose -f ${REPO_DIR}/server/docker-compose.yml up -d"
+echo "  For client-server:     see server/install.sh + install-client.sh"
