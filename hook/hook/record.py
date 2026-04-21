@@ -1,10 +1,12 @@
 """
 Claude Code Stop hook.
 
-Reads the session transcript, embeds any new messages, and persists them to
-PostgreSQL.  Always exits 0 so Claude is never blocked from stopping.
+Reads the session transcript and either embeds messages directly into
+PostgreSQL (local mode) or publishes them to an ActiveMQ queue for a
+remote worker to process (remote mode).
 
-Embedding provider is configured via CLAUDE_CHATS_PROVIDER — see embed.py.
+Mode is controlled by CLAUDE_CHATS_MODE (local|remote, default: local).
+Always exits 0 so Claude is never blocked from stopping.
 """
 
 import json
@@ -12,11 +14,12 @@ import os
 import sys
 from datetime import datetime, timezone
 
-import psycopg
-
-from hook.embed import get_embedding
-
-DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
+DB_URL     = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
+MODE       = os.environ.get("CLAUDE_CHATS_MODE", "local")
+QUEUE_URL  = os.environ.get("CLAUDE_CHATS_QUEUE_URL", "stomp://localhost:61613")
+QUEUE_NAME = os.environ.get("CLAUDE_CHATS_QUEUE_NAME", "claude-chats-messages")
+QUEUE_USER = os.environ.get("CLAUDE_CHATS_QUEUE_USER", "admin")
+QUEUE_PASS = os.environ.get("CLAUDE_CHATS_QUEUE_PASS", "admin")
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +27,6 @@ DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@local
 # ---------------------------------------------------------------------------
 
 def _vec_str(embedding: list[float]) -> str:
-    """Format a Python list as a PostgreSQL vector literal '[x,y,…]'."""
     return "[" + ",".join(str(v) for v in embedding) + "]"
 
 
@@ -54,6 +56,28 @@ def _extract_text(content) -> str:
                             parts.append(ib.get("text", ""))
         return "\n".join(p for p in parts if p).strip()
     return ""
+
+
+def _parse_stomp_url(url: str) -> tuple[str, int]:
+    url = url.removeprefix("stomp://")
+    host, _, port = url.rpartition(":")
+    return host or "localhost", int(port or 61613)
+
+
+def _post_to_queue(payload: dict) -> None:
+    import stomp  # only needed in remote mode
+
+    host, port = _parse_stomp_url(QUEUE_URL)
+    conn = stomp.Connection([(host, port)])
+    conn.connect(QUEUE_USER, QUEUE_PASS, wait=True)
+    try:
+        conn.send(
+            destination=f"/queue/{QUEUE_NAME}",
+            body=json.dumps(payload),
+            headers={"content-type": "application/json"},
+        )
+    finally:
+        conn.disconnect()
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +131,46 @@ def main() -> None:  # noqa: C901
     if not messages and name is None:
         sys.exit(0)
 
+    # Build the normalised message list (used by both modes)
+    msg_list = []
+    for seq, entry in enumerate(messages):
+        msg_uuid = entry.get("uuid") or f"{session_id}:{seq}"
+        msg      = entry["message"]
+        role     = msg["role"]
+        text     = _extract_text(msg.get("content", ""))
+        if not text:
+            continue
+        ts_raw = entry.get("timestamp")
+        ts = datetime.fromisoformat(ts_raw) if ts_raw else datetime.now(timezone.utc)
+        msg_list.append({
+            "message_uuid": msg_uuid,
+            "role": role,
+            "content": text,
+            "created_at": ts.isoformat(),
+            "sequence_num": seq,
+        })
+
+    # ── Remote mode ──────────────────────────────────────────────────────────
+    if MODE == "remote":
+        if not msg_list and name is None:
+            sys.exit(0)
+        try:
+            _post_to_queue({
+                "session_id":   session_id,
+                "project_path": cwd,
+                "git_branch":   git_branch,
+                "started_at":   datetime.now(timezone.utc).isoformat(),
+                "name":         name,
+                "messages":     msg_list,
+            })
+        except Exception:
+            pass
+        sys.exit(0)
+
+    # ── Local mode ───────────────────────────────────────────────────────────
+    from hook.embed import get_embedding
+    import psycopg
+
     try:
         with psycopg.connect(DB_URL, autocommit=False) as conn:
             with conn.cursor() as cur:
@@ -135,28 +199,12 @@ def main() -> None:  # noqa: C901
                 )
                 stored = {row[0] for row in cur.fetchall()}
 
-                for seq, entry in enumerate(messages):
-                    msg_uuid = entry.get("uuid") or f"{session_id}:{seq}"
-
-                    if msg_uuid in stored:
+                for item in msg_list:
+                    if item["message_uuid"] in stored:
                         continue
-
-                    msg     = entry["message"]
-                    role    = msg["role"]
-                    content = _extract_text(msg.get("content", ""))
-
-                    if not content:
-                        continue
-
-                    ts_raw = entry.get("timestamp")
-                    ts = (
-                        datetime.fromisoformat(ts_raw)
-                        if ts_raw
-                        else datetime.now(timezone.utc)
-                    )
 
                     try:
-                        embedding = get_embedding(content)
+                        embedding = get_embedding(item["content"])
                     except Exception:
                         embedding = None
 
@@ -169,8 +217,8 @@ def main() -> None:  # noqa: C901
                             VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
                             ON CONFLICT (message_uuid) DO NOTHING
                             """,
-                            (conv_id, msg_uuid, role, content,
-                             _vec_str(embedding), ts, seq),
+                            (conv_id, item["message_uuid"], item["role"], item["content"],
+                             _vec_str(embedding), item["created_at"], item["sequence_num"]),
                         )
                     else:
                         cur.execute(
@@ -181,7 +229,8 @@ def main() -> None:  # noqa: C901
                             VALUES (%s, %s, %s, %s, %s, %s)
                             ON CONFLICT (message_uuid) DO NOTHING
                             """,
-                            (conv_id, msg_uuid, role, content, ts, seq),
+                            (conv_id, item["message_uuid"], item["role"], item["content"],
+                             item["created_at"], item["sequence_num"]),
                         )
 
                 conn.commit()

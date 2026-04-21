@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: claude-chats-db
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: claude_chats
+      POSTGRES_USER: claude
+      POSTGRES_PASSWORD: claude
+    volumes:
+      - ../init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U claude -d claude_chats"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  activemq:
+    profiles: ["server"]
+    image: apache/activemq-classic:latest
+    container_name: claude-chats-mq
+    restart: unless-stopped
+    ports:
+      - "61613:61613"
+      - "8161:8161"
+    volumes:
+      - mqdata:/var/lib/activemq/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8161/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backup:
+    profiles: ["server"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    container_name: claude-chats-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: claude
+      BUCKET_NAME: ${BUCKET_NAME}
+      AWS_DEFAULT_REGION: ${AWS_REGION}
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+
+volumes:
+  pgdata:
+  mqdata:

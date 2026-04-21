@@ -1,0 +1,23 @@
+{
+  "name": "claude-chats-worker",
+  "version": "0.1.0",
+  "description": "ActiveMQ → Ollama embed → PostgreSQL worker for claude-chats",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/worker.js",
+    "dev": "tsx src/worker.ts"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "pg": "^8.12.0",
+    "stompit": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "@types/stompit": "^0.9.6",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
