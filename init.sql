@@ -34,3 +34,8 @@ CREATE INDEX IF NOT EXISTS messages_sequence_num_idx    ON messages (conversatio
 CREATE INDEX IF NOT EXISTS messages_embedding_idx
     ON messages USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
+
+-- Full-text search: generated tsvector column + GIN index
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+CREATE INDEX IF NOT EXISTS messages_content_tsv_idx ON messages USING GIN (content_tsv);
