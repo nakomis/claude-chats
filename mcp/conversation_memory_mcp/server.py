@@ -42,62 +42,93 @@ def search_memory(
     query: str,
     limit: int = 5,
     project_path: str | None = None,
-) -> list[dict]:
-    """Semantically search previous Claude Code conversations.
+    mode: str = "hybrid",
+) -> dict:
+    """Search previous Claude Code conversations.
 
-    Returns the most relevant messages plus a few lines of surrounding context
-    so you can understand what was being discussed.  Useful for recovering
-    context lost to compaction, or for finding how a problem was solved before.
+    Returns the most relevant messages plus surrounding context.  Useful for
+    recovering context lost to compaction, or finding how a problem was solved.
 
-    Search strategy — HyDE (Hypothetical Document Embeddings):
-        A bare keyword query ("umbrella", "climatology") often scores poorly
-        because the indexed messages use natural conversational language.
-        For best results, write the query as a short hypothetical sentence or
-        exchange that *would appear* in the conversation you're looking for,
-        e.g. "It's raining, should I bring an umbrella?" rather than just
-        "umbrella".  This is especially important when:
+    Return value shape:
+        {
+          "status":   "ok" | "fallback" | "no_results",
+          "mode_used": "hybrid" | "semantic" | "fulltext",
+          "warning":  "<string>",   # only present when status != "ok"
+          "results":  [...]
+        }
 
-        - A first keyword search returns no results, OR
-        - The user insists that 'we' discussed something or says they are sure
-          the conversation happened.
+    Each result contains: session_id, project_path, role, sequence_num,
+    created_at, score, context (surrounding messages).
 
-        In those cases, you MUST ask the user for any keywords or extra context
-        they can recall BEFORE retrying — do not guess at a HyDE sentence
-        without that input.  Once you have their keywords, construct a HyDE
-        sentence from that detail and then call this tool again.
+    Modes:
+        "hybrid" (default)
+            Combines vector similarity with full-text search using Reciprocal
+            Rank Fusion.  Best overall — works for both fuzzy semantic recall
+            and exact phrase/keyword lookups.  Falls back to "fulltext" if the
+            embedding service is unavailable (check "status" in the response).
+
+        "semantic"
+            Vector-only search.  Use when describing a concept rather than
+            exact words, e.g. "the conversation about umbrella insurance".
+            Apply HyDE for best results: phrase the query as a short sentence
+            that *would appear* in the target conversation.
+            Returns an error result (no fallback) if embeddings are unavailable.
+
+        "fulltext"
+            PostgreSQL tsvector/tsquery only — no embedding call.  Use for
+            known exact phrases, function names, error messages, or quoted
+            strings.  Also reliable when Ollama is offline.
+            Supports websearch syntax: quote phrases, use OR, prefix - to exclude.
+
+    HyDE guidance (relevant for "semantic" and the semantic half of "hybrid"):
+        Bare keywords score poorly against conversational text.  Write the
+        query as a short hypothetical sentence that *would appear* in the
+        conversation, e.g. "It's raining, should I bring an umbrella?" rather
+        than "umbrella".  When a first search misses, ask Martin for any
+        extra keywords or context before retrying — do not guess.
 
     Args:
-        query:        Natural-language description or HyDE sentence for what you are looking for.
+        query:        Search string.  For "fulltext"/"hybrid", supports websearch
+                      syntax (quote phrases, OR, -exclude).  For "semantic",
+                      use a HyDE sentence for best results.
         limit:        Number of results to return (default 5).
         project_path: If supplied, restrict results to that project directory.
+        mode:         Search mode: "hybrid" (default), "semantic", or "fulltext".
     """
-    vec = _vec(get_embedding(query, for_query=True))
+    project_filter = "AND c.project_path = %s" if project_path else ""
+    candidates = limit * 10
+
+    warning: str | None = None
+    mode_used = mode
+    vec: str | None = None
+
+    if mode in ("hybrid", "semantic"):
+        try:
+            vec = _vec(get_embedding(query, for_query=True))
+        except Exception:
+            if mode == "hybrid":
+                mode_used = "fulltext"
+                warning = "Embedding service unavailable; fell back to full-text search."
+            else:
+                return {
+                    "status": "fallback",
+                    "mode_used": "none",
+                    "warning": "Embedding service unavailable and mode='semantic' — no results.",
+                    "results": [],
+                }
 
     with _conn() as conn:
         with conn.cursor() as cur:
-            base = """
-                SELECT m.id, m.conversation_id, c.session_id, c.project_path,
-                       m.role, m.content, m.sequence_num, m.created_at,
-                       1 - (m.embedding <=> %s::vector) AS similarity
-                FROM   messages m
-                JOIN   conversations c ON c.id = m.conversation_id
-                WHERE  m.embedding IS NOT NULL
-            """
-            params: list = [vec]
-
-            if project_path:
-                base += " AND c.project_path = %s"
-                params.append(project_path)
-
-            base += " ORDER BY m.embedding <=> %s::vector LIMIT %s"
-            params += [vec, limit]
-
-            cur.execute(base, params)
-            rows = cur.fetchall()
+            if mode_used == "semantic":
+                rows = _query_semantic(cur, vec, project_path, project_filter, limit)
+            elif mode_used == "fulltext":
+                rows = _query_fulltext(cur, query, project_path, project_filter, limit)
+            else:
+                rows = _query_hybrid(cur, vec, query, project_path, project_filter,
+                                     limit, candidates)
 
             results = []
-            for msg_id, conv_id, session_id, proj, role, content, seq, ts, sim in rows:
-                # Fetch surrounding messages for context
+            for msg_id, conv_id, session_id, proj, role, content, seq, ts, score in rows:
                 cur.execute(
                     """
                     SELECT role, content, sequence_num
@@ -117,18 +148,104 @@ def search_memory(
                     }
                     for r, c, s in cur.fetchall()
                 ]
-
                 results.append({
                     "session_id":   session_id,
                     "project_path": proj,
                     "role":         role,
                     "sequence_num": seq,
                     "created_at":   str(ts),
-                    "similarity":   round(float(sim), 4),
+                    "score":        round(float(score), 6),
                     "context":      context,
                 })
 
-            return results
+    out: dict = {
+        "status": "ok" if not warning else "fallback",
+        "mode_used": mode_used,
+        "results": results,
+    }
+    if warning:
+        out["warning"] = warning
+    return out
+
+
+def _query_semantic(cur, vec: str, project_path, project_filter: str, limit: int):
+    sql = f"""
+        SELECT m.id, m.conversation_id, c.session_id, c.project_path,
+               m.role, m.content, m.sequence_num, m.created_at,
+               1 - (m.embedding <=> %s::vector) AS score
+        FROM   messages m
+        JOIN   conversations c ON c.id = m.conversation_id
+        WHERE  m.embedding IS NOT NULL
+        {project_filter}
+        ORDER  BY m.embedding <=> %s::vector
+        LIMIT  %s
+    """
+    params = [vec, *(([project_path]) if project_path else []), vec, limit]
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def _query_fulltext(cur, query: str, project_path, project_filter: str, limit: int):
+    sql = f"""
+        SELECT m.id, m.conversation_id, c.session_id, c.project_path,
+               m.role, m.content, m.sequence_num, m.created_at,
+               ts_rank_cd(m.content_tsv, q) AS score
+        FROM   messages m
+        JOIN   conversations c ON c.id = m.conversation_id,
+               websearch_to_tsquery('english', %s) AS q
+        WHERE  m.content_tsv @@ q
+        {project_filter}
+        ORDER  BY score DESC
+        LIMIT  %s
+    """
+    params = [query, *(([project_path]) if project_path else []), limit]
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def _query_hybrid(cur, vec: str, query: str, project_path, project_filter: str,
+                  limit: int, candidates: int):
+    sql = f"""
+        WITH semantic AS (
+            SELECT m.id,
+                   ROW_NUMBER() OVER (ORDER BY m.embedding <=> %s::vector) AS rank
+            FROM   messages m
+            JOIN   conversations c ON c.id = m.conversation_id
+            WHERE  m.embedding IS NOT NULL
+            {project_filter}
+            ORDER  BY m.embedding <=> %s::vector
+            LIMIT  %s
+        ),
+        fulltext AS (
+            SELECT m.id,
+                   ROW_NUMBER() OVER (ORDER BY ts_rank_cd(m.content_tsv, q) DESC) AS rank
+            FROM   messages m
+            JOIN   conversations c ON c.id = m.conversation_id,
+                   websearch_to_tsquery('english', %s) AS q
+            WHERE  m.content_tsv @@ q
+            {project_filter}
+            ORDER  BY ts_rank_cd(m.content_tsv, q) DESC
+            LIMIT  %s
+        ),
+        rrf AS (
+            SELECT COALESCE(s.id, f.id) AS id,
+                   COALESCE(1.0 / (60 + s.rank), 0) +
+                   COALESCE(1.0 / (60 + f.rank), 0) AS score
+            FROM   semantic s
+            FULL OUTER JOIN fulltext f ON s.id = f.id
+        )
+        SELECT m.id, m.conversation_id, c.session_id, c.project_path,
+               m.role, m.content, m.sequence_num, m.created_at, r.score
+        FROM   rrf r
+        JOIN   messages m ON m.id = r.id
+        JOIN   conversations c ON c.id = m.conversation_id
+        ORDER  BY r.score DESC
+        LIMIT  %s
+    """
+    proj = ([project_path] if project_path else [])
+    params = [vec, *proj, vec, candidates, query, *proj, candidates, limit]
+    cur.execute(sql, params)
+    return cur.fetchall()
 
 
 @mcp.tool()
