@@ -30,10 +30,10 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_conversation_id_idx ON messages (conversation_id);
 CREATE INDEX IF NOT EXISTS messages_sequence_num_idx    ON messages (conversation_id, sequence_num);
 -- ivfflat index for approximate nearest-neighbour search (cosine distance)
--- lists=100 is a reasonable default; tune upward as the table grows
+-- lists=300 suits ~300k rows; tune upward (and REINDEX) as the table grows further
 CREATE INDEX IF NOT EXISTS messages_embedding_idx
     ON messages USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+    WITH (lists = 300);
 
 -- Full-text search: generated tsvector column + GIN index
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
