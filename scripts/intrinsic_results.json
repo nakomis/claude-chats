@@ -1,0 +1,58 @@
+{
+  "mxbai-embed-large": {
+    "recall@10": 0.4863,
+    "intra_sim": 0.6094,
+    "inter_sim": 0.4982,
+    "separation": 1.223,
+    "coverage": 29482
+  },
+  "nomic-embed-text:v1.5": {
+    "recall@10": 0.413,
+    "intra_sim": 0.5954,
+    "inter_sim": 0.5143,
+    "separation": 1.1577,
+    "coverage": 28690
+  },
+  "bge-m3": {
+    "recall@10": 0.4913,
+    "intra_sim": 0.5368,
+    "inter_sim": 0.434,
+    "separation": 1.2371,
+    "coverage": 29499
+  },
+  "bge-large": {
+    "recall@10": 0.4997,
+    "intra_sim": 0.6391,
+    "inter_sim": 0.5481,
+    "separation": 1.1661,
+    "coverage": 28413
+  },
+  "snowflake-arctic-embed:l": {
+    "recall@10": 0.4767,
+    "intra_sim": 0.6663,
+    "inter_sim": 0.596,
+    "separation": 1.118,
+    "coverage": 28413
+  },
+  "amazon.titan-embed-text-v2:0": {
+    "recall@10": 0.542,
+    "intra_sim": 0.2621,
+    "inter_sim": 0.1011,
+    "separation": 2.5927,
+    "coverage": 29499
+  },
+  "cohere.embed-english-v3": {
+    "recall@10": 0.4983,
+    "intra_sim": 0.38,
+    "inter_sim": 0.2454,
+    "separation": 1.5487,
+    "coverage": 27152
+  },
+  "cohere.embed-v4:0": {
+    "recall@10": 0.5093,
+    "intra_sim": 0.4101,
+    "inter_sim": 0.2619,
+    "separation": 1.5655,
+    "coverage": 29485
+  }
+}

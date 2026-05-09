@@ -87,6 +87,13 @@ def search_memory(
         than "umbrella".  When a first search misses, ask Martin for any
         extra keywords or context before retrying — do not guess.
 
+    Fallback when hybrid misses:
+        If hybrid search returns weak results for something Martin confirms
+        exists, retry with mode="fulltext" and a verbatim distinctive phrase
+        from that conversation (e.g. a specific error message, command, or
+        sentence).  Hybrid's semantic half fails when the query framing differs
+        from the actual wording; fulltext hits exact phrases regardless.
+
     Args:
         query:        Search string.  For "fulltext"/"hybrid", supports websearch
                       syntax (quote phrases, OR, -exclude).  For "semantic",

@@ -1,0 +1,225 @@
+[
+  {
+    "query": "how did I fix the LUKS encrypted volumes on Leia after reinstalling",
+    "relevant_ids": [
+      "fdc8d312-310f-4fe0-996d-3b9b4000fcd7",
+      "fcb1d7a2-7526-4266-888f-d097f6ed493d"
+    ]
+  },
+  {
+    "query": "Time Machine backup failing disconnected disk image on macOS",
+    "relevant_ids": [
+      "cbee3c1d-3432-4a6d-b639-77b50505c207",
+      "41f63a88-ad8b-457b-a998-09c5650fa702",
+      "a89a3cf4-e086-48c3-8a84-444e8c88f316",
+      "7e1a96c4-3704-405b-b31c-637d07ad8a35",
+      "e4e1a151-1f08-441f-af03-4aaa376a7860",
+      "782ebdd4-71f0-44df-b011-26e381edbc57",
+      "9c38a1a2-d83d-4bc7-9225-1ea6cd053cec"
+    ]
+  },
+  {
+    "query": "CDK backup stack S3 bucket setup for Taiga",
+    "relevant_ids": [
+      "855cc70f-0de4-4ceb-b329-310e1a75a651",
+      "cd7ded72-bc3c-454d-a90c-46e02d668a16",
+      "2d9c6360-49bd-46a4-bf65-e598f9956cd6",
+      "8c212a06-3912-4d1f-927b-9ebe776f927e",
+      "1286c2d9-b1e2-4327-a1c4-e117127966e1",
+      "f9a106e3-a7d4-4829-a21c-90cdd052512b",
+      "acfdc7a9-1d71-4a04-9b24-aba2083e8dc2",
+      "ec28278b-aebb-49aa-b809-3cc8b407ea1d"
+    ]
+  },
+  {
+    "query": "Ansible playbook for Leia provisioning RAID setup",
+    "relevant_ids": [
+      "57b29e90-2fae-4fdc-82b5-412e2cb15dbe",
+      "a071247e-de21-4f1f-8cc1-c7c4384654e0",
+      "440f26f6-9dc5-42d5-9585-7b8cdf0990f1",
+      "23653afc-ed89-4d29-92f2-01f7538b8682",
+      "4df53327-04dd-4ed1-94b9-3cd35d1e9e92",
+      "aae355b4-a1a2-4426-a917-f34975c08c3f"
+    ]
+  },
+  {
+    "query": "conversation memory pgvector postgres backup to S3",
+    "relevant_ids": [
+      "e0da6e17-2bf8-4b5b-b875-fdc626f53f42",
+      "09a5883a-029d-4573-9005-2c6f4c254d62",
+      "d3c19abd-1eea-485a-b0c8-ed5c536de74e",
+      "7bbeaf4b-906a-4454-ab88-6eb5473bd4cd",
+      "c0ed01db-c0c3-4ed8-b8c8-f6fa2a0ee13d",
+      "02c57c9e-01c7-4740-adca-83abef2e4df0",
+      "aa1c5bc0-3037-4835-9f0f-fe950863f18a"
+    ]
+  },
+  {
+    "query": "nginx reverse proxy letsencrypt certificate on Leia",
+    "relevant_ids": [
+      "a170e493-2039-4499-a672-4a36a51fa8b3",
+      "ab287489-658e-4c06-80fa-edd7c941f989",
+      "0a3ddeec-48f5-4166-9b07-063268a188a3",
+      "31ec8588-c4ea-4163-aeee-63ce61ee2b30",
+      "2b9cd8c4-6fb1-44e9-8f2a-8d05d9bbfc51",
+      "e2084f6c-a72e-49c2-a154-9633ff3d8c59",
+      "36348353-6c0d-4ab2-b869-609c1acc0b42"
+    ]
+  },
+  {
+    "query": "Taiga docker-compose postgres migration",
+    "relevant_ids": [
+      "f01f4feb-403b-4f24-b0a8-21716ed7c249",
+      "712979bb-fe9f-4127-bcb1-014bf0799c43",
+      "6ac50d18-0a52-4066-9de2-4e32cd212f17",
+      "900e1961-d80a-4f6b-b11a-a8a62d2e7cb6",
+      "f9ececbb-9c0f-40dc-bf0a-10979d49f48a",
+      "d6ad708f-1b30-4825-b7ce-55a3638656a4",
+      "91e80b1a-9465-42d0-ab28-64a64d84e09f"
+    ]
+  },
+  {
+    "query": "badblocks hard drive testing slow write cache",
+    "relevant_ids": [
+      "4080184d-8768-4b87-ade5-4a0aad5bba78",
+      "0baebeee-3403-4eef-b0e7-c27fc71bb90e",
+      "8ca598d1-063e-4186-9a03-b97c8e22077f",
+      "fcab5acd-9473-499a-971b-ee4ada7f2efa",
+      "c374d187-6f8f-4a7a-bbcb-52d4826d41b0",
+      "2a158920-c888-46a9-9f5a-45f976165d09",
+      "075eef1d-8570-4cab-a89e-175e51ad4842",
+      "996ab143-6643-4f61-b23f-f08fcac9fdff"
+    ]
+  },
+  {
+    "query": "Ubuntu autoinstall subiquity cloud-init configuration",
+    "relevant_ids": [
+      "647c888e-c37c-495a-a3db-f72dbbfab320",
+      "6c2bf156-6c73-42b2-a2c4-4e888d553adc",
+      "91b16235-e949-4945-9f97-9a5cd3c1c1fa",
+      "555915fa-0c47-47e0-b12a-b4a787afcc11",
+      "05f28bbd-fb8d-4470-94e6-57bc2a45494f",
+      "eb056026-878b-4471-9060-7ad79b75e1a5",
+      "c2aba33d-6d33-4e6e-98b3-95440f6f57c5",
+      "469c92f0-9f54-4b7e-86cd-2fecb2022a7c"
+    ]
+  },
+  {
+    "query": "Samba SMB server configuration Time Machine vfs fruit",
+    "relevant_ids": [
+      "e7881b2a-959d-418b-9d3e-5ef3c9e81949",
+      "04076a5c-598c-4469-9c66-aa8e30652cee",
+      "381c7bea-4ee7-48d4-9db9-b3a0739ca9c0",
+      "560bbf2b-8077-4f73-beaf-c1ef42747153",
+      "51cca813-d3d6-445a-99cf-4c445ba7a566",
+      "f1e7236f-5985-4d7a-aaa0-5884bf1a8bd0",
+      "2c4a3b28-455b-4545-9264-a38df67f6f37",
+      "932a0f2b-d16e-4218-96d4-5490eba88531"
+    ]
+  },
+  {
+    "query": "Docker Compose service configuration home servers",
+    "relevant_ids": [
+      "ab90b7fe-2fa2-46f8-a444-d238966aaf3d",
+      "4fa3a4d8-5ec4-4878-ba01-5a2e69c87119",
+      "776e88d0-a30f-4448-a74c-c609a2be407b",
+      "9efe48a6-9e7d-4df8-b283-b3f250d930c0"
+    ]
+  },
+  {
+    "query": "CDK IAM role OIDC GitHub Actions deployment",
+    "relevant_ids": [
+      "bfaccef5-7aca-4eb5-9b68-4b904bca1338",
+      "07e7e759-e1fb-4e36-b71e-e53e0501df46",
+      "f896bb09-5d28-4e58-8c9d-cc93140873df",
+      "1b60cf55-b3cb-4f76-9c70-2b54dc559b38",
+      "6b838b76-9495-4738-ba92-8b52b81d59e1",
+      "a7f38314-0edb-47b2-8d28-69c9f5387a39",
+      "68a91a40-fd15-4858-ae88-e63c73152188"
+    ]
+  },
+  {
+    "query": "Python asdf version management tensorflow",
+    "relevant_ids": [
+      "ac65d178-434a-4945-8121-209f1ca8f95e",
+      "9f05cbc1-d706-40bf-900f-1e026b3fda6f",
+      "5e4bd86e-87ec-4b66-b5d9-cd21cbc17b3e",
+      "d1e6016b-f22d-497e-933d-ebb852c4ad68"
+    ]
+  },
+  {
+    "query": "pgvector embedding search cosine similarity",
+    "relevant_ids": [
+      "d63af301-b418-4c15-8f95-f0fcf83cfbba",
+      "9648bbb9-ad3d-4858-b612-9236d008e81a",
+      "59071b86-7ea8-4f26-a870-42d69fe22363",
+      "dc120070-05d9-401a-95a4-128d611444d0",
+      "d9b5c62c-2a19-47a4-9e61-5396e4c7937e"
+    ]
+  },
+  {
+    "query": "Datadog observability logging container monitoring",
+    "relevant_ids": [
+      "b97231e2-d49f-4a52-ad27-d77c3e6c6b2d",
+      "3024d8b3-2324-4a5a-9542-857b620e0a26",
+      "1649896c-020f-470d-a0ca-cd72d38e3ddd"
+    ]
+  },
+  {
+    "query": "Let's Encrypt DNS Route53 certificate renewal",
+    "relevant_ids": [
+      "ba5ee49f-4cee-4061-8d32-48af1056ca54",
+      "76be1639-60f0-45b8-a214-ee69675b6c6e",
+      "15f46dc3-05b2-4036-b372-1e787ac274b6",
+      "20a34913-c111-4098-84a3-b2581ce4fcea",
+      "d9d2eab2-4d40-4677-8be2-acfbfbfbd4da",
+      "13804e4f-255a-4885-82c8-fc80987b11cf"
+    ]
+  },
+  {
+    "query": "RAID mdadm disk array configuration",
+    "relevant_ids": [
+      "b3257542-1b04-4aaf-a0b0-cc19c3cbe407",
+      "665b7710-54dc-4d75-914d-b2c2909d8ff7",
+      "44e1ce1b-aece-4c1b-8710-5af8eb0e98a3",
+      "bcb58109-a281-4829-832d-cab694d2b3de",
+      "072741aa-ed7c-4211-9eb3-2a51108fc4a8",
+      "7258ce2c-069c-439e-8e80-bc42d2d847f1"
+    ]
+  },
+  {
+    "query": "draw.io architecture diagram generation",
+    "relevant_ids": [
+      "7beb5f3d-004f-4d40-b9c2-e183176c0069",
+      "a25d0b94-906d-4633-ac64-c4bdf003094a",
+      "64ec07d0-c3eb-494b-9b23-81c691cbd220",
+      "a23df455-95ae-40bc-9ab6-371a2ce2ce78",
+      "dfc2e1a0-600f-4acd-9437-ff2934cf1939",
+      "d85262d9-516a-4ef6-a710-28438f0bdf64",
+      "1978f851-c007-4ab8-9fb8-36681b633eb8"
+    ]
+  },
+  {
+    "query": "Taiga project management story sprint tracking",
+    "relevant_ids": [
+      "2c0fa4df-4413-4936-8a0c-a47f1e56d415",
+      "551c62fe-388c-466f-9224-1dfc49d332d9",
+      "7abb79f1-b140-434f-b7cf-77f756db38ef",
+      "bc184b5f-fb96-48e1-aec2-77311babe560",
+      "ebbbb89a-a65c-4cca-88c0-09e96fbfaee6",
+      "650ae84a-e3f7-44d6-9117-8d9cdb85e7bb",
+      "3196194d-3565-482e-b6e5-fea28543da32",
+      "9e4e614a-fe03-433b-bb7f-dcb1c54afc72"
+    ]
+  },
+  {
+    "query": "SSH key authentication Leia Luke server access",
+    "relevant_ids": [
+      "13d85473-1586-42f1-bcdc-ce86e4c72280",
+      "2b873241-d27b-405a-b732-c13c0dc9a720",
+      "96b44b67-7faf-4baa-ac66-83533603137b",
+      "3f07ff56-7dc8-40ce-8c3d-ce49d5b897ec",
+      "0aa398f3-c91e-4668-999a-6b6be6c52e5c"
+    ]
+  }
+]
