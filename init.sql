@@ -39,3 +39,14 @@ CREATE INDEX IF NOT EXISTS messages_embedding_idx
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
     GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
 CREATE INDEX IF NOT EXISTS messages_content_tsv_idx ON messages USING GIN (content_tsv);
+
+-- Autovacuum is enabled globally by default, but the stock 10% analyze
+-- threshold let the planner statistics drift badly out of date on the
+-- insert-heavy messages table (row estimates were ~35x too low), which
+-- degrades pgvector query plans. Tighten the per-table thresholds so
+-- ANALYZE runs after ~2% churn and VACUUM after ~5%. Idempotent.
+ALTER TABLE messages
+    SET (autovacuum_analyze_scale_factor = 0.02,
+         autovacuum_vacuum_scale_factor  = 0.05);
+ALTER TABLE conversations
+    SET (autovacuum_analyze_scale_factor = 0.02);

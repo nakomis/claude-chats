@@ -58,16 +58,32 @@ aws s3 cp "s3://${BUCKET}/${S3_KEY}" "$TMPFILE" \
     --no-progress
 
 echo "[restore] dropping and recreating database"
+# psql is routed through the container: the host has no postgres client, only
+# the Docker image does. The vector extension is created by the dump itself
+# (init.sql's CREATE EXTENSION is included), so we don't pre-create it here.
 docker exec "$DB_CONTAINER" psql -U claude -d postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};"
 docker exec "$DB_CONTAINER" psql -U claude -d postgres -c "CREATE DATABASE ${DB_NAME} OWNER claude;"
-docker exec "$DB_CONTAINER" psql -U claude -d postgres -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
-echo "[restore] loading dump"
-gunzip -c "$TMPFILE" | psql "$DB_URL"
+echo "[restore] loading dump (embeddings excluded — repopulated below)"
+gunzip -c "$TMPFILE" | docker exec -i "$DB_CONTAINER" psql -q -U claude -d "$DB_NAME"
 
-echo "[restore] verifying"
-psql "$DB_URL" -c '\dt'
-psql "$DB_URL" -c 'SELECT COUNT(*) AS conversations FROM conversations;'
-psql "$DB_URL" -c 'SELECT COUNT(*) AS messages FROM messages;'
+echo "[restore] verifying row counts"
+docker exec "$DB_CONTAINER" psql -U claude -d "$DB_NAME" -c '\dt'
+docker exec "$DB_CONTAINER" psql -U claude -d "$DB_NAME" \
+    -c 'SELECT COUNT(*) AS conversations FROM conversations;'
+docker exec "$DB_CONTAINER" psql -U claude -d "$DB_NAME" \
+    -c 'SELECT COUNT(*) AS messages, COUNT(embedding) AS with_embedding FROM messages;'
+
+# The dump carries message content but not the embedding vectors. Regenerate
+# them and rebuild the ivfflat index. Runs on the host via uv so it can reach
+# both Postgres (localhost:5433) and the embedding provider (e.g. Ollama on
+# localhost:11434), using the same hook.embed helper the live recorder uses.
+echo "[restore] backfilling embeddings (this is the slow part — ~15-20 min for a full history)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLAUDE_CHATS_DB_URL="$DB_URL" uv run --project "${REPO_DIR}/hook" backfill-embeddings
+
+echo "[restore] verifying embeddings"
+docker exec "$DB_CONTAINER" psql -U claude -d "$DB_NAME" \
+    -c 'SELECT COUNT(*) AS messages, COUNT(embedding) AS with_embedding FROM messages;'
 
 echo "[restore] complete"
