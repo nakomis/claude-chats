@@ -53,13 +53,22 @@ def main() -> None:
             return
 
         done = 0
+        # Rows that cannot be embedded at all must be excluded from the next
+        # SELECT, not merely skipped. A skipped row keeps embedding IS NULL, so
+        # it matches the query again on the following pass: with any permanently
+        # unembeddable content the loop never terminates, never reaches the
+        # REINDEX below, and hammers the embedding service indefinitely. Seen
+        # 22 Jul 2026 with 14 rows of captured machine output (raw JSON tool
+        # results, a null-byte dump) that make Ollama return HTTP 500.
+        failed: set = set()
         t0 = time.perf_counter()
         while True:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, content FROM messages "
-                    "WHERE embedding IS NULL AND content <> '' LIMIT %s",
-                    (BATCH,),
+                    "WHERE embedding IS NULL AND content <> '' "
+                    "AND NOT (id = ANY(%s)) LIMIT %s",
+                    (list(failed), BATCH),
                 )
                 rows = cur.fetchall()
             if not rows:
@@ -70,6 +79,7 @@ def main() -> None:
                         emb = get_embedding(content)
                     except Exception as exc:  # noqa: BLE001 — skip, keep going
                         print(f"[backfill] skip {mid}: {exc}", file=sys.stderr)
+                        failed.add(mid)
                         continue
                     cur.execute(
                         "UPDATE messages SET embedding = %s::vector WHERE id = %s",
@@ -80,6 +90,13 @@ def main() -> None:
             pct = done * 100 // max(todo, 1)
             print(f"[backfill] {done}/{todo} ({pct}%)", file=sys.stderr)
 
+        if failed:
+            print(
+                f"[backfill] {len(failed)} message(s) could not be embedded and "
+                "were left with NULL embeddings",
+                file=sys.stderr,
+            )
+
         # Rebuild the ivfflat index so its list centroids are trained on the full
         # vector set. Restoring loads all rows with NULL embeddings, so the index
         # created by init.sql starts empty; re-embedding alone would leave it
@@ -88,7 +105,14 @@ def main() -> None:
             "[backfill] rebuilding ivfflat index (messages_embedding_idx)",
             file=sys.stderr,
         )
+        # ivfflat needs enough maintenance_work_mem to hold the sample it runs
+        # k-means over, and that requirement grows with the corpus. At ~54k
+        # vectors it wanted 80 MB against Postgres's 64 MB default and the
+        # REINDEX aborted outright (22 Jul 2026), which would silently leave a
+        # restored database with an untrained index. Raise it for this session
+        # only; it is not a server-wide change.
         with conn.cursor() as cur:
+            cur.execute("SET maintenance_work_mem = '512MB'")
             cur.execute("REINDEX INDEX messages_embedding_idx")
         conn.commit()
 
