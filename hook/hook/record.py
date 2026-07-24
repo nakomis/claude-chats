@@ -1,34 +1,84 @@
 """
 Claude Code Stop hook.
 
-Reads the session transcript and either embeds messages directly into
-PostgreSQL (local mode) or publishes them to an ActiveMQ queue for a
-remote worker to process (remote mode).
+Reads the session transcript and appends new messages to a local SQLite
+outbox. A separate forwarder daemon drains that outbox to the ingest queue,
+and a consumer inside the house does the embedding and the database write.
 
-Mode is controlled by CLAUDE_CHATS_MODE (local|remote, default: local).
-Always exits 0 so Claude is never blocked from stopping.
+This hook deliberately does *no* network I/O, holds no credentials, and never
+talks to Postgres. That is the whole point: capture must not be able to fail.
+
+It used to write straight to Postgres, and it failed silently — when the Docker
+daemon holding the local database was down, the write threw and the message
+vanished with no signal at all. Pointing it at a remote database would have
+made that worse, not better: more failure modes (network, credentials, being
+away from home), not fewer.
+
+So capture and delivery are split, and only capture has to be reliable:
+
+  * this hook appends to a local SQLite file — no network, no auth, no daemon,
+    nothing that can be "down";
+  * the forwarder owns everything that *can* fail, and when it does the outbox
+    simply grows and drains later.
+
+Always exits 0 so Claude is never blocked from stopping. Failures are reported
+on stderr and fall back to a plain append-only file, rather than being swallowed.
 """
 
 import json
 import os
+import socket
+import sqlite3
 import sys
 from datetime import datetime, timezone
 
-DB_URL     = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
-MODE       = os.environ.get("CLAUDE_CHATS_MODE", "local")
-QUEUE_URL  = os.environ.get("CLAUDE_CHATS_QUEUE_URL", "stomp://localhost:61613")
-QUEUE_NAME = os.environ.get("CLAUDE_CHATS_QUEUE_NAME", "claude-chats-messages")
-QUEUE_USER = os.environ.get("CLAUDE_CHATS_QUEUE_USER", "admin")
-QUEUE_PASS = os.environ.get("CLAUDE_CHATS_QUEUE_PASS", "admin")
+OUTBOX_PATH = os.environ.get(
+    "CLAUDE_CHATS_OUTBOX",
+    os.path.expanduser("~/.claude-chats/outbox.db"),
+)
+# Derived from the outbox rather than hardcoded, so overriding the outbox
+# location doesn't leave the fallback writing somewhere unrelated.
+FALLBACK_PATH = os.path.join(os.path.dirname(OUTBOX_PATH), "outbox-fallback.ndjson")
+# A friendly label ("work-laptop") beats a raw hostname, which changes with
+# whatever the DHCP lease felt like that day. Several machines share one
+# database, so search can span every tenant or filter to one.
+HOST = os.environ.get("CLAUDE_CHATS_HOST") or socket.gethostname()
+
+# Schema shared with the Rust forwarder (mac/conversation-memory-forwarder in
+# nakomis/home-infra). Whichever process opens the file first creates it, so
+# neither depends on the other having been installed. KEEP THE TWO IN STEP.
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=FULL;
+
+CREATE TABLE IF NOT EXISTS outbox (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_uuid      TEXT    NOT NULL UNIQUE,
+    session_id        TEXT    NOT NULL,
+    project_path      TEXT    NOT NULL DEFAULT '',
+    git_branch        TEXT    NOT NULL DEFAULT '',
+    conversation_name TEXT,
+    host              TEXT,
+    role              TEXT    NOT NULL,
+    content           TEXT    NOT NULL,
+    sequence_num      INTEGER NOT NULL,
+    created_at        TEXT    NOT NULL,
+    sent_at           TEXT,
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT
+);
+CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox (sent_at, id);
+
+CREATE TABLE IF NOT EXISTS forwarder_state (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
+"""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _vec_str(embedding: list[float]) -> str:
-    return "[" + ",".join(str(v) for v in embedding) + "]"
-
 
 def _extract_text(content) -> str:
     """Extract plain text from a message content value.
@@ -58,33 +108,70 @@ def _extract_text(content) -> str:
     return ""
 
 
-def _parse_stomp_url(url: str) -> tuple[str, int]:
-    url = url.removeprefix("stomp://")
-    host, _, port = url.rpartition(":")
-    return host or "localhost", int(port or 61613)
+def _write_fallback(records: list[dict], reason: str) -> None:
+    """Last-resort capture when SQLite itself is unavailable.
 
-
-def _post_to_queue(payload: dict) -> None:
-    import stomp  # only needed in remote mode
-
-    host, port = _parse_stomp_url(QUEUE_URL)
-    conn = stomp.Connection([(host, port)])
-    conn.connect(QUEUE_USER, QUEUE_PASS, wait=True)
+    A plain append to a text file has fewer moving parts than anything else we
+    could reach for, so it is what stands between a broken outbox and a lost
+    conversation. Recover with scripts/replay-fallback.py.
+    """
+    path = FALLBACK_PATH
     try:
-        conn.send(
-            destination=f"/queue/{QUEUE_NAME}",
-            body=json.dumps(payload),
-            headers={"content-type": "application/json"},
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec) + "\n")
+        print(
+            f"claude-chats: outbox unavailable ({reason}); "
+            f"wrote {len(records)} message(s) to {path}",
+            file=sys.stderr,
         )
+    except Exception as exc:  # pragma: no cover - the truly hopeless case
+        print(
+            f"claude-chats: LOST {len(records)} message(s) — "
+            f"outbox failed ({reason}) and fallback failed ({exc})",
+            file=sys.stderr,
+        )
+
+
+def _append_to_outbox(records: list[dict], session_id: str, name: str | None) -> None:
+    conn = sqlite3.connect(OUTBOX_PATH, timeout=10)
+    try:
+        conn.executescript(SCHEMA)
+        with conn:
+            # INSERT OR IGNORE against the UNIQUE message_uuid is what makes
+            # this safe to run on every Stop: the hook re-reads the entire
+            # transcript each time, and rows already forwarded remain as
+            # tombstones (content blanked, sent_at set) precisely so they still
+            # suppress a re-insert here.
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO outbox
+                    (message_uuid, session_id, project_path, git_branch,
+                     conversation_name, host, role, content, sequence_num, created_at)
+                VALUES
+                    (:message_uuid, :session_id, :project_path, :git_branch,
+                     :conversation_name, :host, :role, :content, :sequence_num, :created_at)
+                """,
+                records,
+            )
+            if name:
+                # A rename can land after the messages it applies to. Update
+                # anything still pending so the new name travels with it.
+                conn.execute(
+                    "UPDATE outbox SET conversation_name = ? "
+                    "WHERE session_id = ? AND sent_at IS NULL",
+                    (name, session_id),
+                )
     finally:
-        conn.disconnect()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:  # noqa: C901
+def main() -> None:
     try:
         payload = json.loads(sys.stdin.read())
     except Exception:
@@ -131,112 +218,40 @@ def main() -> None:  # noqa: C901
     if not messages and name is None:
         sys.exit(0)
 
-    # Build the normalised message list (used by both modes)
-    msg_list = []
+    records = []
     for seq, entry in enumerate(messages):
-        msg_uuid = entry.get("uuid") or f"{session_id}:{seq}"
-        msg      = entry["message"]
-        role     = msg["role"]
-        text     = _extract_text(msg.get("content", ""))
+        msg  = entry["message"]
+        text = _extract_text(msg.get("content", ""))
         if not text:
             continue
         ts_raw = entry.get("timestamp")
         ts = datetime.fromisoformat(ts_raw) if ts_raw else datetime.now(timezone.utc)
-        msg_list.append({
-            "message_uuid": msg_uuid,
-            "role": role,
-            "content": text,
-            "created_at": ts.isoformat(),
-            "sequence_num": seq,
+        records.append({
+            "message_uuid":      entry.get("uuid") or f"{session_id}:{seq}",
+            "session_id":        session_id,
+            "project_path":      cwd,
+            "git_branch":        git_branch,
+            "conversation_name": name,
+            "host":              HOST,
+            "role":              msg["role"],
+            "content":           text,
+            "sequence_num":      seq,
+            # The real transcript timestamp. The forwarder may not deliver this
+            # for days if we are offline, so it must not be re-derived later.
+            "created_at":        ts.isoformat(),
         })
 
-    # ── Remote mode ──────────────────────────────────────────────────────────
-    if MODE == "remote":
-        if not msg_list and name is None:
-            sys.exit(0)
-        try:
-            _post_to_queue({
-                "session_id":   session_id,
-                "project_path": cwd,
-                "git_branch":   git_branch,
-                "started_at":   datetime.now(timezone.utc).isoformat(),
-                "name":         name,
-                "messages":     msg_list,
-            })
-        except Exception:
-            pass
+    if not records and name is None:
         sys.exit(0)
 
-    # ── Local mode ───────────────────────────────────────────────────────────
-    from hook.embed import get_embedding
-    import psycopg
-
     try:
-        with psycopg.connect(DB_URL, autocommit=False) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO conversations (session_id, project_path, git_branch)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (session_id) DO NOTHING
-                    """,
-                    (session_id, cwd, git_branch),
-                )
-                if name:
-                    cur.execute(
-                        "UPDATE conversations SET name = %s WHERE session_id = %s",
-                        (name, session_id),
-                    )
-                cur.execute(
-                    "SELECT id FROM conversations WHERE session_id = %s",
-                    (session_id,),
-                )
-                conv_id = cur.fetchone()[0]
-
-                cur.execute(
-                    "SELECT message_uuid FROM messages WHERE conversation_id = %s",
-                    (conv_id,),
-                )
-                stored = {row[0] for row in cur.fetchall()}
-
-                for item in msg_list:
-                    if item["message_uuid"] in stored:
-                        continue
-
-                    try:
-                        embedding = get_embedding(item["content"])
-                    except Exception:
-                        embedding = None
-
-                    if embedding:
-                        cur.execute(
-                            """
-                            INSERT INTO messages
-                                (conversation_id, message_uuid, role, content,
-                                 embedding, created_at, sequence_num)
-                            VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
-                            ON CONFLICT (message_uuid) DO NOTHING
-                            """,
-                            (conv_id, item["message_uuid"], item["role"], item["content"],
-                             _vec_str(embedding), item["created_at"], item["sequence_num"]),
-                        )
-                    else:
-                        cur.execute(
-                            """
-                            INSERT INTO messages
-                                (conversation_id, message_uuid, role, content,
-                                 created_at, sequence_num)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (message_uuid) DO NOTHING
-                            """,
-                            (conv_id, item["message_uuid"], item["role"], item["content"],
-                             item["created_at"], item["sequence_num"]),
-                        )
-
-                conn.commit()
-
-    except Exception:
-        pass
+        os.makedirs(os.path.dirname(OUTBOX_PATH), exist_ok=True)
+        _append_to_outbox(records, session_id, name)
+    except Exception as exc:
+        # Never swallow this. A silent failure here is exactly the bug this
+        # design exists to remove — but still exit 0, because blocking Claude
+        # from stopping would be a worse outcome than a delayed message.
+        _write_fallback(records, str(exc))
 
     sys.exit(0)
 

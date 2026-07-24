@@ -13,6 +13,13 @@ CREATE TABLE IF NOT EXISTS conversations (
 -- Idempotent upgrade: add columns introduced after initial release
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS name TEXT;
 
+-- Which machine the conversation happened on. Several machines (desktop, work
+-- laptop, a loaner while one is in for repair) share this database, so search
+-- can span every tenant or filter to one. Nullable: rows from the
+-- single-machine era predate the concept.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS host TEXT;
+
+CREATE INDEX IF NOT EXISTS conversations_host_idx         ON conversations (host);
 CREATE INDEX IF NOT EXISTS conversations_project_path_idx ON conversations (project_path);
 CREATE INDEX IF NOT EXISTS conversations_started_at_idx   ON conversations (started_at DESC);
 
