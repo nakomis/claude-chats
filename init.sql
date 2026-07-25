@@ -1,3 +1,7 @@
+-- Source of truth for the conversation-memory pg schema. Vendored into
+-- home-infra at luke/deployment/claude-chats/init.sql, which is what runs on
+-- Luke. tests/test_pg_schema.py and that repo's check pin the same DDL checksum
+-- so the copy cannot silently drift — change one and both go red (HOME-194).
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
