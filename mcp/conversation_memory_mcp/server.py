@@ -8,6 +8,8 @@ Embedding provider is configured via CLAUDE_CHATS_PROVIDER — see embed.py.
 """
 
 import os
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import psycopg
 from mcp.server.fastmcp import FastMCP
@@ -17,6 +19,12 @@ from conversation_memory_mcp.embed import get_embedding
 DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
 
 CONTEXT_WINDOW = 2  # messages either side of a search hit
+
+# Postgres stores timestamptz in UTC (correct — leave it). This is purely how
+# the MCP *presents* it: a bare UTC clock time (21:37) invites a reader whose
+# wall clock says 22:37 BST to misread it as an hour old — which is exactly what
+# happened the first time the system was queried across sessions (HOME-199).
+LOCAL_TZ = ZoneInfo(os.environ.get("CLAUDE_CHATS_TZ", "Europe/London"))
 
 mcp = FastMCP("conversation-memory")
 
@@ -31,6 +39,47 @@ def _vec(embedding: list[float]) -> str:
 
 def _conn():
     return psycopg.connect(DB_URL)
+
+
+def _aware_utc(ts: datetime) -> datetime:
+    """Treat a naive datetime as UTC; leave an aware one alone."""
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+
+def _relative(ts: datetime, now: datetime | None = None) -> str:
+    """A UTC-correct 'N minutes ago' — computed against real elapsed time, so it
+    can't be misread whatever timezone the reader is in."""
+    ts = _aware_utc(ts)
+    now = now or datetime.now(timezone.utc)
+    secs = (now - ts).total_seconds()
+    future, s = secs < 0, abs(secs)
+    if s < 45:
+        return "just now"
+    mins = s / 60
+    if mins < 60:
+        v, unit = round(mins), "minute"
+    elif mins < 60 * 24:
+        v, unit = round(mins / 60), "hour"
+    elif mins < 60 * 24 * 7:
+        v, unit = round(mins / 60 / 24), "day"
+    else:
+        v, unit = round(mins / 60 / 24 / 7), "week"
+    label = f"{v} {unit}{'' if v == 1 else 's'}"
+    return f"in {label}" if future else f"{label} ago"
+
+
+def _human_time(ts: datetime, now: datetime | None = None) -> str:
+    """Present a timestamp so it cannot be misread: lead with the relative form,
+    then the operator-local wall-clock time with its zone, e.g.
+    '2 minutes ago (2026-07-24 22:37 BST)'. The exact UTC value stays available
+    as a sibling `*_utc` field for correlation (see _utc_iso)."""
+    local = _aware_utc(ts).astimezone(LOCAL_TZ)
+    return f"{_relative(ts, now)} ({local.strftime('%Y-%m-%d %H:%M %Z')})"
+
+
+def _utc_iso(ts: datetime) -> str:
+    """The raw UTC value, ISO 8601 — for exact correlation across machines."""
+    return _aware_utc(ts).astimezone(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +107,9 @@ def search_memory(
         }
 
     Each result contains: session_id, project_path, role, sequence_num,
-    created_at, score, context (surrounding messages).
+    created_at (relative + operator-local, e.g. "2 minutes ago (2026-07-24
+    22:37 BST)"), created_at_utc (raw ISO-8601 UTC for exact correlation),
+    score, context (surrounding messages).
 
     Modes:
         "hybrid" (default)
@@ -160,7 +211,8 @@ def search_memory(
                     "project_path": proj,
                     "role":         role,
                     "sequence_num": seq,
-                    "created_at":   str(ts),
+                    "created_at":   _human_time(ts),
+                    "created_at_utc": _utc_iso(ts),
                     "score":        round(float(score), 6),
                     "context":      context,
                 })
@@ -308,7 +360,8 @@ def get_conversation(
             cur.execute(sql, params)
 
             messages = [
-                {"role": r, "seq": s, "created_at": str(t), "content": c}
+                {"role": r, "seq": s, "created_at": _human_time(t),
+                 "created_at_utc": _utc_iso(t), "content": c}
                 for r, c, s, t in cur.fetchall()
             ]
 
@@ -317,7 +370,8 @@ def get_conversation(
                 "name":          name,
                 "project_path":  project_path,
                 "git_branch":    git_branch,
-                "started_at":    str(started_at),
+                "started_at":    _human_time(started_at),
+                "started_at_utc": _utc_iso(started_at),
                 "total_messages": total,
                 "returned":      len(messages),
                 "messages":      messages,
@@ -363,9 +417,9 @@ def list_recent_sessions(
                     "name":           name,
                     "project_path":   pp,
                     "git_branch":     gb,
-                    "started_at":     str(sa),
+                    "started_at":     _human_time(sa),
                     "message_count":  mc,
-                    "last_message_at": str(lm) if lm else None,
+                    "last_message_at": _human_time(lm) if lm else None,
                 }
                 for sid, pp, gb, sa, name, mc, lm in cur.fetchall()
             ]
