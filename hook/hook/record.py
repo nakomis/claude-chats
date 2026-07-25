@@ -46,7 +46,10 @@ HOST = os.environ.get("CLAUDE_CHATS_HOST") or socket.gethostname()
 
 # Schema shared with the Rust forwarder (mac/conversation-memory-forwarder in
 # nakomis/home-infra). Whichever process opens the file first creates it, so
-# neither depends on the other having been installed. KEEP THE TWO IN STEP.
+# neither depends on the other having been installed. KEEP THE TWO IN STEP:
+# tests/test_outbox_schema.py pins a checksum of this DDL, and the forwarder's
+# outbox.rs pins the identical value — change one copy and both test suites go
+# red until the other copy and both hashes are updated together (HOME-194).
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
