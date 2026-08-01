@@ -33,7 +33,7 @@ from hook.record import SCHEMA  # noqa: E402
 
 # Must equal SCHEMA_SHA256 in the forwarder's outbox.rs test. Same algorithm
 # (sha256), same normalisation, so the two are the same value by construction.
-SCHEMA_SHA256 = "ff278d5a68181f9e34ae11bfdd11aaadf4067578cbef4534985cdcff436fc681"
+SCHEMA_SHA256 = "ed79497fb291e0efff6baa3d3498bb15760143259ef2707d2e943706d5508968"
 
 
 def _normalise(s: str) -> str:
