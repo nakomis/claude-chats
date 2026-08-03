@@ -25,8 +25,12 @@ Always exits 0 so Claude is never blocked from stopping. Failures are reported
 on stderr and fall back to a plain append-only file, rather than being swallowed.
 """
 
+import base64
+import binascii
+import hashlib
 import json
 import os
+import re
 import socket
 import sqlite3
 import sys
@@ -109,6 +113,86 @@ def _extract_text(content) -> str:
                             parts.append(ib.get("text", ""))
         return "\n".join(p for p in parts if p).strip()
     return ""
+
+
+# Claude Code records a pasted image's origin in a separate `isMeta` entry
+# whose parentUuid points back at the message carrying the image block:
+#
+#   message  uuid=c497a6cb  content=[text "[Image #1]", image(base64)]
+#   meta     parentUuid=c497a6cb  text="[Image: source: /var/folders/…/Foo.png]"
+#
+# The image block itself has no filename, and the message's own text is only
+# "[Image #1]", so this meta entry is the ONLY place the original name survives.
+# Images pasted from the clipboard have no source file and therefore no meta
+# entry at all — in one real transcript, 59 meta entries against 63 image
+# blocks — so the name must always be treated as optional.
+_IMAGE_SOURCE_RE = re.compile(r"^\[Image:\s*source:\s*(.+?)\]\s*$")
+
+
+def _image_sources(entries: list[dict]) -> dict[str, list[str]]:
+    """Map a message uuid -> the source paths of the images it carries.
+
+    Order is preserved so the Nth path lines up with the Nth image block in
+    the parent message.
+    """
+    sources: dict[str, list[str]] = {}
+    for entry in entries:
+        if not entry.get("isMeta"):
+            continue
+        parent = entry.get("parentUuid")
+        if not parent:
+            continue
+        content = entry.get("message", {}).get("content")
+        blocks = content if isinstance(content, list) else []
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            match = _IMAGE_SOURCE_RE.match(block.get("text", "").strip())
+            if match:
+                sources.setdefault(parent, []).append(match.group(1))
+    return sources
+
+
+def _image_markers(content, source_paths: list[str]) -> list[str]:
+    """Render a text stand-in for each image block, in block order.
+
+    Claude Code always writes a "[Image #N]" text block alongside the image, so
+    these messages do reach the outbox — but that placeholder is the entirety of
+    what gets stored. On recall you can see that an image was sent and have no
+    idea what it was, nor any way to reach it (HOME-315).
+
+    The marker carries the sha256 prefix of the DECODED bytes, which is the same
+    join key the image archive uses for the file and its sidecar (HOME-298), so
+    a search hit resolves to the actual picture rather than merely proving one
+    existed. Hash the decoded bytes, not the base64 text: the archive writes
+    decoded bytes, and the two must agree.
+    """
+    if not isinstance(content, list):
+        return []
+    markers: list[str] = []
+    seen = 0
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "image":
+            continue
+        source = block.get("source", {})
+        media_type = source.get("media_type") or "image"
+        digest = ""
+        if source.get("type") == "base64" and source.get("data"):
+            try:
+                digest = hashlib.sha256(
+                    base64.b64decode(source["data"], validate=True)
+                ).hexdigest()[:8]
+            except (binascii.Error, ValueError):
+                # A corrupt payload must not cost us the whole message.
+                digest = ""
+        name = ""
+        if seen < len(source_paths):
+            name = os.path.basename(source_paths[seen])
+        seen += 1
+
+        bits = [b for b in (media_type, f"sha256:{digest}" if digest else "") if b]
+        markers.append(f"[image: {name or 'pasted'} ({', '.join(bits)})]")
+    return markers
 
 
 def _write_fallback(records: list[dict], reason: str) -> None:
@@ -221,10 +305,19 @@ def main() -> None:
     if not messages and name is None:
         sys.exit(0)
 
+    # uuid -> source paths of the images that message carries (HOME-315).
+    image_sources = _image_sources(entries)
+
     records = []
     for seq, entry in enumerate(messages):
         msg  = entry["message"]
-        text = _extract_text(msg.get("content", ""))
+        content = msg.get("content", "")
+        text = _extract_text(content)
+        markers = _image_markers(content, image_sources.get(entry.get("uuid") or "", []))
+        if markers:
+            # Appended, not substituted: "[Image #1]" carries the ordering the
+            # rest of the conversation refers to, so keep it and add the detail.
+            text = "\n".join(part for part in (text, *markers) if part)
         if not text:
             continue
         ts_raw = entry.get("timestamp")
