@@ -225,6 +225,13 @@ def classify_author(role, content) -> str:
 
     Harness-generated notices (interrupts, system messages) arrive as a list of
     ``text`` blocks. They are not the human either, so they count as 'tool'.
+
+    The one human message that is *not* a string is a pasted image: Claude Code
+    represents it as a list of ``text`` + ``image`` blocks. Nothing but a person
+    can produce an ``image`` block — the assistant never emits one — so it is as
+    structural a signal as ``tool_result``, and the list rule alone gets all 90
+    such messages in the corpus wrong, 56 of them carrying typed prose next to
+    the picture (HOME-315/298 made these worth finding).
     """
     if role == "assistant":
         return "claude"
@@ -240,9 +247,14 @@ def classify_author(role, content) -> str:
                 return "tool"
         return "martin"
     if isinstance(content, list):
+        # tool_result wins over image: a result carrying a screenshot back from
+        # a tool is the tool's output, not something the human pasted.
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 return "tool"
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                return "martin"
         return "tool"
     return "tool"
 

@@ -43,10 +43,45 @@ def test_harness_text_blocks_are_not_the_human():
     """Interrupts and system notices arrive as a list of text blocks.
 
     They are not typed by anyone, so they must not land in the human bucket.
-    The list-vs-string distinction is what separates them; a human message is
-    always a bare string.
+    A list of nothing but text blocks is the harness talking; the human's own
+    messages are bare strings, or lists carrying an image (see below).
     """
     content = [{"type": "text", "text": "[Request interrupted by user for tool use]"}]
+    assert classify_author("user", content) == "tool"
+
+
+def test_a_pasted_image_is_the_human():
+    """The one human message that is not a bare string.
+
+    Claude Code renders a pasted image as text + image blocks, so the plain
+    list rule reads it as harness output. Every one of the 90 image-bearing
+    user messages in the corpus was mislabelled 'tool' before this -- and 56 of
+    them carry prose the human typed alongside the picture, which is exactly
+    the conversation HOME-309 exists to keep findable.
+    """
+    content = [
+        {"type": "text", "text": "[Image #4] Age ratings were already done"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "iVBORw0KGgo="}},
+    ]
+    assert classify_author("user", content) == "martin"
+
+
+def test_an_image_returned_by_a_tool_is_still_the_tool():
+    """Precedence matters: a screenshot handed back by a tool is tool output.
+
+    Checked explicitly because the image rule would otherwise claim it, and a
+    tool that returns images (a browser screenshot, say) is a real case rather
+    than a hypothetical one.
+    """
+    content = [
+        {"type": "tool_result", "tool_use_id": "toolu_9", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": "iVBORw0KGgo="}},
+        ]},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "iVBORw0KGgo="}},
+    ]
     assert classify_author("user", content) == "tool"
 
 
