@@ -46,6 +46,35 @@ CREATE INDEX IF NOT EXISTS messages_embedding_idx
     ON messages USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
 
+-- Who produced the message: 'martin', 'claude', 'tool', or 'unknown'
+-- (HOME-310/311). `role` cannot express this — Claude Code delivers tool
+-- results as role='user' messages, so before this column existed only 14% of
+-- role='user' rows were actually typed by a person, and every semantic search
+-- competed against thousands of embedded command outputs (HOME-309).
+--
+-- Backfilled rows keep 'unknown' rather than being guessed at: honest and
+-- greppable, where defaulting to 'martin' would manufacture the exact bad data
+-- this exists to remove. No CHECK constraint yet, deliberately — one would
+-- have to be added NOT VALID and validated separately against 70k existing
+-- rows, and there is nothing to constrain until the backfill lands (HOME-311).
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS author TEXT NOT NULL DEFAULT 'unknown';
+
+-- Which tool produced a row where author='tool', resolved by the hook through
+-- the tool_use_id. NULL for every other author, and for tool results whose
+-- originating call was not in the transcript.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_name TEXT;
+
+-- Model behind an author='claude' row. NULL otherwise. The corpus already
+-- spans several models; being able to slice by one later is worth the column.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS model TEXT;
+
+-- Every projection and most search paths filter on author, and the values are
+-- few and skewed, so this earns its keep immediately.
+CREATE INDEX IF NOT EXISTS messages_author_idx ON messages (author);
+-- Partial: tool_name is NULL for ~70% of rows, so exclude them from the index.
+CREATE INDEX IF NOT EXISTS messages_tool_name_idx
+    ON messages (tool_name) WHERE tool_name IS NOT NULL;
+
 -- Full-text search: generated tsvector column + GIN index
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
     GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
