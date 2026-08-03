@@ -337,6 +337,29 @@ def main() -> None:
             "created_at":        ts.isoformat(),
         })
 
+    # Stage any images to a LOCAL directory (HOME-298). Deliberately not written
+    # to the SMB share here: that is network I/O on the capture path, which is
+    # the exact failure mode this module was rewritten to remove — and a write
+    # to a hung mount blocks uninterruptibly, which would stall the hook. The
+    # `flush-images` command moves them to the share and is allowed to fail.
+    try:
+        from hook.images import stage_images
+
+        stage_images(
+            messages,
+            image_sources,
+            session_id,
+            cwd,
+            git_branch,
+            text_by_uuid={
+                e.get("uuid") or "": _extract_text(e.get("message", {}).get("content", ""))
+                for e in messages
+            },
+        )
+    except Exception:
+        # Archiving is a nice-to-have; losing the message is not.
+        pass
+
     if not records and name is None:
         sys.exit(0)
 

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Moves staged images to /Volumes/share (HOME-298).
+
+    This exists as a separate agent, rather than the hook writing to the share
+    directly, because the share is an SMB mount over two wireless hops. A real
+    flush of 18 MB measured ~60s; the hook's timeout is 120s, and a write to a
+    hung mount blocks uninterruptibly. Putting that on the capture path would
+    reintroduce exactly the failure record.py was rewritten to remove.
+
+    So the hook stages locally (fast, cannot fail) and this agent does the part
+    that is allowed to fail. When the share is absent, flush-images leaves
+    everything staged and says so — nothing is lost, it drains next time.
+
+    REPO_PATH is substituted at install time.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nakomis.claude-chats-flush-images</string>
+
+    <!-- Absolute path to uv, not `/usr/bin/env uv`: launchd runs with a minimal
+         PATH that does not include /opt/homebrew/bin, so env would not find it
+         and the agent would fail silently every 15 minutes. Substituted at
+         install time from `which uv`. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>UV_PATH</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>REPO_PATH/hook</string>
+        <string>flush-images</string>
+    </array>
+
+    <!-- Every 15 minutes. The images are already safe on local disk, so this
+         is about getting them onto the NAS reasonably promptly, not urgently.
+         Frequent enough that a session's images land the same day; infrequent
+         enough that a slow mesh transfer never overlaps itself. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- Catch up on anything staged while the Mac was asleep or the share was
+         unmounted. Safe: flush-images is idempotent and refuses politely when
+         the share is not mounted. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-chats-flush-images.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-chats-flush-images.log</string>
+</dict>
+</plist>
