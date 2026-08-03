@@ -18,6 +18,7 @@ dependencies = [
 [project.scripts]
 record-conversation = "hook.record:main"
 backfill-embeddings = "hook.backfill:main"
+flush-images = "hook.images:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hook"]
