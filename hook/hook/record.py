@@ -36,6 +36,11 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 
+# Harness injections that arrive as a bare string rather than a content block.
+# Used only to spot a message that is *entirely* one of these — never to judge
+# a message by its prose, which is the mistake this whole change exists to fix.
+_SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
 OUTBOX_PATH = os.environ.get(
     "CLAUDE_CHATS_OUTBOX",
     os.path.expanduser("~/.claude-chats/outbox.db"),
@@ -67,6 +72,9 @@ CREATE TABLE IF NOT EXISTS outbox (
     conversation_name TEXT,
     host              TEXT,
     role              TEXT    NOT NULL,
+    author            TEXT    NOT NULL DEFAULT 'unknown',
+    tool_name         TEXT,
+    model             TEXT,
     content           TEXT    NOT NULL,
     sequence_num      INTEGER NOT NULL,
     created_at        TEXT    NOT NULL,
@@ -195,6 +203,92 @@ def _image_markers(content, source_paths: list[str]) -> list[str]:
     return markers
 
 
+def classify_author(role, content) -> str:
+    """Who produced this message: 'martin', 'claude' or 'tool'.
+
+    ``role`` cannot answer this. Claude Code delivers tool results as
+    role='user' messages, so before this existed every command output, file
+    dump and API response was indistinguishable from something the human
+    typed. Measured on 134 transcripts: of 11,900 role='user' rows, only 14%
+    were actually typed by a person (HOME-309).
+
+    The transcript makes the distinction unambiguous, and it is structural
+    rather than textual:
+
+      * a message the human typed has a **string** ``content``
+      * a tool result has a **list** whose blocks are ``tool_result``
+
+    Deliberately *not* pattern-matched on the text. People paste code, config
+    and command output into conversations on purpose, and that is genuine
+    conversation. A regex on content scored 92.6% precision but 21.8% recall,
+    and no amount of tuning fixes it — a file dump is prose-shaped.
+
+    Harness-generated notices (interrupts, system messages) arrive as a list of
+    ``text`` blocks. They are not the human either, so they count as 'tool'.
+
+    The one human message that is *not* a string is a pasted image: Claude Code
+    represents it as a list of ``text`` + ``image`` blocks. Nothing but a person
+    can produce an ``image`` block — the assistant never emits one — so it is as
+    structural a signal as ``tool_result``, and the list rule alone gets all 90
+    such messages in the corpus wrong, 56 of them carrying typed prose next to
+    the picture (HOME-315/298 made these worth finding).
+    """
+    if role == "assistant":
+        return "claude"
+    if isinstance(content, str):
+        # A handful of harness injections (session-rename notices and similar)
+        # arrive as a bare string, which the structural rule would otherwise
+        # read as human. Measured across 134 transcripts: 11 of 1,841 string
+        # messages, and *zero* cases where a reminder was appended to real
+        # text — so a message that is nothing but reminder tags is never the
+        # human, and one containing any other text always is.
+        if _SYSTEM_REMINDER_RE.search(content):
+            if not _SYSTEM_REMINDER_RE.sub("", content).strip():
+                return "tool"
+        return "martin"
+    if isinstance(content, list):
+        # tool_result wins over image: a result carrying a screenshot back from
+        # a tool is the tool's output, not something the human pasted.
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                return "tool"
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                return "martin"
+        return "tool"
+    return "tool"
+
+
+def _tool_use_names(entries: list[dict]) -> dict[str, str]:
+    """Map ``tool_use_id`` -> tool name, harvested from assistant messages.
+
+    A ``tool_result`` block carries only the id of the call it answers, so the
+    name has to come from the assistant's matching ``tool_use`` block. Building
+    the map once beats scanning the transcript per result.
+    """
+    names: dict[str, str] = {}
+    for entry in entries:
+        msg = entry.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for block in msg.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                bid, name = block.get("id"), block.get("name")
+                if bid and name:
+                    names[bid] = name
+    return names
+
+
+def _tool_name_for(content, names: dict[str, str]) -> str | None:
+    """Name of the tool that produced this result, if it is one."""
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            return names.get(block.get("tool_use_id", ""))
+    return None
+
+
 def _write_fallback(records: list[dict], reason: str) -> None:
     """Last-resort capture when SQLite itself is unavailable.
 
@@ -221,10 +315,38 @@ def _write_fallback(records: list[dict], reason: str) -> None:
         )
 
 
+# Columns added after the outbox was first shipped. `CREATE TABLE IF NOT
+# EXISTS` is a no-op against a database that already exists, so a plain schema
+# edit would leave every existing outbox without these and the INSERT below
+# would fail on a missing column. Applied idempotently on every open.
+_ADDED_COLUMNS = {
+    "author":    "TEXT NOT NULL DEFAULT 'unknown'",
+    "tool_name": "TEXT",
+    "model":     "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add post-v1 columns to an existing outbox.
+
+    Rows captured before this ran keep author='unknown' rather than being
+    guessed at. That is deliberate: 'unknown' is honest and greppable, whereas
+    defaulting them to 'martin' would silently manufacture the exact bad data
+    HOME-309 is about.
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(outbox)")}
+    if not have:
+        return  # table does not exist yet; SCHEMA will create it complete
+    for col, decl in _ADDED_COLUMNS.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE outbox ADD COLUMN {col} {decl}")
+
+
 def _append_to_outbox(records: list[dict], session_id: str, name: str | None) -> None:
     conn = sqlite3.connect(OUTBOX_PATH, timeout=10)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         with conn:
             # INSERT OR IGNORE against the UNIQUE message_uuid is what makes
             # this safe to run on every Stop: the hook re-reads the entire
@@ -235,10 +357,12 @@ def _append_to_outbox(records: list[dict], session_id: str, name: str | None) ->
                 """
                 INSERT OR IGNORE INTO outbox
                     (message_uuid, session_id, project_path, git_branch,
-                     conversation_name, host, role, content, sequence_num, created_at)
+                     conversation_name, host, role, author, tool_name, model,
+                     content, sequence_num, created_at)
                 VALUES
                     (:message_uuid, :session_id, :project_path, :git_branch,
-                     :conversation_name, :host, :role, :content, :sequence_num, :created_at)
+                     :conversation_name, :host, :role, :author, :tool_name, :model,
+                     :content, :sequence_num, :created_at)
                 """,
                 records,
             )
@@ -308,12 +432,16 @@ def main() -> None:
     # uuid -> source paths of the images that message carries (HOME-315).
     image_sources = _image_sources(entries)
 
+    # tool_result blocks name only the call they answer, so the tool's name has
+    # to come from the assistant's matching tool_use block. Build once.
+    tool_names = _tool_use_names(entries)
+
     records = []
     for seq, entry in enumerate(messages):
         msg  = entry["message"]
-        content = msg.get("content", "")
-        text = _extract_text(content)
-        markers = _image_markers(content, image_sources.get(entry.get("uuid") or "", []))
+        raw  = msg.get("content", "")
+        text = _extract_text(raw)
+        markers = _image_markers(raw, image_sources.get(entry.get("uuid") or "", []))
         if markers:
             # Appended, not substituted: "[Image #1]" carries the ordering the
             # rest of the conversation refers to, so keep it and add the detail.
@@ -322,6 +450,7 @@ def main() -> None:
             continue
         ts_raw = entry.get("timestamp")
         ts = datetime.fromisoformat(ts_raw) if ts_raw else datetime.now(timezone.utc)
+        author = classify_author(msg["role"], raw)
         records.append({
             "message_uuid":      entry.get("uuid") or f"{session_id}:{seq}",
             "session_id":        session_id,
@@ -330,6 +459,13 @@ def main() -> None:
             "conversation_name": name,
             "host":              HOST,
             "role":              msg["role"],
+            # Derived from transcript structure, not from the text. See
+            # classify_author — this is the field HOME-309 existed for.
+            "author":            author,
+            "tool_name":         _tool_name_for(raw, tool_names) if author == "tool" else None,
+            # '<synthetic>' appears for harness-generated assistant turns; keep
+            # it rather than normalising, so it stays distinguishable later.
+            "model":             msg.get("model") if author == "claude" else None,
             "content":           text,
             "sequence_num":      seq,
             # The real transcript timestamp. The forwarder may not deliver this
