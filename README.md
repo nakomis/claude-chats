@@ -4,6 +4,28 @@ Records Claude Code conversations to PostgreSQL with vector embeddings for seman
 
 A hook fires on every user message and again at session end, saving new messages to Postgres incrementally. Each message is embedded using your chosen provider so the MCP tools can do similarity search across all past conversations.
 
+## Two editions
+
+The project started as a single-machine tool and grew into a distributed one.
+Both are in this repository, and they are separate: pick one.
+
+| | [`localhost/`](localhost/README.md) | this directory |
+|---|---|---|
+| Runs on | one machine | a client and a server |
+| Database | local Docker PostgreSQL | PostgreSQL on the server |
+| Delivery | direct write, or a local SQLite outbox drained by a LaunchAgent | SQLite outbox → Rust forwarder → ActiveMQ → worker |
+| Extra pieces | none | message broker, worker, S3 backups deployed with CDK, SMB image share |
+| Install | [`localhost/INSTALL.md`](localhost/INSTALL.md) | `server/install.sh`, then `install-client.sh` |
+
+**If you just want this on your laptop, use [`localhost/`](localhost/README.md).**
+
+Note that the distributed edition is not self-contained: `hook/hook/record.py`
+only appends to a local outbox, and the forwarder that drains it lives in
+`nakomis/home-infra`, as does the deployed copy of `init.sql`. The root
+`install.sh` below therefore sets up capture but not delivery — the single-machine
+edition in `localhost/` is the one that works end to end from this repository
+alone.
+
 ## Support
 
 If you find this useful, please consider buying me a coffee:

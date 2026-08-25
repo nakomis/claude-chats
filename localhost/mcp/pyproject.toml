@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "conversation-memory-mcp-localhost"
+version = "0.1.0"
+description = "MCP server — semantic search and retrieval of recorded Claude Code conversations"
+requires-python = ">=3.11"
+dependencies = [
+    # Upper bound is load-bearing: mcp 2.x moved mcp.server.fastmcp, which
+    # server.py imports. The distributed edition is pinned to the same major
+    # by its lockfile; this edition has to say so out loud.
+    "mcp[cli]>=1.0.0,<2",
+    "httpx>=0.27.0",
+    "psycopg[binary]>=3.1.0",
+    "boto3>=1.35.0",
+    "openai>=1.0.0",
+]
+
+[project.scripts]
+conversation-memory-mcp = "conversation_memory_mcp.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+# Named explicitly because the project name no longer matches the package
+# directory — hatchling's default heuristic looks for `conversation_memory_mcp_localhost`.
+[tool.hatch.build.targets.wheel]
+packages = ["conversation_memory_mcp"]

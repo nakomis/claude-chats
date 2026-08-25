@@ -1,0 +1,27 @@
+# Single-machine edition: PostgreSQL and nothing else.
+#
+# The distributed edition's compose file also brings up an ActiveMQ broker and a
+# backup container that ships dumps to S3. Neither has a job here — the drainer
+# runs locally, and `install.sh --backup` writes to local disk.
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: claude-chats-db
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: claude_chats
+      POSTGRES_USER: claude
+      POSTGRES_PASSWORD: claude
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U claude -d claude_chats"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
