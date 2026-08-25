@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Drains the SQLite outbox into PostgreSQL (durable capture mode only).
+
+    The hook appends to the outbox and does no network I/O, so capture cannot
+    fail. This agent owns everything that can: Docker being down, Postgres not
+    yet accepting connections, an embedding provider that is not running. When
+    it fails the outbox simply grows and drains on the next run.
+
+    Only installed when the capture mode is `durable`. In `direct` mode the hook
+    writes to Postgres itself and there is nothing to drain, so install.sh boots
+    this agent out.
+
+    REPO_PATH, UV_PATH and the environment values are substituted at install
+    time by install.sh.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nakomis.claude-chats-drain</string>
+
+    <!-- Absolute path to uv, not `/usr/bin/env uv`: launchd runs with a minimal
+         PATH that does not include /opt/homebrew/bin, so env would not find it
+         and the agent would fail silently for ever. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>UV_PATH</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>REPO_PATH/hook</string>
+        <string>drain-outbox</string>
+    </array>
+
+    <!-- launchd inherits almost nothing, so the provider configuration has to
+         be stated here or the drainer would embed with the wrong model. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+ENV_ENTRIES
+    </dict>
+
+    <!-- Every two minutes. Messages are already safe in the outbox, so this is
+         about making them searchable promptly rather than urgently — but two
+         minutes is short enough that a conversation you just finished is
+         findable by the time you think to look for it. -->
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <!-- Catch up on anything captured while the Mac was asleep or Postgres was
+         down. Safe: draining is idempotent. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-chats-drain.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-chats-drain.log</string>
+</dict>
+</plist>

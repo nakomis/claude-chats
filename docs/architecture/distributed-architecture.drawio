@@ -1,0 +1,161 @@
+<mxfile host="app.diagrams.net" type="device">
+  <diagram name="claude-chats capture and recall" id="claude-chats-distributed">
+    <mxGraphModel dx="1600" dy="820" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="800" background="#FFFFFF" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="g1" value="Client Mac — this repository" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#6C8EBF;dashed=1;dashPattern=8 4;verticalAlign=top;align=left;spacingLeft=14;spacingTop=6;fontStyle=1;fontSize=13;fontColor=#3F5F8F;" vertex="1" parent="1">
+          <mxGeometry x="20" y="70" width="470" height="440" as="geometry" />
+        </mxCell>
+        <mxCell id="g4" value="NAS — Leia" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999999;dashed=1;dashPattern=8 4;verticalAlign=top;align=left;spacingLeft=14;spacingTop=6;fontStyle=1;fontSize=13;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="20" y="570" width="470" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="g2" value="Delivery — nakomis/home-infra  ·  not in this repository" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FAFAFA;strokeColor=#B0B0B0;dashed=1;dashPattern=8 4;verticalAlign=top;align=left;spacingLeft=14;spacingTop=6;fontStyle=2;fontSize=13;fontColor=#777777;" vertex="1" parent="1">
+          <mxGeometry x="540" y="70" width="560" height="560" as="geometry" />
+        </mxCell>
+        <mxCell id="g2a" value="AWS Cloud" style="sketch=0;outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=12;fontStyle=1;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_aws_cloud;strokeColor=#232F3E;fillColor=none;verticalAlign=top;align=left;spacingLeft=30;fontColor=#232F3E;dashed=0;" vertex="1" parent="1">
+          <mxGeometry x="565" y="230" width="290" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="g2b" value="Cal" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#82B366;dashed=1;dashPattern=8 4;verticalAlign=top;align=left;spacingLeft=12;spacingTop=6;fontStyle=1;fontSize=12;fontColor=#4F7A3A;" vertex="1" parent="1">
+          <mxGeometry x="880" y="230" width="200" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="g3" value="Luke" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#D79B00;dashed=1;dashPattern=8 4;verticalAlign=top;align=left;spacingLeft=14;spacingTop=6;fontStyle=1;fontSize=13;fontColor=#A67400;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="230" width="380" height="200" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n1" value="&lt;b&gt;Claude Code session&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px&quot;&gt;~/.claude/projects/**/*.jsonl&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="100" y="118" width="370" height="46" as="geometry" />
+        </mxCell>
+        <mxCell id="n2" value="&lt;b&gt;hook&lt;/b&gt;&lt;br/&gt;record-conversation&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;no network, no credentials&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="100" y="190" width="170" height="68" as="geometry" />
+        </mxCell>
+        <mxCell id="n3" value="&lt;b&gt;MCP server&lt;/b&gt;&lt;br/&gt;conversation-memory&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;search · get · list&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="290" y="190" width="180" height="68" as="geometry" />
+        </mxCell>
+        <mxCell id="n4" value="&lt;b&gt;SQLite outbox&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;~/.claude-chats/outbox.db&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=10;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="100" y="292" width="170" height="68" as="geometry" />
+        </mxCell>
+        <mxCell id="n5" value="&lt;b&gt;query embedding&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Ollama (local) · Bedrock · OpenAI&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="290" y="292" width="180" height="68" as="geometry" />
+        </mxCell>
+        <mxCell id="n7" value="&lt;b&gt;image staging&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;~/.claude-chats/images&lt;br/&gt;+ JSON sidecars&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=10;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="100" y="394" width="170" height="68" as="geometry" />
+        </mxCell>
+        <mxCell id="n8" value="&lt;b&gt;flush-images&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;launchd · every 15 min&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="290" y="394" width="180" height="68" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n10" value="&lt;b&gt;forwarder&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Rust · launchd · runs on the Mac&lt;br/&gt;IAM Roles Anywhere (mTLS) · send-only&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="575" y="120" width="200" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="n11" value="SQS — ingest queue" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#E7157B;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;pointerEvents=1;shape=mxgraph.aws4.sqs;" vertex="1" parent="1">
+          <mxGeometry x="600" y="265" width="78" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="n13" value="SQS — DLQ" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#E7157B;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;pointerEvents=1;shape=mxgraph.aws4.sqs;" vertex="1" parent="1">
+          <mxGeometry x="600" y="400" width="78" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="n12" value="S3 — claim check" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#7AA116;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;pointerEvents=1;shape=mxgraph.aws4.bucket;" vertex="1" parent="1">
+          <mxGeometry x="740" y="400" width="75" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="n14" value="&lt;b&gt;embedding-consumer&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Rust · polls SQS&lt;br/&gt;decrypt (age) → embed → write&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="900" y="280" width="160" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="n15" value="&lt;b&gt;Ollama&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;mxbai-q8 · one embed at a time&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="900" y="400" width="160" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n20" value="&lt;b&gt;PostgreSQL + pgvector&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;:5433 · LAN only, never exposed&lt;br/&gt;conversations · messages (vector 1024 + tsvector)&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=12;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1180" y="290" width="320" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="n21" value="&lt;b&gt;SMB share&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;/Volumes/share/claude-chats/images&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=10;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="60" y="610" width="390" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="note1" value="&lt;i&gt;Every hop is outbound. The home network accepts no inbound connections:&lt;br/&gt;the Mac pushes to SQS, Cal polls from it, and Postgres stays on the LAN.&lt;/i&gt;" style="text;html=1;align=center;verticalAlign=middle;fontSize=11;fontColor=#777777;" vertex="1" parent="1">
+          <mxGeometry x="540" y="645" width="560" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="note3" value="&lt;i&gt;also serves POST /search for the&lt;br/&gt;home portal SPA (mTLS + Cognito)&lt;/i&gt;" style="text;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#4F7A3A;" vertex="1" parent="1">
+          <mxGeometry x="880" y="516" width="200" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="note2" value="&lt;i&gt;Full ingest topology:&lt;br/&gt;home-infra docs/architecture/conversation-memory.drawio&lt;/i&gt;" style="text;html=1;align=center;verticalAlign=middle;fontSize=11;fontColor=#777777;" vertex="1" parent="1">
+          <mxGeometry x="540" y="530" width="290" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" value="Stop · UserPromptSubmit" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#3F5F8F;fontSize=10;" edge="1" parent="1" source="n1" target="n2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="tool call" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#3F5F8F;fontSize=10;" edge="1" parent="1" source="n1" target="n3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="append" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#3F5F8F;fontSize=10;" edge="1" parent="1" source="n2" target="n4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="images" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#3F5F8F;fontSize=10;" edge="1" parent="1" source="n2" target="n7">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="72" y="224" />
+              <mxPoint x="72" y="428" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e5" value="drain" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#D6B656;strokeWidth=2;fontSize=10;fontColor=#A6870C;" edge="1" parent="1" source="n4" target="n10">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="185" y="490" />
+              <mxPoint x="520" y="490" />
+              <mxPoint x="520" y="158" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="enqueue · age-encrypted" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#E7157B;strokeWidth=2;fontSize=10;fontColor=#B01062;" edge="1" parent="1" source="n10" target="n11">
+          <mxGeometry relative="1" as="geometry"><mxPoint as="offset" y="-22" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e7" value="&amp;gt; 200 KB" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#7AA116;fontSize=10;fontColor=#5A7A10;" edge="1" parent="1" source="n10" target="n12">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="777" y="196" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" value="poll" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.32;entryDx=0;entryDy=0;strokeColor=#E7157B;strokeWidth=2;fontSize=10;fontColor=#B01062;" edge="1" parent="1" source="n11" target="n14">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" value="repeated failure" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#B85450;dashed=1;fontSize=10;fontColor=#B85450;" edge="1" parent="1" source="n11" target="n13">
+          <mxGeometry relative="1" as="geometry"><mxPoint as="offset" y="16" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e10" value="fetch payload" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.82;entryDx=0;entryDy=0;strokeColor=#7AA116;fontSize=10;fontColor=#5A7A10;" edge="1" parent="1" source="n12" target="n14">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="862" y="439" />
+              <mxPoint x="862" y="342" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11" value="embed" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#4F7A3A;fontSize=10;" edge="1" parent="1" source="n14" target="n15">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" value="upsert" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.32;entryDx=0;entryDy=0;strokeColor=#4F7A3A;strokeWidth=2;fontSize=10;fontColor=#4F7A3A;" edge="1" parent="1" source="n14" target="n20">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" value="embed query" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#9673A6;fontSize=10;" edge="1" parent="1" source="n3" target="n5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" value="SQL :5433 — direct to Postgres, on the LAN" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#9673A6;strokeWidth=2;fontSize=10;fontColor=#9673A6;" edge="1" parent="1" source="n3" target="n20">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="380" y="40" />
+              <mxPoint x="1340" y="40" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e15" value="moves staged files" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#7F7F7F;fontSize=10;" edge="1" parent="1" source="n7" target="n8">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" value="SMB write" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.56;entryY=0;entryDx=0;entryDy=0;strokeColor=#7F7F7F;fontSize=10;" edge="1" parent="1" source="n8" target="n21">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
