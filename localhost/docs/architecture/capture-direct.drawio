@@ -1,0 +1,68 @@
+<mxfile host="app.diagrams.net" type="device">
+  <diagram name="direct capture" id="localhost-direct">
+    <mxGraphModel dx="1000" dy="620" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1000" pageHeight="600" background="#FFFFFF" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="g1" value="Your machine — direct capture" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#6C8EBF;dashed=1;dashPattern=8 4;verticalAlign=top;align=left;spacingLeft=14;spacingTop=6;fontStyle=1;fontSize=13;fontColor=#3F5F8F;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="900" height="520" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n1" value="&lt;b&gt;Claude Code session&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;~/.claude/projects/**/*.jsonl&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="90" y="90" width="380" height="46" as="geometry" />
+        </mxCell>
+        <mxCell id="n3" value="&lt;b&gt;embedding provider&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Ollama (local) · Bedrock · OpenAI&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="80" width="340" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="n2" value="&lt;b&gt;hook&lt;/b&gt; — record-conversation&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;embeds and writes inline&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="90" y="170" width="380" height="68" as="geometry" />
+        </mxCell>
+        <mxCell id="n5" value="&lt;b&gt;MCP server&lt;/b&gt; — conversation-memory&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;search_memory · get_conversation · list_recent_sessions&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="180" width="340" height="68" as="geometry" />
+        </mxCell>
+        <mxCell id="n4" value="&lt;b&gt;PostgreSQL + pgvector&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Docker · localhost:5433 · conversations · messages&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=12;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="90" y="300" width="790" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="n6" value="&lt;b&gt;image archive&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;~/.claude-chats/images + sidecars&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=8;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="90" y="430" width="380" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="n7" value="&lt;b&gt;fallback&lt;/b&gt; — outbox-fallback.ndjson&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;only when the write fails · recover with --replay-fallback&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8F0F0;strokeColor=#B85450;dashed=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="430" width="340" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" value="Stop · UserPromptSubmit" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;strokeColor=#3F5F8F;fontSize=10;" edge="1" parent="1" source="n1" target="n2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="tool call" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#3F5F8F;fontSize=10;" edge="1" parent="1" source="n1" target="n5">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="505" y="113" /><mxPoint x="505" y="214" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e3" value="embed message" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.8;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#9673A6;fontSize=10;fontColor=#9673A6;" edge="1" parent="1" source="n2" target="n3">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="520" y="224" /><mxPoint x="520" y="113" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e4" value="INSERT (with vector)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;strokeColor=#D79B00;strokeWidth=2;fontSize=10;fontColor=#A67400;" edge="1" parent="1" source="n2" target="n4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="embed query" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;strokeColor=#9673A6;fontSize=10;fontColor=#9673A6;" edge="1" parent="1" source="n5" target="n3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" value="SQL :5433" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.78;entryY=0;entryDx=0;entryDy=0;strokeColor=#D79B00;strokeWidth=2;fontSize=10;fontColor=#A67400;" edge="1" parent="1" source="n5" target="n4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" value="images" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#3F5F8F;fontSize=10;" edge="1" parent="1" source="n2" target="n6">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="68" y="204" /><mxPoint x="68" y="460" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" value="on failure" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;labelBackgroundColor=#FFFFFF;dashed=1;exitX=1;exitY=1;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#B85450;fontSize=10;fontColor=#B85450;" edge="1" parent="1" source="n2" target="n7">
+          <mxGeometry relative="1" as="geometry"><mxPoint as="offset" x="150" y="0" />
+            <Array as="points"><mxPoint x="470" y="274" /><mxPoint x="910" y="274" /><mxPoint x="910" y="460" /></Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

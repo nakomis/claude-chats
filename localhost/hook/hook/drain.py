@@ -2,10 +2,10 @@
 Drain the local SQLite outbox into Postgres (durable capture mode only).
 
 In the distributed edition this job is split three ways: a Rust forwarder ships
-outbox rows to an ActiveMQ broker, and a Node worker on the server consumes the
-queue, embeds, and writes to Postgres. On a single machine there is no network
-between those pieces, so this module is all three of them — read the pending
-rows, embed, write, mark them sent.
+outbox rows to an SQS queue, and a consumer on another box drains it, embeds,
+and writes to Postgres. That split exists so the write path survives being away
+from home. On a single machine there is no network between those pieces, so this
+module is all three of them — read the pending rows, embed, write, mark sent.
 
 Rows are NOT deleted once written. They are left as tombstones with the content
 blanked and `sent_at` set, because record.py re-reads the entire transcript on

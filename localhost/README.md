@@ -37,57 +37,21 @@ There are two ways the recording half can work, chosen at install time.
 
 The hook does everything inline: embed, then write.
 
-```
- You send a message / the session ends
-              │
-              ▼
-   Hook (record-conversation)
-              │
-              ├─ reads ~/.claude/projects/**/*.jsonl
-              ├─ embeds each new message  ──►  Ollama / Bedrock / OpenAI
-              └─ INSERT                   ──►  PostgreSQL + pgvector
-                                                     │
-                                                     ▼
-                                          MCP server (conversation-memory)
-                                          search_memory · get_conversation
-                                              · list_recent_sessions
-```
+![Direct capture](docs/architecture/capture-direct.svg)
 
-Simplest, and a message is searchable the moment the session stops. The cost is
-that capture now depends on Docker, Postgres and the embedding provider all
-being up. When one of them is not, the message goes to an append-only fallback
-file and waits for `./install.sh --replay-fallback`.
+Simplest, and a message is searchable the moment the session stops. The cost is that capture now depends on Docker, Postgres and the embedding provider all being up. When one of them is not, the message goes to an append-only fallback file and waits for `./install.sh --replay-fallback`.
 
 ### durable
 
 Capture and delivery are split, and only capture has to be reliable.
 
-```
- You send a message / the session ends
-              │
-              ▼
-   Hook (record-conversation)          ← no network, no credentials,
-              │                          nothing that can be "down"
-              └─ INSERT ──►  ~/.claude-chats/outbox.db  (SQLite)
-                                    │
-                                    │  every 2 minutes, via launchd
-                                    ▼
-                          Drainer (drain-outbox)
-                                    │
-                                    ├─ embeds  ──►  Ollama / Bedrock / OpenAI
-                                    └─ INSERT  ──►  PostgreSQL + pgvector
-                                                          │
-                                                          ▼
-                                               MCP server (conversation-memory)
-```
+![Durable capture](docs/architecture/capture-durable.svg)
 
-The hook appends to a local SQLite file and does no network I/O at all, so a
-stopped database is a delay rather than a lost message — the outbox simply grows
-and drains later. The costs are one more moving part and a couple of minutes
-before a message becomes searchable.
+The hook appends to a local SQLite file and does no network I/O at all, so a stopped database is a delay rather than a lost message — the outbox simply grows and drains later. The costs are one more moving part and a couple of minutes before a message becomes searchable.
 
-This is the same split the distributed edition uses, with the Rust forwarder,
-the message broker and the remote worker collapsed into one local process.
+This is the same split the distributed edition uses, with its forwarder, SQS queue and remote consumer collapsed into one local process.
+
+*Diagram sources: [`docs/architecture/`](docs/architecture). The SVGs are regenerated on commit by the repository's `githooks/pre-commit`.*
 
 ## What you get
 
