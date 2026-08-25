@@ -76,7 +76,7 @@
           <mxGeometry x="540" y="645" width="560" height="40" as="geometry" />
         </mxCell>
         <mxCell id="note3" value="&lt;i&gt;also serves POST /search for the&lt;br/&gt;home portal SPA (mTLS + Cognito)&lt;/i&gt;" style="text;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#4F7A3A;" vertex="1" parent="1">
-          <mxGeometry x="880" y="500" width="200" height="34" as="geometry" />
+          <mxGeometry x="880" y="516" width="200" height="34" as="geometry" />
         </mxCell>
         <mxCell id="note2" value="&lt;i&gt;Full ingest topology:&lt;br/&gt;home-infra docs/architecture/conversation-memory.drawio&lt;/i&gt;" style="text;html=1;align=center;verticalAlign=middle;fontSize=11;fontColor=#777777;" vertex="1" parent="1">
           <mxGeometry x="540" y="530" width="290" height="40" as="geometry" />
