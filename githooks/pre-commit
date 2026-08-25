@@ -1,0 +1,18 @@
+#!/bin/bash
+
+FILES=$(git diff --cached --name-status)
+
+if [[ $FILES =~ .drawio ]]; then
+    echo
+    echo "--- Auto-generating SVG files for drawio diagrams ---"
+    find docs -name "*.drawio" | while read -r f; do
+        svg="${f%.drawio}.svg"
+        # -o, not a trailing positional: draw.io treats extra positionals as
+        # further *inputs* and exits complaining the .svg does not exist.
+        /Applications/draw.io.app/Contents/MacOS/draw.io -x "$f" -f svg -s 1 -o "$svg"
+        git add "$svg"
+    done
+    echo
+fi
+
+exit 0
