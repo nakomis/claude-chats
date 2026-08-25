@@ -1,0 +1,587 @@
+<meta charset="utf-8">
+<title>Conversation Memory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Public+Sans:ital,wght@0,400;0,500;0,700;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  /* ---- tokens: light is the base, both dark states override only these ---- */
+  :root {
+    --ground:   #F1F0EC;
+    --surface:  #FFFFFF;
+    --sunk:     #E5E4DF;
+    --ink:      #171B24;
+    --muted:    #656B7A;
+    --line:     #D2D1CB;
+    --primary:  #3B3AA8;
+    --on-primary: #FFFFFF;
+    --signal:   #C24A16;
+    --signal-soft: #F6E2D6;
+
+    --f-display: "Bricolage Grotesque", "Helvetica Neue", Arial, sans-serif;
+    --f-body:    "Public Sans", "Helvetica Neue", Arial, sans-serif;
+    --f-mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    /* everything scales off the slide box, so it reads on any projector */
+    --u: clamp(0.62rem, 1.15vmin + 0.35vw, 1.15rem);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:  #0F131A;
+      --surface: #171C25;
+      --sunk:    #1F252F;
+      --ink:     #E8E9EC;
+      --muted:   #989EAE;
+      --line:    #2C333F;
+      --primary: #9694F2;
+      --on-primary: #10131B;
+      --signal:  #F5883F;
+      --signal-soft: #37241A;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:  #0F131A;
+    --surface: #171C25;
+    --sunk:    #1F252F;
+    --ink:     #E8E9EC;
+    --muted:   #989EAE;
+    --line:    #2C333F;
+    --primary: #9694F2;
+    --on-primary: #10131B;
+    --signal:  #F5883F;
+    --signal-soft: #37241A;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: calc(var(--u) * 1.55);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  /* ---- deck shell ---------------------------------------------------- */
+  .deck { position: fixed; inset: 0; }
+
+  .slide {
+    position: absolute; inset: 0;
+    display: none;
+    flex-direction: column;
+    justify-content: center;
+    gap: calc(var(--u) * 1.6);
+    padding: calc(var(--u) * 5) calc(var(--u) * 7) calc(var(--u) * 7);
+    overflow-y: auto;
+  }
+  .slide[data-active] { display: flex; }
+  @media (prefers-reduced-motion: no-preference) {
+    .slide[data-active] > * { animation: rise .38s cubic-bezier(.2,.7,.3,1) backwards; }
+    .slide[data-active] > *:nth-child(2) { animation-delay: .05s; }
+    .slide[data-active] > *:nth-child(3) { animation-delay: .10s; }
+    .slide[data-active] > *:nth-child(4) { animation-delay: .15s; }
+    .slide[data-active] > *:nth-child(5) { animation-delay: .20s; }
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(calc(var(--u) * 0.9)); } }
+
+  /* ---- type ---------------------------------------------------------- */
+  h1, h2, h3 { font-family: var(--f-display); margin: 0; text-wrap: balance; line-height: 1.04; }
+  h1 { font-size: calc(var(--u) * 6.4); font-weight: 800; letter-spacing: -0.025em; }
+  h2 { font-size: calc(var(--u) * 4.2); font-weight: 700; letter-spacing: -0.02em; max-width: 20ch; }
+  h3 { font-size: calc(var(--u) * 2.1); font-weight: 600; letter-spacing: -0.01em; }
+  p  { margin: 0; max-width: 46ch; }
+  .lead { font-size: calc(var(--u) * 2.05); color: var(--muted); max-width: 40ch; }
+  strong { font-weight: 700; color: var(--ink); }
+  em.hl { font-style: normal; color: var(--signal); font-weight: 600; }
+
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: calc(var(--u) * 1.15);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--muted);
+    display: flex; align-items: center; gap: calc(var(--u) * 0.9);
+  }
+  .eyebrow::before {
+    content: ""; width: calc(var(--u) * 2.6); height: 2px;
+    background: var(--signal); flex: none;
+  }
+
+  code, .mono { font-family: var(--f-mono); font-size: 0.88em; }
+  code:not(pre code) {
+    background: var(--sunk); padding: 0.12em 0.38em;
+    border-radius: 3px; color: var(--ink);
+  }
+
+  /* ---- reusable blocks ------------------------------------------------ */
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(24ch, 1fr)); gap: calc(var(--u) * 2.2); align-items: start; }
+  .cols.tight { gap: calc(var(--u) * 1.4); }
+
+  ul.plain { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: calc(var(--u) * 1.15); max-width: 52ch; }
+  ul.plain li { display: grid; grid-template-columns: calc(var(--u) * 2.4) 1fr; gap: calc(var(--u) * 0.8); align-items: baseline; }
+  ul.plain li::before {
+    content: "→"; font-family: var(--f-mono); color: var(--signal);
+    font-size: 0.86em;
+  }
+  ul.plain.numbered { counter-reset: n; }
+  ul.plain.numbered li::before {
+    counter-increment: n; content: counter(n, decimal-leading-zero);
+    color: var(--muted); font-size: 0.72em; letter-spacing: 0.06em;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: calc(var(--u) * 1.8) calc(var(--u) * 2);
+    display: flex; flex-direction: column; gap: calc(var(--u) * 0.7);
+  }
+  .card h3 { color: var(--ink); }
+  .card p { font-size: calc(var(--u) * 1.4); color: var(--muted); max-width: none; }
+  .card .tag {
+    font-family: var(--f-mono); font-size: calc(var(--u) * 1.05);
+    text-transform: uppercase; letter-spacing: 0.12em; color: var(--signal);
+  }
+  .card.accent { border-color: var(--signal); background: var(--signal-soft); }
+  .card.accent p { color: var(--ink); }
+
+  pre {
+    font-family: var(--f-mono);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--primary);
+    border-radius: 5px;
+    padding: calc(var(--u) * 1.5) calc(var(--u) * 1.8);
+    margin: 0;
+    font-size: calc(var(--u) * 1.4);
+    line-height: 1.65;
+    overflow-x: auto;
+    max-width: 62ch;
+  }
+  pre .c { color: var(--muted); }
+  pre .k { color: var(--primary); font-weight: 600; }
+  pre .s { color: var(--signal); }
+
+  .big-stat { font-family: var(--f-display); font-size: calc(var(--u) * 5.2); font-weight: 800; letter-spacing: -0.03em; line-height: 1; }
+  .big-stat + p { color: var(--muted); font-size: calc(var(--u) * 1.4); }
+
+  /* ---- title slide ---------------------------------------------------- */
+  .slide.title { justify-content: center; gap: calc(var(--u) * 2.2); }
+  .slide.title h1 { font-size: calc(var(--u) * 8.2); max-width: 16ch; }
+  .byline { display: flex; gap: calc(var(--u) * 1.2); align-items: baseline; font-family: var(--f-mono); font-size: calc(var(--u) * 1.3); color: var(--muted); }
+
+  /* ---- quote / punch slides ------------------------------------------- */
+  .slide.punch { justify-content: center; align-items: flex-start; }
+  .slide.punch h2 { font-size: calc(var(--u) * 5.6); max-width: 17ch; }
+
+  /* ---- transcript mock ------------------------------------------------ */
+  .chat { display: flex; flex-direction: column; gap: calc(var(--u) * 1.1); max-width: 64ch; width: 100%; }
+  .msg { display: grid; grid-template-columns: calc(var(--u) * 7) 1fr; gap: calc(var(--u) * 1.2); align-items: start; }
+  .msg .who { font-family: var(--f-mono); font-size: calc(var(--u) * 1.15); color: var(--muted); text-align: right; padding-top: 0.25em; }
+  .msg .what { background: var(--surface); border: 1px solid var(--line); border-radius: 5px; padding: calc(var(--u) * 1.1) calc(var(--u) * 1.4); font-size: calc(var(--u) * 1.4); }
+  .msg.hit .what { border-color: var(--signal); background: var(--signal-soft); }
+  .msg .what .meta { font-family: var(--f-mono); font-size: calc(var(--u) * 1.05); color: var(--muted); display: block; margin-bottom: 0.35em; }
+
+  /* ---- diagram -------------------------------------------------------- */
+  .diagram { width: 100%; max-width: calc(var(--u) * 78); }
+  .diagram svg { width: 100%; height: auto; display: block; }
+  .dg-box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+  .dg-box.pri { stroke: var(--primary); }
+  .dg-box.acc { stroke: var(--signal); }
+  .dg-t { fill: var(--ink); font-family: var(--f-body); font-size: 13px; font-weight: 600; }
+  .dg-s { fill: var(--muted); font-family: var(--f-mono); font-size: 10.5px; }
+  .dg-l { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+  .dg-l.acc { stroke: var(--signal); stroke-width: 2; }
+  .dg-arrow { fill: var(--muted); stroke: none; }
+  .dg-arrow.acc { fill: var(--signal); }
+  .dg-lab { fill: var(--muted); font-family: var(--f-mono); font-size: 10px; }
+
+  /* ---- footer rail ---------------------------------------------------- */
+  .rail {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    height: calc(var(--u) * 3.4);
+    display: flex; align-items: center; gap: calc(var(--u) * 1.6);
+    padding: 0 calc(var(--u) * 7);
+    font-family: var(--f-mono); font-size: calc(var(--u) * 1.1);
+    color: var(--muted);
+    border-top: 1px solid var(--line);
+    background: var(--ground);
+  }
+  .rail .track { flex: 1; height: 2px; background: var(--line); position: relative; }
+  .rail .fill { position: absolute; inset: 0 auto 0 0; background: var(--signal); width: 0; transition: width .28s ease; }
+  @media (prefers-reduced-motion: reduce) { .rail .fill { transition: none; } }
+  .rail .count { font-variant-numeric: tabular-nums; }
+
+  .btns { position: fixed; top: calc(var(--u) * 1.6); right: calc(var(--u) * 2); display: flex; gap: calc(var(--u) * 0.6); }
+  .btns button {
+    font-family: var(--f-mono); font-size: calc(var(--u) * 1.15);
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 4px;
+    padding: calc(var(--u) * 0.35) calc(var(--u) * 0.9);
+    cursor: pointer; line-height: 1.4;
+  }
+  .btns button:hover { color: var(--ink); border-color: var(--muted); }
+  .btns button:focus-visible, .slide a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+
+  a { color: var(--primary); text-underline-offset: 3px; }
+
+  @media (max-width: 700px) {
+    .slide { padding: calc(var(--u) * 4) calc(var(--u) * 3) calc(var(--u) * 6); }
+    .rail { padding: 0 calc(var(--u) * 3); }
+    .msg { grid-template-columns: 1fr; }
+    .msg .who { text-align: left; }
+  }
+</style>
+
+<div class="deck" id="deck">
+
+  <!-- 1 ................................................................. -->
+  <section class="slide title">
+    <div class="eyebrow">Lightning talk · 15 minutes</div>
+    <h1>Claude forgets everything. Mine doesn't.</h1>
+    <p class="lead">A conversation memory for Claude Code — every session you've ever had, searchable from inside the next one. Runs entirely on your laptop.</p>
+    <div class="byline"><span>Martin Harris</span><span>·</span><span>github.com/nakomis/claude-chats</span></div>
+  </section>
+
+  <!-- 2 ................................................................. -->
+  <section class="slide">
+    <div class="eyebrow">The problem</div>
+    <h2>You have had this conversation before.</h2>
+    <ul class="plain">
+      <li>Context window fills. Auto-compaction fires. The reasoning is gone, the summary is not the same thing.</li>
+      <li>New day, new session — you re-explain the codebase, the conventions, the constraints.</li>
+      <li>Six weeks ago you and Claude solved this exact bug. Neither of you remembers how.</li>
+      <li>"Why is it done this way?" The answer was in a session you closed in March.</li>
+    </ul>
+  </section>
+
+  <!-- 3 ................................................................. -->
+  <section class="slide punch">
+    <div class="eyebrow">The thing nobody says out loud</div>
+    <h2>Your best design docs are the conversations you never wrote down.</h2>
+    <p class="lead">Every trade-off you talked through, every "no, do it this way, because…" — captured in full, then thrown away when the session ended.</p>
+  </section>
+
+  <!-- 4 ................................................................. -->
+  <section class="slide">
+    <div class="eyebrow">What I built</div>
+    <h2>A hook, a database, and three MCP tools.</h2>
+    <div class="cols">
+      <div class="card">
+        <span class="tag">Capture</span>
+        <h3>Every message, automatically</h3>
+        <p>A Claude Code hook fires on each prompt and at session end. No plugin, no remembering to save.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Store</span>
+        <h3>Postgres + pgvector</h3>
+        <p>Each message embedded as a vector, plus a full-text index. One Docker container.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Recall</span>
+        <h3>Claude searches its own past</h3>
+        <p>An MCP server exposes the archive as tools. Claude decides when to look things up.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 ................................................................. -->
+  <section class="slide">
+    <div class="eyebrow">In practice</div>
+    <h2>You just ask.</h2>
+    <div class="chat">
+      <div class="msg">
+        <span class="who">you</span>
+        <span class="what">What did we decide about retry backoff on the ingest worker?</span>
+      </div>
+      <div class="msg">
+        <span class="who">claude</span>
+        <span class="what"><span class="meta">→ search_memory("retry backoff ingest worker")</span>Three hits, the closest from 14 March…</span>
+      </div>
+      <div class="msg hit">
+        <span class="who">14 Mar</span>
+        <span class="what"><span class="meta">nakomis/ingest · branch: spike-retries · 5 months ago</span>"…so exponential is wrong here — the downstream is rate-limited per minute, not per request. Fixed delay of 20s, cap at 5 attempts, then DLQ."</span>
+      </div>
+    </div>
+    <p class="lead">It found a decision you made before the repo had a README.</p>
+  </section>
+
+  <!-- 6 ................................................................. -->
+  <section class="slide">
+    <div class="eyebrow">The three tools</div>
+    <h2>Small surface, on purpose.</h2>
+    <div class="cols tight">
+      <div class="card">
+        <span class="tag">search_memory</span>
+        <p>Hybrid search — semantic similarity <em>and</em> full-text, fused. Returns the matching messages with the turns either side, so the answer arrives with its context.</p>
+      </div>
+      <div class="card">
+        <span class="tag">get_conversation</span>
+        <p>Pull a whole session back by id. This is the compaction rescue: the detail the summary dropped is still there, verbatim.</p>
+      </div>
+      <div class="card">
+        <span class="tag">list_recent_sessions</span>
+        <p>What was I working on? Newest first, filterable by project path.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7 ................................................................. -->
+  <section class="slide">
+    <div class="eyebrow">Under the hood</div>
+    <h2>Four moving parts, all on your machine.</h2>
+    <div class="diagram">
+      <svg viewBox="0 0 760 250" role="img" aria-label="A Claude Code session feeds a hook. The hook embeds each message using a local Ollama and writes it to a local Postgres with pgvector. An MCP server reads that same database and answers questions from the next session.">
+        <rect class="dg-box" x="8" y="14" width="150" height="52" rx="5"/>
+        <text class="dg-t" x="83" y="38" text-anchor="middle">Claude Code</text>
+        <text class="dg-s" x="83" y="54" text-anchor="middle">your session</text>
+
+        <rect class="dg-box pri" x="8" y="104" width="150" height="52" rx="5"/>
+        <text class="dg-t" x="83" y="128" text-anchor="middle">hook</text>
+        <text class="dg-s" x="83" y="144" text-anchor="middle">reads the transcript</text>
+
+        <rect class="dg-box" x="212" y="104" width="150" height="52" rx="5"/>
+        <text class="dg-t" x="287" y="128" text-anchor="middle">Ollama</text>
+        <text class="dg-s" x="287" y="144" text-anchor="middle">embeds locally</text>
+
+        <rect class="dg-box acc" x="212" y="188" width="330" height="52" rx="5"/>
+        <text class="dg-t" x="377" y="212" text-anchor="middle">PostgreSQL + pgvector</text>
+        <text class="dg-s" x="377" y="228" text-anchor="middle">docker · localhost:5433</text>
+
+        <rect class="dg-box pri" x="416" y="104" width="150" height="52" rx="5"/>
+        <text class="dg-t" x="491" y="128" text-anchor="middle">MCP server</text>
+        <text class="dg-s" x="491" y="144" text-anchor="middle">three tools</text>
+
+        <rect class="dg-box" x="608" y="14" width="144" height="52" rx="5"/>
+        <text class="dg-t" x="680" y="38" text-anchor="middle">Claude Code</text>
+        <text class="dg-s" x="680" y="54" text-anchor="middle">next session</text>
+
+        <path class="dg-l" d="M83 66 L83 104"/><polygon class="dg-arrow" points="83,104 79,96 87,96"/>
+        <text class="dg-lab" x="92" y="90">on every prompt</text>
+
+        <path class="dg-l" d="M158 130 L206 130"/><polygon class="dg-arrow" points="212,130 204,126 204,134"/>
+        <polygon class="dg-arrow" points="158,130 166,126 166,134"/>
+        <text class="dg-lab" x="185" y="118" text-anchor="middle">embed</text>
+        <path class="dg-l acc" d="M83 156 L83 214 L206 214"/><polygon class="dg-arrow acc" points="212,214 204,210 204,218"/>
+        <text class="dg-lab" x="120" y="206">writes</text>
+        <path class="dg-l acc" d="M491 188 L491 156"/><polygon class="dg-arrow acc" points="491,156 487,164 495,164"/>
+        <path class="dg-l" d="M680 66 L680 130 L566 130"/><polygon class="dg-arrow" points="566,130 574,126 574,134"/>
+        <text class="dg-lab" x="576" y="88">asks</text>
+      </svg>
+    </div>
+    <p class="lead">No server. No account. No network call that leaves the box.</p>
+  </section>
+
+  <!-- 8 ................................................................. -->
+  <section class="slide">
+    <div class="eyebrow">The part your security team will ask about</div>
+    <h2>Nothing leaves your laptop.</h2>
+    <div class="cols">
+      <div class="card accent">
+        <span class="tag">Default</span>
+        <h3>Ollama, locally</h3>
+        <p>Embeddings are computed on your machine by a local model. Your conversations are never sent anywhere — not to me, not to a vendor, not to a cloud region.</p>
+      </div>
+      <div class="card">
+        <span class="tag">If you'd rather</span>
+        <h3>Bedrock or OpenAI</h3>
+        <p>Both supported, both opt-in. Worth knowing that choosing them does send message text to that provider to be embedded.</p>
+      </div>
+    </div>
+    <p class="lead">The database is a container on <code>localhost:5433</code>. The archive is a directory in your home folder. That is the whole trust boundary.</p>
+  </section>
+
+  <!-- 9 ................................................................. -->
+  <section class="slide">
+    <div class="eyebrow">One design decision worth stealing</div>
+    <h2>The first version lost messages, silently.</h2>
+    <p>The hook wrote straight to Postgres. When Docker was down the write threw, the exception was swallowed, and the message was simply gone. No error. No log line. You find out weeks later, looking for something that was never there.</p>
+    <pre><span class="c"># the worst four lines in the original</span>
+<span class="k">try</span>:
+    write_to_postgres(messages)
+<span class="k">except</span> Exception:
+    <span class="s">pass</span>  <span class="c"># ← a conversation just died here</span></pre>
+  </section>
+
+  <!-- 10 ................................................................ -->
+  <section class="slide">
+    <div class="eyebrow">The fix</div>
+    <h2>Split what must not fail from what may.</h2>
+    <div class="cols">
+      <div class="card">
+        <span class="tag">Must not fail</span>
+        <h3>Capture</h3>
+        <p>The hook appends to a local SQLite file. No network, no credentials, no daemon — nothing that can be "down".</p>
+      </div>
+      <div class="card">
+        <span class="tag">Allowed to fail</span>
+        <h3>Delivery</h3>
+        <p>A drainer moves it into Postgres later. If that fails, the queue simply grows and drains next time.</p>
+      </div>
+    </div>
+    <p class="lead"><strong>Durable mode</strong> is the default for exactly this reason. <strong>Direct mode</strong> — write straight through — is one flag away if you'd rather have fewer moving parts.</p>
+  </section>
+
+  <!-- 11 ................................................................ -->
+  <section class="slide">
+    <div class="eyebrow">Getting it</div>
+    <h2>One script. Ten minutes.</h2>
+    <pre><span class="c"># needs docker, uv, python 3.11+, and ollama</span>
+git clone https://github.com/nakomis/claude-chats
+<span class="k">cd</span> claude-chats/localhost
+./install.sh</pre>
+    <ul class="plain numbered">
+      <li>Starts Postgres, pulls the embedding model, wires up the hook and the MCP server.</li>
+      <li>Asks which capture mode you want. Re-run it to change your mind.</li>
+      <li>Restart Claude Code and it is already recording.</li>
+    </ul>
+    <p class="lead">Every step is idempotent — re-running is always safe.</p>
+  </section>
+
+  <!-- 12 ................................................................ -->
+  <section class="slide">
+    <div class="eyebrow">Being straight with you</div>
+    <h2>What it costs.</h2>
+    <ul class="plain">
+      <li><strong>Disk.</strong> Text is cheap; the vectors are not. Budget a few hundred MB per year of heavy use.</li>
+      <li><strong>A couple of minutes' lag</strong> in durable mode before a message becomes searchable. Force it with <code>--drain</code> if you're impatient.</li>
+      <li><strong>It records everything you type at Claude.</strong> Including the things you paste. Know that before you install it on a work machine.</li>
+      <li><strong>Recall is only as good as the embedding model.</strong> Full-text search covers for it when the phrasing is exact.</li>
+    </ul>
+  </section>
+
+  <!-- 13 ................................................................ -->
+  <section class="slide">
+    <div class="eyebrow">Why you, specifically</div>
+    <h2>Where it earns its keep.</h2>
+    <div class="cols tight">
+      <div class="card">
+        <span class="tag">Post-compaction</span>
+        <p>The long debugging session that got summarised into two bullets. Pull the real thing back.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Cross-repo</span>
+        <p>You solved this in another project. Search spans every session, every repo, every branch.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Decision archaeology</span>
+        <p>"Why is it done this way?" — the reasoning, in your own words, with the alternatives you rejected.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Onboarding</span>
+        <p>New to a codebase someone else drove Claude through? Their sessions are searchable too.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 14 ................................................................ -->
+  <section class="slide punch">
+    <div class="eyebrow">Take one thing away</div>
+    <h2>Treat your sessions as an asset, not exhaust.</h2>
+    <p class="lead">We are all generating an enormous amount of reasoning through these tools and throwing nearly all of it away. Keeping it costs one Docker container.</p>
+  </section>
+
+  <!-- 15 ................................................................ -->
+  <section class="slide title">
+    <div class="eyebrow">Thanks — questions?</div>
+    <h1>Go and install it.</h1>
+    <pre><span class="k">cd</span> claude-chats/localhost &amp;&amp; ./install.sh</pre>
+    <div class="byline"><span>github.com/nakomis/claude-chats</span><span>·</span><span>see <code>localhost/INSTALL.md</code></span></div>
+  </section>
+
+</div>
+
+<div class="btns">
+  <button id="theme" title="Toggle light/dark" aria-label="Toggle light and dark theme">◐</button>
+  <button id="full" title="Fullscreen" aria-label="Toggle fullscreen">⛶</button>
+</div>
+
+<div class="rail">
+  <span>Conversation Memory</span>
+  <span class="track"><span class="fill" id="fill"></span></span>
+  <span class="count" id="count">1 / 15</span>
+</div>
+
+<script>
+  (function () {
+    var slides = Array.prototype.slice.call(document.querySelectorAll(".slide"));
+    var fill = document.getElementById("fill");
+    var count = document.getElementById("count");
+    var i = 0;
+
+    function show(n) {
+      i = Math.max(0, Math.min(slides.length - 1, n));
+      slides.forEach(function (s, k) {
+        if (k === i) { s.setAttribute("data-active", ""); } else { s.removeAttribute("data-active"); }
+      });
+      fill.style.width = ((i + 1) / slides.length * 100) + "%";
+      count.textContent = (i + 1) + " / " + slides.length;
+      try { location.hash = String(i + 1); } catch (e) {}
+    }
+
+    function next() { show(i + 1); }
+    function prev() { show(i - 1); }
+
+    document.addEventListener("keydown", function (e) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      switch (e.key) {
+        case "ArrowRight": case "ArrowDown": case " ": case "PageDown":
+          e.preventDefault(); next(); break;
+        case "ArrowLeft": case "ArrowUp": case "PageUp":
+          e.preventDefault(); prev(); break;
+        case "Home": e.preventDefault(); show(0); break;
+        case "End": e.preventDefault(); show(slides.length - 1); break;
+        case "f": document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); break;
+      }
+    });
+
+    // Click to advance, but never steal a click on a link or a button.
+    document.addEventListener("click", function (e) {
+      if (e.target.closest("a, button, pre")) return;
+      next();
+    });
+
+    var x0 = null;
+    document.addEventListener("touchstart", function (e) { x0 = e.changedTouches[0].clientX; }, { passive: true });
+    document.addEventListener("touchend", function (e) {
+      if (x0 === null) return;
+      var dx = e.changedTouches[0].clientX - x0;
+      if (Math.abs(dx) > 45) { dx < 0 ? next() : prev(); }
+      x0 = null;
+    }, { passive: true });
+
+    document.getElementById("full").addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (document.fullscreenElement) { document.exitFullscreen(); }
+      else { document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); }
+    });
+
+    // Theme override. localStorage can throw outright in some embeddings, so
+    // every read and write is guarded and the page renders fine without it.
+    var root = document.documentElement;
+    function stored(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+    var saved = stored("cm-theme");
+    if (saved === "dark" || saved === "light") root.setAttribute("data-theme", saved);
+    // Read the token CSS actually applied rather than asking matchMedia. The two
+    // can disagree, and when they do the first click is a no-op — which is not
+    // something you want to discover in front of a room.
+    function effectiveTheme() {
+      var explicit = root.getAttribute("data-theme");
+      if (explicit) return explicit;
+      var ground = getComputedStyle(root).getPropertyValue("--ground").trim().toLowerCase();
+      return ground === "#0f131a" ? "dark" : "light";
+    }
+    document.getElementById("theme").addEventListener("click", function (e) {
+      e.stopPropagation();
+      var nextTheme = effectiveTheme() === "dark" ? "light" : "dark";
+      root.setAttribute("data-theme", nextTheme);
+      try { localStorage.setItem("cm-theme", nextTheme); } catch (err) {}
+    });
+
+    var start = parseInt((location.hash || "").replace("#", ""), 10);
+    show(isNaN(start) ? 0 : start - 1);
+  })();
+</script>
