@@ -41,7 +41,7 @@ def _pending(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     cur = conn.execute(
         """
         SELECT id, message_uuid, session_id, project_path, git_branch,
-               conversation_name, host, role, content, sequence_num, created_at
+               conversation_name, ai_title, host, role, content, sequence_num, created_at
         FROM outbox
         WHERE sent_at IS NULL
         ORDER BY id
@@ -100,10 +100,12 @@ def _write_session(cur, rows: list[sqlite3.Row], get_embedding) -> None:
         (r["conversation_name"] for r in reversed(rows) if r["conversation_name"]),
         None,
     )
-    if name:
+    ai_title = next((r["ai_title"] for r in reversed(rows) if r["ai_title"]), None)
+    if name or ai_title:
         cur.execute(
-            "UPDATE conversations SET name = %s WHERE session_id = %s",
-            (name, first["session_id"]),
+            "UPDATE conversations SET name = COALESCE(%s, name), "
+            "ai_title = COALESCE(%s, ai_title) WHERE session_id = %s",
+            (name, ai_title, first["session_id"]),
         )
 
     cur.execute(
@@ -156,9 +158,15 @@ def drain() -> tuple[int, int]:
     if not os.path.exists(OUTBOX_PATH):
         return 0, 0
 
+    from hook.record import _migrate
+
     conn = sqlite3.connect(OUTBOX_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
+        # The drain can open an outbox before any post-HOME-391 hook run has,
+        # and _pending selects ai_title.
+        with conn:
+            _migrate(conn)
         rows = _pending(conn)
         if not rows:
             return 0, 0

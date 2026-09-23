@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     project_path      TEXT    NOT NULL DEFAULT '',
     git_branch        TEXT    NOT NULL DEFAULT '',
     conversation_name TEXT,
+    ai_title          TEXT,
     host              TEXT,
     role              TEXT    NOT NULL,
     author            TEXT    NOT NULL DEFAULT 'unknown',
@@ -315,6 +316,76 @@ def _write_fallback(records: list[dict], reason: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Session titles
+# ---------------------------------------------------------------------------
+
+def _sidecar_title(transcript_path: str, session_id: str) -> str | None:
+    """The name from ``<session-id>/custom-title.json`` beside the transcript.
+
+    Located from the transcript's own directory rather than from cwd, which
+    drifts whenever a session changes directory or enters a worktree.
+    """
+    path = os.path.join(os.path.dirname(transcript_path), session_id, "custom-title.json")
+    try:
+        with open(path) as fh:
+            title = json.load(fh).get("customTitle")
+    except Exception:
+        return None
+    return (title.strip() or None) if isinstance(title, str) else None
+
+
+def _session_name(entries: list[dict], transcript_path: str, session_id: str) -> str | None:
+    """The name Martin gave the session with /rename, or None.
+
+    Claude Code has stored this three ways (HOME-391), and the hook broke
+    silently when it moved from the first to the others:
+
+      * the ``custom-title.json`` sidecar — one current value, so checked first;
+      * ``{"type": "custom-title"}`` transcript entries, re-appended over the
+        session's life — the last one is current;
+      * a ``local_command`` entry wrapping ``<command-name>/rename`` — the old
+        format, kept so replaying old transcripts still finds their names.
+    """
+    name = _sidecar_title(transcript_path, session_id)
+    if name:
+        return name
+    for entry in reversed(entries):
+        if entry.get("type") == "custom-title":
+            title = entry.get("customTitle")
+            if isinstance(title, str) and title.strip():
+                return title.strip()
+    for entry in reversed(entries):
+        content = entry.get("content", "")
+        if (
+            entry.get("type") == "system"
+            and entry.get("subtype") == "local_command"
+            and isinstance(content, str)
+            and "<command-name>/rename</command-name>" in content
+        ):
+            args_start = content.find("<command-args>") + len("<command-args>")
+            args_end = content.find("</command-args>")
+            if args_start > -1 and args_end > -1:
+                return content[args_start:args_end].strip() or None
+            return None
+    return None
+
+
+def _ai_title(entries: list[dict]) -> str | None:
+    """Claude Code's generated title for the session, or None.
+
+    Kept apart from the name on purpose: a name is what Martin chose, and this
+    is a guess. Claude Code rewrites it as the conversation develops, so the
+    last entry wins.
+    """
+    for entry in reversed(entries):
+        if entry.get("type") == "ai-title":
+            title = entry.get("aiTitle")
+            if isinstance(title, str) and title.strip():
+                return title.strip()
+    return None
+
+
 # Columns added after the outbox was first shipped. `CREATE TABLE IF NOT
 # EXISTS` is a no-op against a database that already exists, so a plain schema
 # edit would leave every existing outbox without these and the INSERT below
@@ -323,6 +394,7 @@ _ADDED_COLUMNS = {
     "author":    "TEXT NOT NULL DEFAULT 'unknown'",
     "tool_name": "TEXT",
     "model":     "TEXT",
+    "ai_title":  "TEXT",
 }
 
 
@@ -342,7 +414,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE outbox ADD COLUMN {col} {decl}")
 
 
-def _append_to_outbox(records: list[dict], session_id: str, name: str | None) -> None:
+def _append_to_outbox(
+    records: list[dict],
+    session_id: str,
+    name: str | None,
+    ai_title: str | None = None,
+) -> None:
     conn = sqlite3.connect(OUTBOX_PATH, timeout=10)
     try:
         conn.executescript(SCHEMA)
@@ -357,25 +434,69 @@ def _append_to_outbox(records: list[dict], session_id: str, name: str | None) ->
                 """
                 INSERT OR IGNORE INTO outbox
                     (message_uuid, session_id, project_path, git_branch,
-                     conversation_name, host, role, author, tool_name, model,
-                     content, sequence_num, created_at)
+                     conversation_name, ai_title, host, role, author, tool_name,
+                     model, content, sequence_num, created_at)
                 VALUES
                     (:message_uuid, :session_id, :project_path, :git_branch,
-                     :conversation_name, :host, :role, :author, :tool_name, :model,
-                     :content, :sequence_num, :created_at)
+                     :conversation_name, :ai_title, :host, :role, :author,
+                     :tool_name, :model, :content, :sequence_num, :created_at)
                 """,
                 records,
             )
-            if name:
-                # A rename can land after the messages it applies to. Update
-                # anything still pending so the new name travels with it.
-                conn.execute(
-                    "UPDATE outbox SET conversation_name = ? "
-                    "WHERE session_id = ? AND sent_at IS NULL",
-                    (name, session_id),
-                )
+            if name or ai_title:
+                _carry_titles(conn, records, session_id, name, ai_title)
     finally:
         conn.close()
+
+
+def _carry_titles(
+    conn: sqlite3.Connection,
+    records: list[dict],
+    session_id: str,
+    name: str | None,
+    ai_title: str | None,
+) -> None:
+    """Make sure the session's current titles reach the database.
+
+    Titles only travel on message rows. A rename can land after the messages it
+    applies to, so anything still pending is updated to carry it. COALESCE, so
+    a run that found no title never blanks one an earlier run stored.
+    """
+    pending = conn.execute(
+        "UPDATE outbox SET conversation_name = COALESCE(?, conversation_name), "
+        "ai_title = COALESCE(?, ai_title) "
+        "WHERE session_id = ? AND sent_at IS NULL",
+        (name, ai_title, session_id),
+    ).rowcount
+    if pending:
+        return
+
+    # Nothing pending, so the new title has nothing to ride on: typically a
+    # /rename as the last act of a session, caught by the SessionEnd hook
+    # (HOME-391). Re-queue the newest row if what it last carried is stale.
+    latest = conn.execute(
+        "SELECT id, message_uuid, conversation_name, ai_title FROM outbox "
+        "WHERE session_id = ? ORDER BY sequence_num DESC, id DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if latest is None:
+        return
+    row_id, message_uuid, sent_name, sent_ai_title = latest
+    stale = (name and name != sent_name) or (ai_title and ai_title != sent_ai_title)
+    if not stale:
+        return
+    # The row is a tombstone with its content blanked, and the consumer's
+    # upsert overwrites content — so resending it as-is would erase the message
+    # in Postgres. Refill it from the transcript, or leave it alone.
+    record = next((r for r in records if r["message_uuid"] == message_uuid), None)
+    if record is None:
+        return
+    conn.execute(
+        "UPDATE outbox SET sent_at = NULL, attempts = 0, last_error = NULL, "
+        "content = ?, conversation_name = COALESCE(?, conversation_name), "
+        "ai_title = COALESCE(?, ai_title) WHERE id = ?",
+        (record["content"], name, ai_title, row_id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -410,23 +531,10 @@ def main() -> None:
         and e["message"].get("role") in ("user", "assistant")
     ]
 
-    # Extract the most recent /rename value if present
-    name: str | None = None
-    for entry in reversed(entries):
-        content = entry.get("content", "")
-        if (
-            entry.get("type") == "system"
-            and entry.get("subtype") == "local_command"
-            and isinstance(content, str)
-            and "<command-name>/rename</command-name>" in content
-        ):
-            args_start = content.find("<command-args>") + len("<command-args>")
-            args_end = content.find("</command-args>")
-            if args_start > -1 and args_end > -1:
-                name = content[args_start:args_end].strip() or None
-            break
+    name = _session_name(entries, transcript_path, session_id)
+    ai_title = _ai_title(entries)
 
-    if not messages and name is None:
+    if not messages and name is None and ai_title is None:
         sys.exit(0)
 
     # uuid -> source paths of the images that message carries (HOME-315).
@@ -457,6 +565,7 @@ def main() -> None:
             "project_path":      cwd,
             "git_branch":        git_branch,
             "conversation_name": name,
+            "ai_title":          ai_title,
             "host":              HOST,
             "role":              msg["role"],
             # Derived from transcript structure, not from the text. See
@@ -496,12 +605,12 @@ def main() -> None:
         # Archiving is a nice-to-have; losing the message is not.
         pass
 
-    if not records and name is None:
+    if not records and name is None and ai_title is None:
         sys.exit(0)
 
     try:
         os.makedirs(os.path.dirname(OUTBOX_PATH), exist_ok=True)
-        _append_to_outbox(records, session_id, name)
+        _append_to_outbox(records, session_id, name, ai_title)
     except Exception as exc:
         # Never swallow this. A silent failure here is exactly the bug this
         # design exists to remove — but still exit 0, because blocking Claude

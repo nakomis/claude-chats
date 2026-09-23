@@ -106,10 +106,18 @@ def search_memory(
           "results":  [...]
         }
 
-    Each result contains: session_id, project_path, role, sequence_num,
+    Each result contains: session_id, name, ai_title, project_path, role,
+    sequence_num,
     created_at (relative + operator-local, e.g. "2 minutes ago (2026-07-24
     22:37 BST)"), created_at_utc (raw ISO-8601 UTC for exact correlation),
     score, context (surrounding messages).
+
+    Session titles — two, never merged:
+        name      What Martin called the session with /rename. Authoritative;
+                  null if it was never renamed.
+        ai_title  Claude Code's own generated title. Present for almost every
+                  session, but a machine guess. Use it to identify a session
+                  when name is null; don't present it as Martin's name.
 
     Modes:
         "hybrid" (default)
@@ -186,7 +194,7 @@ def search_memory(
                                      limit, candidates)
 
             results = []
-            for msg_id, conv_id, session_id, proj, role, content, seq, ts, score in rows:
+            for msg_id, conv_id, session_id, proj, name, ai_title, role, content, seq, ts, score in rows:
                 cur.execute(
                     """
                     SELECT role, content, sequence_num
@@ -208,6 +216,8 @@ def search_memory(
                 ]
                 results.append({
                     "session_id":   session_id,
+                    "name":         name,
+                    "ai_title":     ai_title,
                     "project_path": proj,
                     "role":         role,
                     "sequence_num": seq,
@@ -230,7 +240,7 @@ def search_memory(
 def _query_semantic(cur, vec: str, project_path, project_filter: str, limit: int):
     sql = f"""
         SELECT m.id, m.conversation_id, c.session_id, c.project_path,
-               m.role, m.content, m.sequence_num, m.created_at,
+               c.name, c.ai_title, m.role, m.content, m.sequence_num, m.created_at,
                1 - (m.embedding <=> %s::vector) AS score
         FROM   messages m
         JOIN   conversations c ON c.id = m.conversation_id
@@ -247,7 +257,7 @@ def _query_semantic(cur, vec: str, project_path, project_filter: str, limit: int
 def _query_fulltext(cur, query: str, project_path, project_filter: str, limit: int):
     sql = f"""
         SELECT m.id, m.conversation_id, c.session_id, c.project_path,
-               m.role, m.content, m.sequence_num, m.created_at,
+               c.name, c.ai_title, m.role, m.content, m.sequence_num, m.created_at,
                ts_rank_cd(m.content_tsv, q) AS score
         FROM   messages m
         JOIN   conversations c ON c.id = m.conversation_id,
@@ -294,7 +304,7 @@ def _query_hybrid(cur, vec: str, query: str, project_path, project_filter: str,
             FULL OUTER JOIN fulltext f ON s.id = f.id
         )
         SELECT m.id, m.conversation_id, c.session_id, c.project_path,
-               m.role, m.content, m.sequence_num, m.created_at, r.score
+               c.name, c.ai_title, m.role, m.content, m.sequence_num, m.created_at, r.score
         FROM   rrf r
         JOIN   messages m ON m.id = r.id
         JOIN   conversations c ON c.id = m.conversation_id
@@ -315,6 +325,9 @@ def get_conversation(
 ) -> dict:
     """Retrieve messages from a past conversation by session ID.
 
+    Returns name (Martin's /rename, or null) and ai_title (Claude Code's
+    generated title) separately — see search_memory.
+
     For very long conversations, use start_seq / end_seq to page through the
     transcript (sequence numbers are shown in search_memory results).
     Omit both to retrieve the full conversation.
@@ -327,14 +340,15 @@ def get_conversation(
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, project_path, git_branch, started_at, name FROM conversations WHERE session_id = %s",
+                "SELECT id, project_path, git_branch, started_at, name, ai_title "
+                "FROM conversations WHERE session_id = %s",
                 (session_id,),
             )
             row = cur.fetchone()
             if not row:
                 return {"error": f"No conversation found for session_id '{session_id}'"}
 
-            conv_id, project_path, git_branch, started_at, name = row
+            conv_id, project_path, git_branch, started_at, name, ai_title = row
 
             cur.execute(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = %s",
@@ -368,6 +382,7 @@ def get_conversation(
             return {
                 "session_id":    session_id,
                 "name":          name,
+                "ai_title":      ai_title,
                 "project_path":  project_path,
                 "git_branch":    git_branch,
                 "started_at":    _human_time(started_at),
@@ -385,6 +400,9 @@ def list_recent_sessions(
 ) -> list[dict]:
     """List recent conversation sessions, newest first.
 
+    Each session has name (Martin's /rename, or null) and ai_title (Claude
+    Code's generated title) — separate fields; see search_memory.
+
     Args:
         limit:        Maximum number of sessions to return (default 10).
         project_path: If supplied, restrict to that project directory.
@@ -393,7 +411,7 @@ def list_recent_sessions(
         with conn.cursor() as cur:
             sql = """
                 SELECT   c.session_id, c.project_path, c.git_branch, c.started_at,
-                         c.name,
+                         c.name, c.ai_title,
                          COUNT(m.id)       AS message_count,
                          MAX(m.created_at) AS last_message_at
                 FROM     conversations c
@@ -405,7 +423,7 @@ def list_recent_sessions(
                 sql += " WHERE c.project_path = %s"
                 params.append(project_path)
 
-            sql += " GROUP BY c.session_id, c.project_path, c.git_branch, c.started_at, c.name"
+            sql += " GROUP BY c.session_id, c.project_path, c.git_branch, c.started_at, c.name, c.ai_title"
             sql += " ORDER BY c.started_at DESC LIMIT %s"
             params.append(limit)
 
@@ -415,13 +433,14 @@ def list_recent_sessions(
                 {
                     "session_id":     sid,
                     "name":           name,
+                    "ai_title":       ai_title,
                     "project_path":   pp,
                     "git_branch":     gb,
                     "started_at":     _human_time(sa),
                     "message_count":  mc,
                     "last_message_at": _human_time(lm) if lm else None,
                 }
-                for sid, pp, gb, sa, name, mc, lm in cur.fetchall()
+                for sid, pp, gb, sa, name, ai_title, mc, lm in cur.fetchall()
             ]
 
 

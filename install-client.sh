@@ -6,7 +6,7 @@
 #   2. Prompts for SERVER_HOST (the server machine's hostname/IP)
 #   3. Installs Python dependencies for the hook and MCP server
 #   4. Registers the MCP server pointing at the remote PostgreSQL
-#   5. Configures the Stop/UserPromptSubmit hooks in remote mode
+#   5. Configures the Stop/UserPromptSubmit/SessionEnd hooks in remote mode
 #      (hook posts messages to ActiveMQ; embedding happens on the server)
 #
 # Re-running is safe — all steps are idempotent.
@@ -164,7 +164,7 @@ hook_group = {"matcher": "", "hooks": [hook_entry]}
 
 hooks = data.setdefault("hooks", {})
 
-for event in ("Stop", "UserPromptSubmit"):
+for event in ("Stop", "UserPromptSubmit", "SessionEnd"):
     existing = hooks.get(event, [])
     cleaned = [
         g for g in existing
@@ -180,7 +180,7 @@ with open(settings_path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PYEOF
-ok "Stop + UserPromptSubmit hooks updated (remote mode, timeout: 30s)"
+ok "Stop + UserPromptSubmit + SessionEnd hooks updated (remote mode, timeout: 30s)"
 
 # ---------------------------------------------------------------------------
 # Done
