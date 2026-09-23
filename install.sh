@@ -12,7 +12,7 @@
 #   3. Pulls the Ollama model (ollama provider only)
 #   4. Creates virtualenvs and installs dependencies (hook + mcp)
 #   5. Registers the MCP server with Claude Code
-#   6. Adds the Stop hook to ~/.claude/settings.json
+#   6. Adds the Stop, UserPromptSubmit and SessionEnd hooks to ~/.claude/settings.json
 #
 # Re-running is safe — all steps are idempotent.
 #
@@ -242,7 +242,7 @@ hook_group = {"matcher": "", "hooks": [hook_entry]}
 hooks = data.setdefault("hooks", {})
 
 # Remove any stale record-conversation entries so re-runs stay idempotent
-for event in ("Stop", "UserPromptSubmit"):
+for event in ("Stop", "UserPromptSubmit", "SessionEnd"):
     existing = hooks.get(event, [])
     cleaned = [
         g for g in existing
@@ -258,7 +258,7 @@ with open(settings_path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PYEOF
-ok "Stop + UserPromptSubmit hooks updated in ${SETTINGS_FILE}"
+ok "Stop + UserPromptSubmit + SessionEnd hooks updated in ${SETTINGS_FILE}"
 
 # ---------------------------------------------------------------------------
 # Done

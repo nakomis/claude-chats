@@ -94,7 +94,7 @@ class TestDurableMode:
 class TestDirectMode:
     def test_writes_to_postgres_and_not_the_outbox(self, hook_env, monkeypatch):
         seen = {}
-        def capture(records, session_id, project_path, git_branch, name):
+        def capture(records, session_id, project_path, git_branch, name, ai_title=None):
             seen["records"] = records
             seen["session_id"] = session_id
         monkeypatch.setattr(rec, "CAPTURE_MODE", "direct")

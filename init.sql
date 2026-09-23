@@ -17,6 +17,12 @@ CREATE TABLE IF NOT EXISTS conversations (
 -- Idempotent upgrade: add columns introduced after initial release
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS name TEXT;
 
+-- Claude Code's own generated title for the session (HOME-391). Deliberately a
+-- separate column from `name`: `name` is what the human chose with /rename,
+-- this is a machine guess, and conflating the two would make a real name
+-- indistinguishable from an invented one. Display with COALESCE(name, ai_title).
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_title TEXT;
+
 -- Which machine the conversation happened on. Several machines (desktop, work
 -- laptop, a loaner while one is in for repair) share this database, so search
 -- can span every tenant or filter to one. Nullable: rows from the

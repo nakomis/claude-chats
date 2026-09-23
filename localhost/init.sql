@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS conversations (
 -- Idempotent upgrade: add columns introduced after initial release
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS name TEXT;
 
+-- Claude Code's own generated title (HOME-391), kept apart from `name`, which
+-- is only ever what the human chose with /rename.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_title TEXT;
+
 -- Which machine the conversation happened on. Several machines (desktop, work
 -- laptop, a loaner while one is in for repair) share this database, so search
 -- can span every tenant or filter to one. Nullable: rows from the

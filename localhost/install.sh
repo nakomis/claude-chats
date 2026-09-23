@@ -210,7 +210,7 @@ path = sys.argv[1]
 with open(path) as f:
     data = json.load(f)
 hooks = data.get("hooks", {})
-for event in ("Stop", "UserPromptSubmit"):
+for event in ("Stop", "UserPromptSubmit", "SessionEnd"):
     groups = hooks.get(event, [])
     kept = [
         g for g in groups
@@ -498,7 +498,7 @@ hooks = data.setdefault("hooks", {})
 # Drop any existing record-conversation entry before adding ours back. This is
 # what keeps re-runs idempotent, and what makes a mode switch take effect rather
 # than leaving two hooks racing each other.
-for event in ("Stop", "UserPromptSubmit"):
+for event in ("Stop", "UserPromptSubmit", "SessionEnd"):
     cleaned = [
         g for g in hooks.get(event, [])
         if not any(
@@ -513,7 +513,7 @@ with open(settings_path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PYEOF
-ok "Stop + UserPromptSubmit hooks updated (mode: ${MODE})"
+ok "Stop + UserPromptSubmit + SessionEnd hooks updated (mode: ${MODE})"
 
 # ---------------------------------------------------------------------------
 # 9. The drain LaunchAgent — installed in durable mode, removed in direct

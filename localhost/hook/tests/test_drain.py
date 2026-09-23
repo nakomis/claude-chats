@@ -26,17 +26,18 @@ from hook.record import SCHEMA  # noqa: E402
 
 FIELDS = (
     "message_uuid", "session_id", "project_path", "git_branch",
-    "conversation_name", "host", "role", "content", "sequence_num", "created_at",
+    "conversation_name", "ai_title", "host", "role", "content", "sequence_num", "created_at",
 )
 
 
-def _row(uuid, session="sess-1", seq=0, name=None, content="hello"):
+def _row(uuid, session="sess-1", seq=0, name=None, content="hello", ai_title=None):
     return {
         "message_uuid": uuid,
         "session_id": session,
         "project_path": "/proj",
         "git_branch": "main",
         "conversation_name": name,
+        "ai_title": ai_title,
         "host": "test-host",
         "role": "user",
         "content": content,
@@ -174,7 +175,18 @@ class TestWriteSession:
         rows = [_FakeRow(_row("a", seq=0)), _FakeRow(_row("b", seq=1, name="Renamed"))]
         dr._write_session(cur, rows, lambda text: None)
         updates = [p for s, p in cur.calls if s.startswith("UPDATE conversations")]
-        assert updates == [("Renamed", "sess-1")]
+        assert updates == [("Renamed", None, "sess-1")]
+
+    def test_ai_title_travels_without_a_name(self):
+        """COALESCE on both, so an ai title alone never blanks a stored name."""
+        cur = FakeCursor()
+        rows = [_FakeRow(_row("a", ai_title="Old guess")),
+                _FakeRow(_row("b", seq=1, ai_title="Better guess"))]
+        dr._write_session(cur, rows, lambda text: None)
+        updates = [(s, p) for s, p in cur.calls if s.startswith("UPDATE conversations")]
+        assert len(updates) == 1
+        assert "COALESCE(%s, name)" in updates[0][0]
+        assert updates[0][1] == (None, "Better guess", "sess-1")
 
     def test_no_rename_means_no_update(self):
         cur = FakeCursor()
