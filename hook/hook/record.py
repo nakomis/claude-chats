@@ -51,7 +51,17 @@ FALLBACK_PATH = os.path.join(os.path.dirname(OUTBOX_PATH), "outbox-fallback.ndjs
 # A friendly label ("work-laptop") beats a raw hostname, which changes with
 # whatever the DHCP lease felt like that day. Several machines share one
 # database, so search can span every tenant or filter to one.
-HOST = os.environ.get("CLAUDE_CHATS_HOST") or socket.gethostname()
+def _default_host() -> str:
+    """This machine's hostname, minus any ``.local`` suffix.
+
+    macOS reports ``phi`` on some networks and ``phi.local`` on others, which
+    split one machine's history across two labels in the database (HOME-395).
+    """
+    name = socket.gethostname()
+    return name[: -len(".local")] if name.endswith(".local") else name
+
+
+HOST = os.environ.get("CLAUDE_CHATS_HOST") or _default_host()
 
 # Schema shared with the Rust forwarder (mac/conversation-memory-forwarder in
 # nakomis/home-infra). Whichever process opens the file first creates it, so

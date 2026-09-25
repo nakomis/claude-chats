@@ -51,7 +51,17 @@ FALLBACK_PATH = os.path.join(os.path.dirname(OUTBOX_PATH), "outbox-fallback.ndjs
 # A friendly label ("work-laptop") beats a raw hostname, which changes with
 # whatever the DHCP lease felt like that day. Single-machine only ever writes
 # one value, but the column is shared with the distributed schema.
-HOST = os.environ.get("CLAUDE_CHATS_HOST") or socket.gethostname()
+def _default_host() -> str:
+    """This machine's hostname, minus any ``.local`` suffix.
+
+    macOS reports ``phi`` on some networks and ``phi.local`` on others, which
+    split one machine's history across two labels in the database (HOME-395).
+    """
+    name = socket.gethostname()
+    return name[: -len(".local")] if name.endswith(".local") else name
+
+
+HOST = os.environ.get("CLAUDE_CHATS_HOST") or _default_host()
 
 # Kept byte-identical to the distributed edition's outbox DDL so an outbox
 # written by one can be drained by the other. Only durable mode touches it.
