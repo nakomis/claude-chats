@@ -300,6 +300,20 @@ def _tool_name_for(content, names: dict[str, str]) -> str | None:
     return None
 
 
+def _parse_ts(value) -> datetime | None:
+    """A transcript timestamp, or None if it isn't one.
+
+    Records are built outside any try, so a value that fails to parse must not
+    raise: it would lose every message in the session, on every run.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def _as_message(entry: dict) -> dict | None:
     """A mid-turn message, reshaped as the user message it really is (HOME-411).
 
@@ -323,11 +337,18 @@ def _as_message(entry: dict) -> dict | None:
     if (attachment.get("origin") or {}).get("kind") != "human":
         return None
     prompt = attachment.get("prompt")
-    if not prompt:
+    # No uuid means a fallback id of session:seq, and a mid-turn message shares
+    # its predecessor's seq, so it would collide and vanish into INSERT OR
+    # IGNORE. Real ones always carry a uuid; leave any other out openly.
+    if not prompt or not entry.get("uuid"):
         return None
+    timestamp = next(
+        (t for t in (attachment.get("timestamp"), entry.get("timestamp")) if _parse_ts(t)),
+        None,
+    )
     return {
         **entry,
-        "timestamp": attachment.get("timestamp") or entry.get("timestamp"),
+        "timestamp": timestamp,
         "origin": attachment.get("origin"),
         "imagePasteIds": attachment.get("imagePasteIds"),
         "message": {"role": "user", "content": prompt},
@@ -393,8 +414,7 @@ def build_records(
             text = "\n".join(part for part in (text, *markers) if part)
         if not text:
             continue
-        ts_raw = entry.get("timestamp")
-        ts = datetime.fromisoformat(ts_raw) if ts_raw else datetime.now(timezone.utc)
+        ts = _parse_ts(entry.get("timestamp")) or datetime.now(timezone.utc)
         # A mid-turn message is human by its recorded origin. classify_author
         # would call a list of plain text blocks 'tool', so it is not asked.
         author = "martin" if entry.get("midTurn") else classify_author(msg["role"], raw)

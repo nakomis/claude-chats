@@ -194,3 +194,33 @@ def test_the_uuid_is_the_transcript_uuid():
     assert [r["message_uuid"] for r in _build(entries)] == [
         r["message_uuid"] for r in _build(entries)
     ] == ["u1", "q1"]
+
+
+# --- robustness --------------------------------------------------------------
+
+def test_a_bad_timestamp_cannot_cost_the_session():
+    """The hook parses every record's timestamp outside a try. One odd value
+    from a new source must not raise and lose the whole transcript."""
+    for bad in (1727710000, "yesterday", None):
+        entry = _queued("q1", "mid-turn", HUMAN)
+        entry["attachment"]["timestamp"] = bad
+        entry["timestamp"] = bad
+        recs = _by_uuid(_build([_user("u1", "hi"), entry]))
+        assert recs["q1"]["content"] == "mid-turn"
+        assert recs["q1"]["created_at"]
+
+
+def test_a_bad_attachment_timestamp_falls_back_to_the_entry():
+    entry = _queued("q1", "mid-turn", HUMAN)
+    entry["attachment"]["timestamp"] = "not a time"
+    entry["timestamp"] = "2026-09-30T15:44:19.693Z"
+    assert _by_uuid(_build([entry]))["q1"]["created_at"].startswith("2026-09-30T15:44:19")
+
+
+def test_a_mid_turn_message_without_a_uuid_is_not_captured():
+    """Its fallback id would be session:seq, and it shares its predecessor's
+    seq, so it would collide and be silently ignored. Leave it out openly."""
+    entry = _queued("q1", "orphan", HUMAN)
+    del entry["uuid"]
+    recs = _build([_user("u1", "hi"), entry])
+    assert [r["message_uuid"] for r in recs] == ["u1"]
