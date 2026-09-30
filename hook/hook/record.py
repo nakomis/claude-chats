@@ -300,6 +300,149 @@ def _tool_name_for(content, names: dict[str, str]) -> str | None:
     return None
 
 
+def _parse_ts(value) -> datetime | None:
+    """A transcript timestamp, or None if it isn't one.
+
+    Records are built outside any try, so a value that fails to parse must not
+    raise: it would lose every message in the session, on every run.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _as_message(entry: dict) -> dict | None:
+    """A mid-turn message, reshaped as the user message it really is (HOME-411).
+
+    A message Martin sends while Claude is still working is not written as an
+    entry with a ``message``. Claude Code records it as an attachment instead:
+
+      {"type": "attachment", "uuid": …,
+       "attachment": {"type": "queued_command", "prompt": "…" | [blocks],
+                      "commandMode": "prompt", "origin": {"kind": "human"}}}
+
+    Everything downstream reads ``message``, so until this existed both the
+    text and any pasted images were dropped without a trace. The same record
+    type also carries harness task notifications, which have no human origin
+    and stay out.
+    """
+    if entry.get("type") != "attachment":
+        return None
+    attachment = entry.get("attachment")
+    if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+        return None
+    if (attachment.get("origin") or {}).get("kind") != "human":
+        return None
+    prompt = attachment.get("prompt")
+    # No uuid means a fallback id of session:seq, and a mid-turn message shares
+    # its predecessor's seq, so it would collide and vanish into INSERT OR
+    # IGNORE. Real ones always carry a uuid; leave any other out openly.
+    if not prompt or not entry.get("uuid"):
+        return None
+    timestamp = next(
+        (t for t in (attachment.get("timestamp"), entry.get("timestamp")) if _parse_ts(t)),
+        None,
+    )
+    return {
+        **entry,
+        "timestamp": timestamp,
+        "origin": attachment.get("origin"),
+        "imagePasteIds": attachment.get("imagePasteIds"),
+        "message": {"role": "user", "content": prompt},
+        "midTurn": True,
+    }
+
+
+def _capturable(entries: list[dict]) -> list[tuple[int, dict]]:
+    """(sequence_num, entry) for every message worth capturing, in transcript order.
+
+    Ordinary messages are numbered exactly as they always were: their index
+    among the entries that carry a ``message``. A mid-turn message takes the
+    number of the message before it rather than shifting everything after it,
+    because rows already delivered keep the numbers they were sent with — the
+    worker never updates a row it has — and renumbering would leave old and
+    new rows disagreeing about the order. created_at breaks the tie.
+    """
+    out: list[tuple[int, dict]] = []
+    seq = -1
+    for entry in entries:
+        msg = entry.get("message")
+        if isinstance(msg, dict) and msg.get("role") in ("user", "assistant"):
+            seq += 1
+            out.append((seq, entry))
+            continue
+        queued = _as_message(entry)
+        if queued is not None:
+            out.append((max(seq, 0), queued))
+    return out
+
+
+def build_records(
+    entries: list[dict],
+    session_id: str,
+    cwd: str,
+    git_branch: str,
+    name: str | None,
+    ai_title: str | None,
+) -> tuple[list[dict], list[dict]]:
+    """Outbox rows for a transcript, plus the message entries they came from.
+
+    The entries are returned too because image staging walks the same set, and
+    it must see mid-turn messages as well. Shared with the backfill scripts, so
+    there is one implementation of what a captured message is.
+    """
+    # uuid -> source paths of the images that message carries (HOME-315).
+    image_sources = _image_sources(entries)
+
+    # tool_result blocks name only the call they answer, so the tool's name has
+    # to come from the assistant's matching tool_use block. Build once.
+    tool_names = _tool_use_names(entries)
+
+    capturable = _capturable(entries)
+    records = []
+    for seq, entry in capturable:
+        msg  = entry["message"]
+        raw  = msg.get("content", "")
+        text = _extract_text(raw)
+        markers = _image_markers(raw, image_sources.get(entry.get("uuid") or "", []))
+        if markers:
+            # Appended, not substituted: "[Image #1]" carries the ordering the
+            # rest of the conversation refers to, so keep it and add the detail.
+            text = "\n".join(part for part in (text, *markers) if part)
+        if not text:
+            continue
+        ts = _parse_ts(entry.get("timestamp")) or datetime.now(timezone.utc)
+        # A mid-turn message is human by its recorded origin. classify_author
+        # would call a list of plain text blocks 'tool', so it is not asked.
+        author = "martin" if entry.get("midTurn") else classify_author(msg["role"], raw)
+        records.append({
+            "message_uuid":      entry.get("uuid") or f"{session_id}:{seq}",
+            "session_id":        session_id,
+            "project_path":      cwd,
+            "git_branch":        git_branch,
+            "conversation_name": name,
+            "ai_title":          ai_title,
+            "host":              HOST,
+            "role":              msg["role"],
+            # Derived from transcript structure, not from the text. See
+            # classify_author — this is the field HOME-309 existed for.
+            "author":            author,
+            "tool_name":         _tool_name_for(raw, tool_names) if author == "tool" else None,
+            # '<synthetic>' appears for harness-generated assistant turns; keep
+            # it rather than normalising, so it stays distinguishable later.
+            "model":             msg.get("model") if author == "claude" else None,
+            "content":           text,
+            "sequence_num":      seq,
+            # The real transcript timestamp. The forwarder may not deliver this
+            # for days if we are offline, so it must not be re-derived later.
+            "created_at":        ts.isoformat(),
+        })
+    return records, [entry for _seq, entry in capturable]
+
+
 def _write_fallback(records: list[dict], reason: str) -> None:
     """Last-resort capture when SQLite itself is unavailable.
 
@@ -535,62 +678,15 @@ def main() -> None:
     except Exception:
         sys.exit(0)
 
-    messages = [
-        e for e in entries
-        if isinstance(e.get("message"), dict)
-        and e["message"].get("role") in ("user", "assistant")
-    ]
-
     name = _session_name(entries, transcript_path, session_id)
     ai_title = _ai_title(entries)
+
+    records, messages = build_records(entries, session_id, cwd, git_branch, name, ai_title)
 
     if not messages and name is None and ai_title is None:
         sys.exit(0)
 
-    # uuid -> source paths of the images that message carries (HOME-315).
     image_sources = _image_sources(entries)
-
-    # tool_result blocks name only the call they answer, so the tool's name has
-    # to come from the assistant's matching tool_use block. Build once.
-    tool_names = _tool_use_names(entries)
-
-    records = []
-    for seq, entry in enumerate(messages):
-        msg  = entry["message"]
-        raw  = msg.get("content", "")
-        text = _extract_text(raw)
-        markers = _image_markers(raw, image_sources.get(entry.get("uuid") or "", []))
-        if markers:
-            # Appended, not substituted: "[Image #1]" carries the ordering the
-            # rest of the conversation refers to, so keep it and add the detail.
-            text = "\n".join(part for part in (text, *markers) if part)
-        if not text:
-            continue
-        ts_raw = entry.get("timestamp")
-        ts = datetime.fromisoformat(ts_raw) if ts_raw else datetime.now(timezone.utc)
-        author = classify_author(msg["role"], raw)
-        records.append({
-            "message_uuid":      entry.get("uuid") or f"{session_id}:{seq}",
-            "session_id":        session_id,
-            "project_path":      cwd,
-            "git_branch":        git_branch,
-            "conversation_name": name,
-            "ai_title":          ai_title,
-            "host":              HOST,
-            "role":              msg["role"],
-            # Derived from transcript structure, not from the text. See
-            # classify_author — this is the field HOME-309 existed for.
-            "author":            author,
-            "tool_name":         _tool_name_for(raw, tool_names) if author == "tool" else None,
-            # '<synthetic>' appears for harness-generated assistant turns; keep
-            # it rather than normalising, so it stays distinguishable later.
-            "model":             msg.get("model") if author == "claude" else None,
-            "content":           text,
-            "sequence_num":      seq,
-            # The real transcript timestamp. The forwarder may not deliver this
-            # for days if we are offline, so it must not be re-derived later.
-            "created_at":        ts.isoformat(),
-        })
 
     # Stage any images to a LOCAL directory (HOME-298). Deliberately not written
     # to the SMB share here: that is network I/O on the capture path, which is

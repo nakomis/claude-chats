@@ -152,6 +152,10 @@ def _sidecar(entry, block_index, image_index, source_path, digest, data,
     ):
         if value not in (None, "", []):
             doc[key] = value
+    if entry.get("midTurn"):
+        # Sent while Claude was still working, so it came from a queued_command
+        # attachment rather than a message (HOME-411). Absent otherwise.
+        doc["mid_turn"] = True
     if text:
         # Truncated on purpose: useful context, but this lands on a Samba share
         # and whole conversations do not belong there.

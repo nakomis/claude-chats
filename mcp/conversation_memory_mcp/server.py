@@ -197,11 +197,11 @@ def search_memory(
             for msg_id, conv_id, session_id, proj, name, ai_title, role, content, seq, ts, score in rows:
                 cur.execute(
                     """
-                    SELECT role, content, sequence_num
+                    SELECT id, role, content, sequence_num
                     FROM   messages
                     WHERE  conversation_id = %s
                       AND  sequence_num BETWEEN %s AND %s
-                    ORDER  BY sequence_num
+                    ORDER  BY sequence_num, created_at
                     """,
                     (conv_id, max(0, seq - CONTEXT_WINDOW), seq + CONTEXT_WINDOW),
                 )
@@ -209,10 +209,12 @@ def search_memory(
                     {
                         "role": r,
                         "seq":  s,
-                        "content": c if s == seq else (c[:300] + "…" if len(c) > 300 else c),
-                        "is_match": s == seq,
+                        "content": c if i == msg_id else (c[:300] + "…" if len(c) > 300 else c),
+                        # By id, not seq: a message sent mid-turn shares its
+                        # predecessor's sequence_num (HOME-411).
+                        "is_match": i == msg_id,
                     }
-                    for r, c, s in cur.fetchall()
+                    for i, r, c, s in cur.fetchall()
                 ]
                 results.append({
                     "session_id":   session_id,
@@ -370,7 +372,9 @@ def get_conversation(
                 sql += " AND sequence_num <= %s"
                 params.append(end_seq)
 
-            sql += " ORDER BY sequence_num"
+            # created_at breaks ties: a message sent mid-turn shares its
+            # predecessor's sequence_num (HOME-411).
+            sql += " ORDER BY sequence_num, created_at"
             cur.execute(sql, params)
 
             messages = [

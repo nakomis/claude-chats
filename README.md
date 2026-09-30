@@ -32,6 +32,8 @@ It used to write straight to Postgres, and it failed silently — when the Docke
 
 Deduplication happens locally, because the hook re-reads the whole transcript on every `Stop` and can no longer ask Postgres what it has already seen. `INSERT OR IGNORE` against a `UNIQUE message_uuid` does it — which is why delivered rows are kept as tombstones rather than deleted.
 
+A message sent while Claude is still working isn't written as a message at all. Claude Code records it as a `queued_command` attachment, and until HOME-411 the hook dropped it, pictures and all. It is now captured like any other message. So that rows already delivered keep their numbers, it shares the `sequence_num` of the message before it, and `created_at` settles the order. `scripts/backfill-mid-turn.py` recovers the ones missed before the fix; run it on each Mac.
+
 ### Delivery — the ingest hop (lives in `home-infra`)
 
 This half is **not in this repository**. It lives in [`nakomis/home-infra`](https://github.com/nakomis/home-infra), whose `docs/architecture/conversation-memory.drawio` is the authoritative topology; the diagram above shows only enough of it to make sense of the ends.
