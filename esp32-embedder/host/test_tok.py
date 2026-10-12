@@ -1,11 +1,16 @@
 """Check the C tokeniser against llama-server (what Ollama runs), id for id.
 
-    python test_tok.py              # corpus_ids.json (from ollama_ids.py) + stress
+    python test_tok.py              # corpus_ids.json (from ollama_ids.py) + stress + long
     python test_tok.py --stress     # stress only (needs llama-server on :18555)
 
 Stress cases go to a live llama-server (see ollama_ids.py for how to start one):
-hand-picked edge cases plus random strings drawn from awkward Unicode blocks and
-random bytes (invalid UTF-8).
+hand-picked edge cases plus random strings drawn from awkward Unicode blocks.
+Invalid UTF-8 is not covered: JSON can't carry it, so it can't reach Ollama.
+
+Long inputs (over 512 tokens) go to Ollama itself, because Ollama truncates
+by detokenising and re-embedding text, which /tokenize can't show: the fp32
+numpy vector from tok.c's ids must match Ollama's to 0.99999, where being one
+token off gives ~0.9999.
 """
 import json
 import random
@@ -76,6 +81,27 @@ def stress(n_random=3000):
     return bad
 
 
+def long():
+    import numpy as np
+    import mxbai as M
+    bad = 0
+    for text in (' '.join(f'word{i} alpha beta' for i in range(200)),
+                 ' '.join(f'\u00dcn\u00efcode-{i} na\u00efve, caf\u00e9!' for i in range(150))):
+        ids, total = TOK.encode(text, total=True)
+        req = urllib.request.Request('http://localhost:11434/api/embed',
+                                     json.dumps({'model': 'mxbai-embed-large', 'input': text}).encode())
+        o = np.array(json.load(urllib.request.urlopen(req))['embeddings'][0])
+        n = len(ids)
+        x = M.T['token_embd.weight'][ids] + M.T['position_embd.weight'][:n] + M.T['token_types.weight'][0]
+        x = M.ln(x, M.T['token_embd_norm.weight'], M.T['token_embd_norm.bias'])
+        for i in range(M.LAYERS):
+            x = M.layer(x, i)
+        c = M.cos(x[0], o)
+        print(f'long: {total} tokens -> {n}, cos vs Ollama {c:.6f}')
+        bad += c < 0.99999
+    return bad
+
+
 def corpus():
     d = json.load(open('corpus_ids.json'))
     bad = 0
@@ -87,5 +113,5 @@ def corpus():
 
 
 if __name__ == '__main__':
-    bad = (0 if '--stress' in sys.argv else corpus()) + stress()
+    bad = (0 if '--stress' in sys.argv else corpus() + long()) + stress()
     sys.exit(1 if bad else 0)

@@ -41,6 +41,7 @@ _lib.tok_init.argtypes = [ctypes.POINTER(_Vocab), ctypes.c_char_p, ctypes.c_size
                           ctypes.c_void_p, ctypes.c_void_p]
 _lib.tok_encode.argtypes = [ctypes.POINTER(_Vocab), ctypes.c_char_p, ctypes.c_size_t,
                             ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+_lib.tok_lookup.argtypes = [ctypes.POINTER(_Vocab), ctypes.c_char_p, ctypes.c_size_t]
 _lib.tok_free.argtypes = [ctypes.POINTER(_Vocab)]
 
 
@@ -55,6 +56,11 @@ class Tokenizer:
 
     def __del__(self):
         _lib.tok_free(ctypes.byref(self._v))
+
+    def lookup(self, s):
+        """Id of a GGUF-form string, or -1."""
+        b = s.encode()
+        return _lib.tok_lookup(ctypes.byref(self._v), b, len(b))
 
     def encode(self, text, max_ids=MAX_IDS, total=False):
         """Token ids for text (str or UTF-8 bytes), [CLS] ... [SEP], truncated as Ollama does."""
@@ -80,8 +86,13 @@ def hf_form(gguf_tokens):
 
 
 def from_gguf_tokens(gguf_tokens):
+    gguf_tokens = list(gguf_tokens)
     vocab = hf_form(gguf_tokens)
-    return Tokenizer(b'\0'.join(v.encode() for v in vocab) + b'\0', len(vocab))
+    t = Tokenizer(b'\0'.join(v.encode() for v in vocab) + b'\0', len(vocab))
+    # the HF form only round-trips by convention ("[..]" bare, "##" continues): check it
+    bad = [i for i, g in enumerate(gguf_tokens) if t.lookup(g) != i]
+    assert not bad, f'vocab does not round-trip, e.g. id {bad[0]} {gguf_tokens[bad[0]]!r}'
+    return t
 
 
 def from_bin(path=BIN):

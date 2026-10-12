@@ -418,7 +418,7 @@ void app_main(void)
                     break;
                 }
         }
-        n = nt;
+        if (!same) { free(emu); free(ref); continue; }   // emu and ref belong to mxtest.bin's ids
         if (n > MAXTOK) { printf("test %d: %lu tokens > %d, skipped\n", ti, (unsigned long)n, MAXTOK); free(emu); free(ref); continue; }
         n_tok = n;
         t_sd = t_att = t_quant = t_stall = 0;

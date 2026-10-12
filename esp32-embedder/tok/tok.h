@@ -4,7 +4,8 @@
 // llama.cpp's WPM tokeniser (src/llama-vocab.cpp, llm_tokenizer_wpm_session,
 // tag b11351), not HuggingFace's. The differences that matter:
 //   - literal "[PAD]" "[UNK]" "[CLS]" "[SEP]" "[MASK]" in the text become those
-//     special tokens (llama-server tokenises with parse_special)
+//     special tokens (llama-server tokenises with parse_special); these are the
+//     GGUF's only CONTROL tokens, hard-coded here, so another vocab needs a check
 //   - llama.cpp's own Unicode tables: single-codepoint NFD, combining marks and
 //     controls dropped, its lowercase map; split on punctuation, ASCII symbols
 //     and CJK
