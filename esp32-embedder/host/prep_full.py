@@ -103,7 +103,7 @@ def embed_emu(ids):
 
 tests = []
 for t in TESTS:
-    ids = M.TOK.encode(t).ids
+    ids = M.TOK.encode(t)
     ref = M.embed(t).astype(np.float32)
     emu = embed_emu(ids)
     print(f"{len(ids):3d} tok: int8 emulation vs fp32/Ollama cos {M.cos(emu, ref):.6f}")
