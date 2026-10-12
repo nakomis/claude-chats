@@ -114,6 +114,11 @@ To test the tokeniser on the Mac, start a private `llama-server` on Ollama's GGU
 .venv/bin/python ollama_ids.py && .venv/bin/python test_tok.py
 ```
 
-On the ESP32-S3 CAM board, flash over the native USB port. After flashing, tap **RST**: a USB reset leaves the chip in download mode. If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
+On the ESP32-S3 CAM board, flash over the native USB port. `idf.py flash` ends with a USB reset, which leaves the chip in download mode, so either tap **RST** afterwards or flash with esptool and a watchdog reset, which needs no hands:
+
+```bash
+python -m esptool --chip esp32s3 -p /dev/cu.usbmodem1101 -b 460800 --after watchdog_reset write_flash 0x10000 build/s3full.bin
+```
+ If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
 
 The SD pins are those of the ESP32-S3 CAM board's onboard slot (1-bit: CLK 39, CMD 38, D0 40). For a 4-bit breakout, see CHATS-6.
