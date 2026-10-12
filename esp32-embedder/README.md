@@ -1,0 +1,85 @@
+# esp32-embedder
+
+`mxbai-embed-large`, the model conversation-memory embeds every message with, running on an **ESP32-S3**: a dual-core 240 MHz microcontroller with 8 MB of PSRAM, on a board that costs about £6. The 335-million-parameter model doesn't fit in the chip's memory, so the weights stream off an SD card, one matrix at a time, on every pass.
+
+It works. On five test texts the S3's embeddings match Ollama's to a cosine similarity of **0.9994–0.9996**. That is exactly what the int8 scheme predicts in numpy, so the microcontroller adds no error of its own.
+
+This is spike code (HOME-432 → CHATS-1): proven on the bench, not yet a service. The plan to turn it into an embedding worker that takes over from Cal is in Plane under **CHATS-1**.
+
+## Results
+
+ESP32-S3 N16R8 (ESP32-S3 CAM board), 32 GB SDHC card in the onboard slot, whole 24-layer model, [CLS] pooling:
+
+| Tokens | cos vs Ollama | Time per pass |
+|---|---|---|
+| 10 | 0.999560 | 72.2 s |
+| 13 | 0.999366 | 72.2 s |
+| 13 | 0.999434 | 72.2 s |
+| 115 | 0.999472 | 75.5 s |
+| 140 | 0.999376 | 78.2 s |
+
+**It is SD-bound.** The onboard slot is wired for 1-bit SDMMC, which tops out at 4.8 MB/s; the firmware gets about 4.3 MB/s. Every pass reads all ~310 MB of weights, so a pass costs about 72 s whatever it carries, until compute catches up at around 150 tokens. Compute alone is ~0.3 s per layer at 13 tokens and ~1.6 s per layer at 115.
+
+So **batching is nearly free.** A pass carrying 140 tokens of queued messages costs 6 s more than one carrying 13. At conversation-memory's load (~900 embeddings a day, ~100 tokens each), one board manages about 2,400 a day. A 4-bit SDIO breakout (CHATS-6) should cut a pass to ~25 s.
+
+## How it works
+
+**The scheme.** Weights are int8 with one scale per output row. Each matmul's input is quantised to int8 per token, except for K = 8 "outlier" input dimensions per matrix, found by calibration, which stay fp32 with their weight columns dequantised. Without that, a handful of huge activation dimensions wreck per-token quantisation (cos 0.9958 instead of 0.9993). Everything else (attention, layernorm, GELU, residuals) is fp32. Token embeddings are int8 per row.
+
+**The kernels** (`firmware/full/main/kernels.inc`):
+- int8 dot products use the S3's PIE SIMD (`esp_nn_dot_s8_aligned_esp32s3`, 16 MACs per instruction), with rows split across both cores.
+- The input is quantised once per matmul, on both cores, using the FPU's `round.s`.
+- GELU is a lookup table folded into the up-projection epilogue.
+- Attention splits heads across the cores, with register-blocked loops and a fast `exp`.
+
+**Streaming** (`firmware/full/main/full.c`):
+- A pass is a flat list of 288 units: (layer, matrix, 1 MB block of rows).
+- While unit *u* computes, unit *u + 1* is already being read.
+- An `sd` task on core 0 keeps the card busy, alternating two 16 KB DMA buffers in internal RAM.
+- A `cp` task on core 1 copies each chunk to PSRAM and checks its CRC32 against `mxcrc.h`.
+
+## Lessons (the expensive way)
+
+- **Never let both cores run PIE loads through the external-memory cache at the same time.** Two cores reading flash-mapped or PSRAM weights with 128-bit vector loads occasionally get garbage: a few dot products in 100,000 come back as random int32s. One core is fine, and so is internal SRAM; masking interrupts changes nothing. Each core therefore copies a block of weight rows into its own internal buffer, and PIE only ever reads internal SRAM.
+- **FatFs seeks are O(file size).** Seeking in a 345 MB file walks the FAT cluster chain, and one 1 MB matrix took 24 s. The firmware builds the cluster map once (`FF_USE_FASTSEEK`, `CREATE_LINKMAP`) and reads raw sectors.
+- **SD DMA into PSRAM is ~6× slower** than into internal RAM (0.8 vs 4.8 MB/s), so reads bounce through internal buffers.
+- **Internal SRAM is the scarce resource,** not PSRAM. The 168 KB input tile, weight-row buffers, bounce buffers and task stacks fight over ~320 KB. Task creation is checked: a failed `xTaskCreate` used to mean a silent hang.
+- **Verify the card.** One Mac card reader flipped 3, then 35, bytes while writing the 345 MB file. Remount and compare after copying, and the on-device CRCs catch anything else.
+- **The original ESP32 (WROOM-32) is ~18× slower** with plain C (76 MMAC/s on two cores), and `MALLOC_CAP_INTERNAL` can hand back IRAM, which faults on byte access.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `host/mxbai.py` | numpy reference (equals Ollama to cos 1.000000) and int8 emulation, read straight from Ollama's GGUF |
+| `host/prep_full.py` | Calibrates the outliers, quantises, checks the full int8 model against Ollama, and writes `mxbai.bin` (345 MB) and `mxtest.bin` (test vectors) |
+| `host/gen_crc.py` | Writes `firmware/full/main/mxcrc.h`: the CRC32 of every section of a given `mxbai.bin` |
+| `host/prep_layer.py` | Packs layer 0 alone for `firmware/layer0` |
+| `host/corpus.py` | Samples real messages from local Claude Code transcripts for tokeniser testing (stays local) |
+| `firmware/full/` | The whole model, streamed off SD and checked against `mxtest.bin` |
+| `firmware/layer0/` | One layer from a flash partition, plus the self-tests that found the PIE bug, an SD speed test and a GPIO pull-up probe |
+| `firmware/bench/` | int8 matmul benchmark for the S3 (esp-nn) |
+| `firmware/wroom-bench/` | int8 dot-product benchmark for the original ESP32 |
+
+## Running it
+
+You need [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) 5.4 or later, Ollama with `mxbai-embed-large` pulled, and Python 3.11+.
+
+```bash
+cd host
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python prep_full.py mxbai.bin mxtest.bin        # a few minutes; prints cos vs Ollama per test
+.venv/bin/python gen_crc.py mxbai.bin ../firmware/full/main/mxcrc.h
+```
+
+Format a card FAT32 and copy `mxbai.bin` and `mxtest.bin` to its root. **Then eject it, reinsert it and compare the copy byte for byte.** Put the card in the board's slot, and:
+
+```bash
+cd firmware/full
+idf.py set-target esp32s3 && idf.py build
+idf.py -p /dev/cu.usbmodem1101 flash
+```
+
+On the ESP32-S3 CAM board, flash over the native USB port. After flashing, tap **RST**: a USB reset leaves the chip in download mode. If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
+
+The SD pins are those of the ESP32-S3 CAM board's onboard slot (1-bit: CLK 39, CMD 38, D0 40). For a 4-bit breakout, see CHATS-6.

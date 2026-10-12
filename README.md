@@ -71,6 +71,7 @@ The `server/` directory — the ActiveMQ container, the Node STOMP worker, `serv
 | `localhost/` | The self-contained [single-machine edition](localhost/README.md) |
 | `docs/architecture/` | The diagram above, as `.drawio` source and exported SVG |
 | `server/` | **Superseded** — the previous ActiveMQ/worker design, kept for reference |
+| `esp32-embedder/` | `mxbai-embed-large` running on a £6 ESP32-S3, weights streamed off an SD card; [matches Ollama to cos 0.9994](esp32-embedder/README.md) (spike, CHATS-1) |
 
 ## Installation
 
