@@ -1,0 +1,2 @@
+# Name,   Type, SubType, Offset,   Size
+factory,  app,  factory, 0x10000,  0x200000
