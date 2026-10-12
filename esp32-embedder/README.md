@@ -38,6 +38,16 @@ So **batching is nearly free.** A pass carrying 140 tokens of queued messages co
 - An `sd` task on core 0 keeps the card busy, alternating two 16 KB DMA buffers in internal RAM.
 - A `cp` task on core 1 copies each chunk to PSRAM and checks its CRC32 against `mxcrc.h`.
 
+**Tokenising** (`tok/`): the device tokenises raw UTF-8 itself, giving the same ids as Ollama. Ollama runs mxbai through llama.cpp's `llama-server`, so `tok.c` is a port of llama.cpp's WordPiece (`llm_tokenizer_wpm_session`, tag b11351, the one Ollama 0.40.3 pins), not HuggingFace's. The differences that matter:
+- literal `[CLS]`, `[SEP]` and the other specials in the text become special tokens
+- llama.cpp's own Unicode tables: single-codepoint NFD, combining marks dropped, symbols split only below 0x7F
+- greedy matching over UTF-8 bytes, with no 100-character `[UNK]` cap
+- over 512 tokens, `[CLS]` + the first 510 + `[SEP]`
+
+The Unicode tables (`tok_tables.h`, ~36 KB of flash) are generated from that tag's `unicode-data.cpp`. The vocab comes off the card (`mxbai.bin` section 6) into a hash table in PSRAM: about 575 KB, loaded in 0.15 s. A 140-token message tokenises in 2.3 ms.
+
+It matches `llama-server`'s `/tokenize` id for id on 3,000 real messages (full and cut to 800 characters) and 3,034 stress strings. HF `tokenizers` disagreed on 2 of the 3,000 real messages, and on 908 of 1,034 stress strings.
+
 ## Lessons (the expensive way)
 
 - **Never let both cores run PIE loads through the external-memory cache at the same time.** Two cores reading flash-mapped or PSRAM weights with 128-bit vector loads occasionally get garbage: a few dot products in 100,000 come back as random int32s. One core is fine, and so is internal SRAM; masking interrupts changes nothing. Each core therefore copies a block of weight rows into its own internal buffer, and PIE only ever reads internal SRAM.
@@ -55,8 +65,13 @@ So **batching is nearly free.** A pass carrying 140 tokens of queued messages co
 | `host/prep_full.py` | Calibrates the outliers, quantises, checks the full int8 model against Ollama, and writes `mxbai.bin` (345 MB) and `mxtest.bin` (test vectors) |
 | `host/gen_crc.py` | Writes `firmware/full/main/mxcrc.h`: the CRC32 of every section of a given `mxbai.bin` |
 | `host/prep_layer.py` | Packs layer 0 alone for `firmware/layer0` |
+| `tok/` | The tokeniser: `tok.c`/`tok.h` (portable C99), and `gen_tables.py`, which writes `tok_tables.h` from llama.cpp's Unicode data |
+| `host/tok.py` | `tok.c` from Python (ctypes); `mxbai.py` tokenises through it |
+| `host/ollama_ids.py` | Ground-truth ids for the corpus from a private `llama-server` (the binary Ollama ships) |
+| `host/test_tok.py` | `tok.c` against `llama-server`, id for id: the corpus plus random and hand-picked stress strings |
+| `host/serial_log.py` | Logs the board's serial output to a file without resetting it |
 | `host/corpus.py` | Samples real messages from local Claude Code transcripts for tokeniser testing (stays local) |
-| `firmware/full/` | The whole model, streamed off SD and checked against `mxtest.bin` |
+| `firmware/full/` | The whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin` |
 | `firmware/layer0/` | One layer from a flash partition, plus the self-tests that found the PIE bug, an SD speed test and a GPIO pull-up probe |
 | `firmware/bench/` | int8 matmul benchmark for the S3 (esp-nn) |
 | `firmware/wroom-bench/` | int8 dot-product benchmark for the original ESP32 |
@@ -78,6 +93,12 @@ Format a card FAT32 and copy `mxbai.bin` and `mxtest.bin` to its root. **Then ej
 cd firmware/full
 idf.py set-target esp32s3 && idf.py build
 idf.py -p /dev/cu.usbmodem1101 flash
+```
+
+To test the tokeniser on the Mac, start a private `llama-server` on Ollama's GGUF (the command is in `host/ollama_ids.py`), then:
+
+```bash
+.venv/bin/python ollama_ids.py && .venv/bin/python test_tok.py
 ```
 
 On the ESP32-S3 CAM board, flash over the native USB port. After flashing, tap **RST**: a USB reset leaves the chip in download mode. If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.

@@ -1,6 +1,8 @@
 // HOME-432 step 3: the whole of mxbai-embed-large on the ESP32-S3. Weights streamed off the
 // SD card (mxbai.bin from prep_full.py) one matrix at a time; checked against mxtest.bin
 // (numpy emulation of the int8 scheme, and fp32 = Ollama). Throwaway spike code.
+// CHATS-3: the test texts are tokenised on the device (../../tok) and the ids checked
+// against mxtest.bin before each pass.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "mxcrc.h"
+#include "tok.h"
 
 extern int32_t esp_nn_dot_s8_aligned_esp32s3(const int8_t *a, const int8_t *b, int32_t len);
 
@@ -288,6 +291,41 @@ static void embed_in(const uint32_t *ids)
 static void *ps(size_t n) { return heap_caps_aligned_alloc(16, n, MALLOC_CAP_SPIRAM); }
 static void *in(size_t n) { return heap_caps_aligned_alloc(16, n, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA); }
 
+// the texts prep_full.py made mxtest.bin from, in the same order
+static const char *const TEXTS[] = {
+    "The cat sat on the radiator all afternoon.",
+    "Shall I carry on with the kernel?",
+    "git push failed: permission denied (publickey)",
+    "Martin asked whether a cheap ESP32-S3 could take over the embedding job that Cal does today. "
+    "The plan streams the weights of mxbai-embed-large from an SD card, one matrix at a time, and "
+    "keeps a batch of messages in PSRAM so that each weight is used many times. Earlier benchmarks "
+    "measured about one billion multiply-accumulates per second across both cores, which suggests "
+    "roughly thirty seconds for a typical message. This test checks the arithmetic of one encoder "
+    "layer against a reference computed on the Mac.",
+    "  File \"/usr/lib/python3.11/site-packages/requests/adapters.py\", line 519, in send\n"
+    "    raise ConnectionError(e, request=request)\nrequests.exceptions.ConnectionError: "
+    "HTTPConnectionPool(host='localhost', port=11434): Max retries exceeded with url: /api/embed "
+    "(Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10f3c2d90>: "
+    "Failed to establish a new connection: [Errno 61] Connection refused'))",
+};
+#define N_TEXTS (int)(sizeof TEXTS / sizeof *TEXTS)
+static tok_vocab vocab;
+
+// vocab section (CRC-checked) -> hash table in PSRAM; the raw section is freed afterwards
+static int vocab_load(void)
+{
+    int64_t t = esp_timer_get_time();
+    char *raw = ps(VOCAB_LEN);
+    if (!raw) { printf("vocab: alloc failed\n"); return -1; }
+    check("vocab", 0, 6, sd_read(raw, goff[6], VOCAB_LEN, 0), glob_crc[6]);
+    int r = tok_init(&vocab, raw, VOCAB_LEN, n_vocab, ps, heap_caps_free);
+    heap_caps_free(raw);
+    if (r) { printf("vocab: tok_init failed\n"); return -1; }
+    printf("vocab: %d tokens, longest %d bytes, loaded in %.2f s; PSRAM free %u\n", vocab.n, vocab.max_len,
+           (esp_timer_get_time() - t) / 1e6, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return 0;
+}
+
 void app_main(void)
 {
     vTaskDelay(pdMS_TO_TICKS(1500));
@@ -345,6 +383,7 @@ void app_main(void)
     att_scr[0] = (float *)xq;                 // xq is idle during attention: k and v per head, per core
     att_scr[1] = (float *)(xq + (size_t)2 * MAXTOK * HD * sizeof(float));
     gelu_init();
+    if (vocab_load()) return;
     for (int li = 0; li < n_layer; li++) sd_read(ltab[li], loff[li], sizeof ltab[li], 0);
     plan();
     reader_start();
@@ -353,20 +392,39 @@ void app_main(void)
     uint32_t th[3];
     fread(th, 4, 3, ft);
     if (memcmp(th, "MXT1", 4)) { printf("bad test magic\n"); return; }
+    int tok_bad = 0;
     for (int ti = 0; ti < (int)th[1]; ti++) {
-        static uint32_t ids[512];
+        static uint32_t want[512];
+        static int32_t ids[512];
         uint32_t n;
         fread(&n, 4, 1, ft);
-        fread(ids, 4, n, ft);
+        fread(want, 4, n, ft);
         float *emu = malloc(D * 4), *ref = malloc(D * 4);
         fread(emu, 4, D, ft);
         fread(ref, 4, D, ft);
+        if (ti >= N_TEXTS) { printf("test %d: no text\n", ti); free(emu); free(ref); continue; }
+        int64_t tt = esp_timer_get_time();
+        int nt = tok_encode(&vocab, TEXTS[ti], strlen(TEXTS[ti]), ids, 512, NULL);
+        tt = esp_timer_get_time() - tt;
+        int same = nt == (int)n && !memcmp(ids, want, n * 4);
+        tok_bad += !same;
+        printf("test %d: tokenised %u bytes -> %d ids in %lld us; %s mxtest.bin\n", ti, (unsigned)strlen(TEXTS[ti]),
+               nt, (long long)tt, same ? "same as" : "DIFFERENT FROM");
+        if (!same) {
+            for (int i = 0; i < (nt > (int)n ? nt : (int)n) && i < 512; i++)
+                if (i >= nt || i >= (int)n || ids[i] != (int32_t)want[i]) {
+                    printf("  first difference at %d: got %ld, want %ld\n", i, i < nt ? (long)ids[i] : -1L,
+                           i < (int)n ? (long)want[i] : -1L);
+                    break;
+                }
+        }
+        n = nt;
         if (n > MAXTOK) { printf("test %d: %lu tokens > %d, skipped\n", ti, (unsigned long)n, MAXTOK); free(emu); free(ref); continue; }
         n_tok = n;
         t_sd = t_att = t_quant = t_stall = 0;
         cyc_cp[0] = cyc_cp[1] = cyc_pie[0] = cyc_pie[1] = 0;
         int64_t t0 = esp_timer_get_time();
-        embed_in(ids);
+        embed_in((const uint32_t *)ids);
         int64_t te = esp_timer_get_time();
         pass_fwd();
         printf("  embeddings in %.2f s; pass %.1f s, of which %.1f s waiting on the card\n", (te - t0) / 1e6,
@@ -378,5 +436,5 @@ void app_main(void)
                t_att / 1e6, t_quant / 1e6, crc_bad ? "  CRC ERRORS" : "");
         free(emu); free(ref);
     }
-    printf("== done (%d CRC mismatches) ==\n", crc_bad);
+    printf("== done (%d CRC mismatches, %d tokeniser mismatches) ==\n", crc_bad, tok_bad);
 }
