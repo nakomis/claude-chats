@@ -9,3 +9,6 @@ firmware/full/main/mxcrc.h
 # model images, test vectors and the local transcript sample
 host/*.bin
 host/corpus.json
+host/corpus_ids.json
+# built by host/tok.py
+tok/libtok.so

@@ -11,7 +11,8 @@ from pathlib import Path
 
 import numpy as np
 from gguf import GGUFReader
-from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, processors
+
+import tok
 
 
 
@@ -31,27 +32,9 @@ _r = GGUFReader(GGUF)
 T = {t.name: np.asarray(t.data, dtype=np.float32) for t in _r.tensors}
 
 
-def _tokenizer():
-    f = _r.fields['tokenizer.ggml.tokens']
-    # llama.cpp stores BERT WordPiece as '\u2581word' (word start) and bare
-    # 'piece' (continuation); turn it back into 'word' / '##piece'
-    vocab = {}
-    for n, i in enumerate(f.data):
-        t = bytes(f.parts[i]).decode()
-        if t.startswith('\u2581'):
-            t = t[1:]
-        elif not (t.startswith('[') and t.endswith(']')):
-            t = '##' + t
-        vocab.setdefault(t, n)
-    tok = Tokenizer(models.WordPiece(vocab, unk_token='[UNK]', max_input_chars_per_word=100))
-    tok.normalizer = normalizers.BertNormalizer(lowercase=True)
-    tok.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
-    tok.post_processor = processors.BertProcessing(('[SEP]', 102), ('[CLS]', 101))
-    tok.enable_truncation(512)
-    return tok
-
-
-TOK = _tokenizer()
+# llama.cpp's WordPiece, as Ollama runs it (../tok, via ctypes): ids match Ollama exactly
+TOK = tok.from_gguf_tokens(bytes(_r.fields['tokenizer.ggml.tokens'].parts[i]).decode()
+                           for i in _r.fields['tokenizer.ggml.tokens'].data)
 
 
 def ln(x, w, b):
@@ -90,7 +73,7 @@ def mm(x, name, int8):
 
 
 def embed_input(text):
-    ids = TOK.encode(text).ids
+    ids = TOK.encode(text)
     n = len(ids)
     x = T['token_embd.weight'][ids] + T['position_embd.weight'][:n] + T['token_types.weight'][0]
     return ln(x, T['token_embd_norm.weight'], T['token_embd_norm.bias'])
