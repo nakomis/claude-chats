@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as iot from 'aws-cdk-lib/aws-iot';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 
 export interface DeviceStackProps extends cdk.StackProps {
@@ -25,8 +26,11 @@ const PROJECT = 'kata';
  *
  * For CHATS-5, the same certificate also buys AWS credentials: the IoT credentials provider
  * (credentials.iot.amazonaws.com) exchanges it for the WorkerRole through the role alias
- * kata-{env}, which the device policy lets a board assume. The role can read the embedding queue
- * once there is one (EmbeddingQueueArn); until then it can do nothing at all.
+ * kata-{env}, which the device policy lets a board assume. The role can take jobs from
+ * conversation-memory's ingest queue and hand them on through its results queue, and nothing else.
+ * Both queues live in home-infra's ConversationMemoryIngestStack, in the same account as the
+ * Things (prod boards consume prod; sandbox boards are for testing against sandbox), and are found
+ * through the SSM parameters it publishes, so that stack must be deployed first (HOME-439).
  */
 export class DeviceStack extends cdk.Stack {
     constructor(scope: Construct, id: string, props: DeviceStackProps) {
@@ -49,33 +53,30 @@ export class DeviceStack extends cdk.Stack {
             credentialDurationSeconds: 3600,
         });
 
-        // PLACEHOLDER (CHATS-5): the queue Kata will pull embedding jobs from doesn't exist yet. Until
-        // its ARN is passed (cdk deploy --parameters ClaudeChatsKataDeviceStack:EmbeddingQueueArn=...),
-        // the policy below isn't created, and the role grants nothing. Add s3:GetObject on the
-        // claim-check bucket only if Kata ends up handling payloads over 200 KB itself.
-        const queueArn = new cdk.CfnParameter(this, 'EmbeddingQueueArn', {
-            type: 'String',
-            default: 'none',
-            description: 'CHATS-5: the SQS queue Kata takes embedding jobs from ("none" until it exists)',
-        });
-        const hasQueue = new cdk.CfnCondition(this, 'HasEmbeddingQueue', {
-            expression: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(queueArn.valueAsString, 'none')),
-        });
-        const queuePolicy = new iam.CfnPolicy(this, 'WorkerQueuePolicy', {
-            policyName: 'embedding-queue',
-            roles: [workerRole.roleName],
-            policyDocument: {
-                Version: '2012-10-17',
-                Statement: [{
-                    Effect: 'Allow',
-                    // Take a job, delete it once its vector is stored, or hand it back (visibility 0)
-                    // when an update arrives mid-pass (CHATS-10's acceptance criterion 4).
-                    Action: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:ChangeMessageVisibility'],
-                    Resource: queueArn.valueAsString,
-                }],
-            },
-        });
-        queuePolicy.cfnOptions.condition = hasQueue;
+        // CHATS-5's custody hand-off: Kata takes a job from the ingest queue, embeds it, sends the
+        // result (the ingest body verbatim, plus its vector) to the results queue, and only then
+        // deletes the job. Cal stores the result and deletes it from there. The ARNs come from
+        // home-infra's SSM parameters, resolved at deploy time: no CloudFormation export crosses
+        // the two repos, and the deploy fails clearly if home-infra hasn't published them yet.
+        const convmem = `/conversation-memory/${deployEnv}`;
+        const ingestQueueArn = ssm.StringParameter.valueForStringParameter(this, `${convmem}/queue-arn`);
+        const resultsQueueArn = ssm.StringParameter.valueForStringParameter(this, `${convmem}/results-queue-arn`);
+        workerRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'TakeJobs',
+            // Receive with a 15-minute visibility, extend it while a job waits in the pool, delete it
+            // once its result is accepted, or hand it back (visibility 0) when an update arrives
+            // mid-pass (CHATS-10's acceptance criterion 4). The batch calls need the same actions.
+            actions: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:ChangeMessageVisibility'],
+            resources: [ingestQueueArn],
+        }));
+        workerRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'HandOffResults',
+            // SendMessage covers SendMessageBatch. Send only: Kata can't read results back.
+            actions: ['sqs:SendMessage'],
+            resources: [resultsQueueArn],
+        }));
+        // Deliberately nothing else: no S3 (claim-check jobs are handed to Cal unembedded), no
+        // GetQueueAttributes, no DLQs, and no KMS (both queues use SQS-managed encryption).
 
         // ---- the boards ----
         // Policy variables pin each certificate to its own Thing: the client id must be the Thing's

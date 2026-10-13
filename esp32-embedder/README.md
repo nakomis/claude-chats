@@ -141,11 +141,28 @@ The SD pins are those of the ESP32-S3 CAM board's onboard slot (1-bit: CLK 39, C
 
 Each board is an AWS IoT Thing, `kata-{env}-{board}`: `blue`, `green` and `red` in sandbox, none in prod yet. The list is `infra/boards.json`, and every deploy declares all of them, so a board left out has its Thing deleted (and the deploy fails while its certificate is still attached). `ClaudeChatsKataDeviceStack` makes the Things, with the attributes Fleet reads (`project=kata`, `deviceType=embedder`, `capabilities=ota,ota-signed`), and one IoT policy for all of them. Through policy variables, a board may connect only as its own Thing, and only use its own topics: it subscribes to `kata/{thing}/commands` and publishes to `kata/{thing}/responses` and `kata/{thing}/status`. There's no `ota-approval`: nobody is there to approve an update, so the board's own checks decide.
 
-The stack also has what CHATS-5 will need to reach the embedding queue with the same certificate: a role that the IoT credentials provider assumes (`kata-worker-{env}`), the role alias `kata-{env}`, and `iot:AssumeRoleWithCertificate` on it in the board policy. Until the queue exists, the role can do nothing. Deploying with `--parameters ClaudeChatsKataDeviceStack:EmbeddingQueueArn=<arn>` gives it receive, delete and change-visibility on that queue, and nothing else.
+The same certificate also buys AWS credentials for CHATS-5: the IoT credentials provider assumes a role (`kata-worker-{env}`, one-hour credentials) through the role alias `kata-{env}`, and the board policy allows `iot:AssumeRoleWithCertificate` on it. The role can do two things. It can take jobs from conversation-memory's ingest queue (receive, delete, change visibility). And it can hand results on to the results queue (send only), where Cal stores them and deletes them only after the commit. Nothing else: no S3, no queue attributes, no dead-letter queues.
+
+Both queues belong to home-infra's `ConversationMemoryIngestStack` (HOME-439), in the same account as the Things: prod boards work the live queue, and sandbox boards are for testing against sandbox's. The stack finds them through the SSM parameters home-infra publishes, `/conversation-memory/{env}/queue-arn` and `/conversation-memory/{env}/results-queue-arn`, so home-infra must be deployed first, or this deploy fails.
 
 ### Provisioning
 
-Nothing secret is in the build: every board runs the same image, so CI can publish it. What's particular to a board lives in its own `prov` partition (NVS, namespace `kata`), which the firmware reads at boot: the house Wi-Fi, the IoT endpoint, the Thing name, and the board's certificate and private key. Also the credentials-provider endpoint and role alias, which nothing reads until CHATS-5.
+Nothing secret is in the build: every board runs the same image, so CI can publish it. What's particular to a board lives in its own `prov` partition (NVS, namespace `kata`), which the firmware reads at boot: the house Wi-Fi, the IoT endpoint, the Thing name, and the board's certificate and private key. Also the credentials-provider endpoint and role alias, and the board's age identity (NVS key `age_id`), which nothing reads until CHATS-5.
+
+Each board has its **own age key** for decrypting conversation-memory jobs, so a lost board can be revoked on its own. Make it before provisioning:
+
+```bash
+infra/scripts/age-identity.sh blue       # --new to replace it, --revoke for a lost or retired board
+```
+
+The private key goes to SSM `/kata/{env}/boards/{board}/age-identity` (SecureString), and from there only into the board's `prov.bin`. The public key goes to `/conversation-memory/{env}/age-recipients/kata-{env}-{board}`. The forwarder encrypts each job to Cal's key (`/conversation-memory/{env}/age-recipient`) and to every parameter under `…/age-recipients/`, so adding a board needs no forwarder config, only a reinstall on each Mac. Jobs that were encrypted before then (or for a replaced key) still reach Cal: Kata hands them off as `unembedded/decrypt-failed`. The script is safe to re-run, and it never replaces a key unless you pass `--new`.
+
+`--revoke` is for a lost board. It deactivates the board's IoT certificate and detaches it, which cuts off IoT Core and SQS; credentials already issued last up to an hour. It then deletes the recipient and the key. After that, reinstall the forwarder on every Mac.
+
+**Which AWS account.** `NPM_ENVIRONMENT` alone decides it for every script here (`provision.sh`, `age-identity.sh`, `ota-signing-key.sh` and `sign.sh`): the profile is `nakom.is-{env}`.
+- A pre-set `AWS_PROFILE` is ignored. Inheriting one once wrote the prod signing key into the sandbox account.
+- To use another profile, set `KATA_AWS_PROFILE`.
+- Before touching AWS, each script checks `sts get-caller-identity` against that environment's account (`infra/scripts/aws-env.sh`), says which account it's using, and stops on a mismatch.
 
 ```bash
 infra/scripts/provision.sh blue          # NPM_ENVIRONMENT=prod for a prod board; --new for a fresh certificate
@@ -153,7 +170,7 @@ infra/scripts/provision.sh blue          # NPM_ENVIRONMENT=prod for a prod board
 
 This is tinycrypt's `provision-key.sh`, and it's safe to re-run. It checks the Thing exists, makes a certificate the first time (`aws iot create-keys-and-certificate`), and attaches it to the Thing and the board policy. `--new` retires the old certificates first: use it if a board's key may have leaked. It reads the Wi-Fi SSID and password from SSM (`/Nakomis/Wifi/*`, in the sandbox account), builds `firmware/full/certs/kata-sandbox-blue/prov.bin` with ESP-IDF's NVS partition generator, and shreds the CSV it went through. The certificate and key are kept beside it, so a re-run reuses them. `certs/` is gitignored.
 
-**It's insecure.** The private key is made on the Mac and flashed in plain text, and so is the Wi-Fi password: anyone holding the board can read both. The private key never passes through CloudFormation, though, and a board's certificate can be revoked on its own.
+**It's insecure.** The private key is made on the Mac and flashed in plain text, and so are the Wi-Fi password and the age identity: anyone holding the board can read all three (accepted for now, 13 Oct, rather than burning eFuses for NVS encryption). The private key never passes through CloudFormation, though, and a board's certificate can be revoked on its own.
 
 A board that isn't provisioned still runs the model and its self-tests; it just says `prov: not provisioned` and skips Wi-Fi. A board provisioned before identity existed gets Wi-Fi but not Fleet, and says so.
 

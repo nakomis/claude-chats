@@ -11,14 +11,16 @@
 # (firmware/full/ota-signing/{env}.pub.pem: commit it); the private PEM made here is deleted, and
 # never passed on a command line.
 #
-# Needs NPM_ENVIRONMENT (default sandbox) and AWS_PROFILE (default nakom.is-{env}).
+# Needs NPM_ENVIRONMENT (default sandbox). The profile is nakom.is-{env} (KATA_AWS_PROFILE overrides
+# it; a pre-set AWS_PROFILE is ignored), and the script stops unless it's that environment's account.
 set -euo pipefail
 umask 077
 
 env=${NPM_ENVIRONMENT:-sandbox}
-case "$env" in sandbox | prod) ;; *) echo "NPM_ENVIRONMENT must be sandbox or prod" >&2; exit 2 ;; esac
-export AWS_PROFILE=${AWS_PROFILE:-nakom.is-$env}
-export AWS_REGION=${AWS_REGION:-eu-west-2}
+# shellcheck source-path=SCRIPTDIR source=aws-env.sh
+. "$(dirname "$0")/aws-env.sh"
+kata_aws_env
+kata_check_account
 param="/kata/${env}/ota/signing-key"
 service=kata-ota-signing
 
