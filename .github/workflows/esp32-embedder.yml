@@ -51,6 +51,27 @@ jobs:
           cc -std=c99 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined -o test_tok test_tok.c tok.c
           ./test_tok
 
+  # Fleet's command parser, copied from tinycrypt with its tests (CHATS-10).
+  otacmd:
+    name: Fleet command parser (host)
+    needs: changes
+    if: needs.changes.outputs.embedder == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: esp32-embedder/otacmd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cJSON and pytest
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libcjson-dev
+          pip install --quiet pytest
+      - name: Build otacmd and run test_ota_cmd.py
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined -o otacmd otacmd_main.c ota_cmd.c \
+            $(pkg-config --cflags --libs libcjson)
+          python -m pytest -q test_ota_cmd.py
+
   # ── Firmware publishing ───────────────────────────────────────────────────────────────────
   # Until the CI roles exist (AWS_SANDBOX_ROLE_ARN / AWS_PROD_ROLE_ARN repo variables), the build
   # still runs, labelled with version.txt, and nothing is published.
@@ -256,7 +277,7 @@ jobs:
   ci-status:
     name: CI Status
     if: always()
-    needs: [changes, tokeniser, infra, firmware-version, firmware-build, firmware-sandbox, firmware-prod]
+    needs: [changes, tokeniser, otacmd, infra, firmware-version, firmware-build, firmware-sandbox, firmware-prod]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed
