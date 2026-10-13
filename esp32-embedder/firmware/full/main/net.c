@@ -13,21 +13,18 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
 
 #include "net.h"
 #include "wifi_secrets.h"
 
 #define GOT_IP BIT0
 static EventGroupHandle_t ev;
-static volatile int paused;                   // stopped on purpose: don't reconnect
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && (id == WIFI_EVENT_STA_START || id == WIFI_EVENT_STA_DISCONNECTED)) {
         xEventGroupClearBits(ev, GOT_IP);
-        if (!paused) esp_wifi_connect();
+        esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = data;
         printf("wifi: got " IPSTR "\n", IP2STR(&e->ip_info.ip));
@@ -44,7 +41,7 @@ void net_heap(const char *when)
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-static int net_up_here(int timeout_ms)
+int net_up(int timeout_ms)
 {
     int64_t t = esp_timer_get_time();
     esp_err_t e;
@@ -70,26 +67,6 @@ static int net_up_here(int timeout_ms)
     return 0;
 }
 
-// esp_wifi_init allocates the Wi-Fi interrupt on the core it runs on, whatever core the Wi-Fi
-// task is pinned to: run it on core 1, away from the core that also serves the SD card.
-typedef struct { int timeout_ms, ret; SemaphoreHandle_t done; } up_t;
-static void up_task(void *p)
-{
-    up_t *u = p;
-    u->ret = net_up_here(u->timeout_ms);
-    xSemaphoreGive(u->done);
-    vTaskDelete(NULL);
-}
-
-int net_up(int timeout_ms)
-{
-    up_t u = { timeout_ms, -1, xSemaphoreCreateBinary() };
-    if (xTaskCreatePinnedToCore(up_task, "net_up", 4096, &u, 5, NULL, 1) != pdPASS) { printf("wifi: no task\n"); return -1; }
-    xSemaphoreTake(u.done, portMAX_DELAY);
-    vSemaphoreDelete(u.done);
-    return u.ret;
-}
-
 int net_https_check(const char *url)
 {
     int64_t t = esp_timer_get_time();
@@ -104,16 +81,3 @@ int net_https_check(const char *url)
     return status;
 }
 
-void net_pause(void)
-{
-    xEventGroupClearBits(ev, GOT_IP);
-    paused = 1;
-    esp_wifi_stop();
-}
-
-int net_resume(int timeout_ms)
-{
-    paused = 0;
-    if (esp_wifi_start() != ESP_OK) return -1;
-    return (xEventGroupWaitBits(ev, GOT_IP, pdFALSE, pdTRUE, pdMS_TO_TICKS(timeout_ms)) & GOT_IP) ? 0 : -1;
-}

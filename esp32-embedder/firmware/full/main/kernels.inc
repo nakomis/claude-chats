@@ -7,8 +7,6 @@ static void spawn(TaskFunction_t f, const char *name, uint32_t stack, void *arg,
 }
 
 #include "f16.h"
-#include "esp_ipc_isr.h"
-#include "esp32s3/rom/cache.h"
 
 #define D      1024
 #define FF     4096
@@ -38,13 +36,7 @@ typedef struct {
 static int n_tok, K;
 
 static int8_t *xq;            // [tc][in], internal
-static float *xs, *xo, *hout; // PSRAM: per-token scale, [n][K] outlier inputs, [2][n][K] hidden outliers (per core)
-
-// Chip revisions up to v0.2 have erratum CACHE-126: if one core is waiting on a PSRAM cache line's
-// write-back while the other touches the same line, the cache can return wrong data or lose the
-// write. With both cores writing PSRAM, passes came out corrupted, differently each run (CHATS-4).
-// So within a phase the two cores never write the same 64-byte line: row and token splits sit on
-// line boundaries, and each core keeps its own hidden outliers (summed when they are read).
+static float *xs, *xo, *hout; // PSRAM: per-token scale, [n][K] outlier inputs, [n][K] hidden outliers
 
 // ---- persistent workers ------------------------------------------------------------
 // One task per core, fed through semaphores: creating and deleting tasks for every
@@ -73,29 +65,8 @@ static void workers_start(void)
 }
 
 // a on core 0, b on core 1; returns when both are done
-static int one_core, run_kind;                // EXPT: kinds in the one_core mask run a then b, both on core 1
-enum { K_MM = 1, K_Q = 2, K_ATT = 4 };
-static int wb_phase, last_kind;               // EXPT: write the data cache back when the phase changes
-static portMUX_TYPE wb_lock = portMUX_INITIALIZER_UNLOCKED;
 static void run2(work_fn f, void *a, void *b)
 {
-    if (wb_phase && run_kind != last_kind) {
-        portENTER_CRITICAL(&wb_lock);
-        esp_ipc_isr_stall_other_cpu();
-        Cache_WriteBack_All();
-        esp_ipc_isr_release_other_cpu();
-        portEXIT_CRITICAL(&wb_lock);
-    }
-    last_kind = run_kind;
-    if (one_core & run_kind) {
-        workers[1].fn = f; workers[1].arg = a;
-        xSemaphoreGive(workers[1].go);
-        xSemaphoreTake(workers[1].done, portMAX_DELAY);
-        workers[1].arg = b;
-        xSemaphoreGive(workers[1].go);
-        xSemaphoreTake(workers[1].done, portMAX_DELAY);
-        return;
-    }
     workers[1].fn = f; workers[1].arg = b;
     workers[0].fn = f; workers[0].arg = a;
     xSemaphoreGive(workers[1].go);
@@ -106,16 +77,10 @@ static void run2(work_fn f, void *a, void *b)
 
 typedef struct { const mat_t *m; int r0, r1, t0, tc; } job_t;
 
-#ifdef EXPT
-static int ck_stop;
-static void ck_mm(const mat_t *m, int t0, int tc, int r0, int r1, int rm);
-static void ck_q(const mat_t *m, int kind, const int8_t *dst, int tm);
-static void ck_att(const uint16_t *q);
-#endif
-
 // PIE only ever reads internal SRAM: each core copies a block of weight rows out of
 // PSRAM with ordinary loads first. (PIE loads from both cores at once through the
-// shared external-memory cache returned occasional garbage dots.)
+// shared external-memory cache returned occasional garbage dots; probably the same marginal core
+// voltage that vcore.c fixes, but internal SRAM is faster for PIE anyway.)
 #define WBUF (16 * 1024)
 static int8_t *wbuf[2];
 static int64_t cyc_cp[2], cyc_pie[2];
@@ -160,7 +125,7 @@ static void store_rows(const mat_t *m, int t, int rb0, int n, float *yb)
     } else {                                  // OUT_HBLK: n == HB rows, rb0 a multiple of HB
         for (int i = 0; i < K; i++) {
             int c = m->noi[i] - rb0;
-            if (c >= 0 && c < n) { hout[(size_t)xPortGetCoreID() * MAXTOK * K + t * K + i] = yb[c]; yb[c] = 0; }
+            if (c >= 0 && c < n) { hout[t * K + i] = yb[c]; yb[c] = 0; }
         }
         float mx = 0;
         for (int r = 0; r < n; r++) { float a = fabsf(yb[r]); mx = a > mx ? a : mx; }
@@ -216,17 +181,9 @@ static void matmul_r(const mat_t *m, const int8_t *x8, int r0, int r1)
     for (int t0 = 0; t0 < n_tok; t0 += chunk) {
         int tc = n_tok - t0 < chunk ? n_tok - t0 : chunk;
         memcpy(xq, x8 + (size_t)t0 * m->in, (size_t)tc * m->in);
-        // the split sits on a 64-byte line in every output: 64 rows (fp16, fp32), 256 for block int8
-        // (its fp32 scales are one per HB rows)
-        int g = m->mode == OUT_HBLK ? 256 : 64, rm = ((r0 + r1) / 2 + g / 2) / g * g;
-        rm = rm < r0 ? r0 : rm > r1 ? r1 : rm;
+        int rm = ((r0 + r1) / 2) / HB * HB;   // the split stays on an HB boundary
         job_t a = { m, r0, rm, t0, tc }, b = { m, rm, r1, t0, tc };
-        run_kind = K_MM;
         run2(mm_rows, &a, &b);
-#ifdef EXPT
-        ck_mm(m, t0, tc, r0, r1, rm);
-        if (ck_stop) return;
-#endif
     }
 }
 
@@ -254,7 +211,7 @@ static void quant_rows(void *arg)
             }
             s = mx > 0 ? mx / 127.0f : 1.0f; inv = 1.0f / s;
             for (int j = 0; j < in; j++) qb[j] = q8(h[j] * bs[j / HB] * inv);
-            for (int i = 0; i < K; i++) xo[t * K + i] = hout[t * K + i] + hout[(size_t)MAXTOK * K + t * K + i];
+            for (int i = 0; i < K; i++) xo[t * K + i] = hout[t * K + i];
         } else {
             if (q->kind == IN_F32) {
                 memcpy(row, (const float *)q->x + (size_t)t * in, in * sizeof(float));
@@ -282,14 +239,8 @@ static int64_t t_quant;
 static void quantise(const mat_t *m, int kind, const void *x, const float *hs, int8_t *dst)
 {
     int64_t t = esp_timer_get_time();
-    int tm = (n_tok / 2 + 8) / 16 * 16;           // 16 tokens: a whole line of xs
-    tm = tm > n_tok ? n_tok : tm;
-    qjob_t a = { m, kind, x, hs, dst, 0, tm }, b = { m, kind, x, hs, dst, tm, n_tok };
-    run_kind = K_Q;
+    qjob_t a = { m, kind, x, hs, dst, 0, n_tok / 2 }, b = { m, kind, x, hs, dst, n_tok / 2, n_tok };
     run2(quant_rows, &a, &b);
-#ifdef EXPT
-    ck_q(m, kind, dst, tm);
-#endif
     t_quant += esp_timer_get_time() - t;
 }
 
@@ -402,11 +353,7 @@ static float *att_scr[2];
 static void attention(uint16_t *q, const uint16_t *k, const uint16_t *v)
 {
     att_t a = { q, k, v, att_scr[0], 0, HEADS / 2 }, b = { q, k, v, att_scr[1], HEADS / 2, HEADS };
-    run_kind = K_ATT;
     run2(att_heads, &a, &b);
-#ifdef EXPT
-    ck_att(q);
-#endif
 }
 
 static double cosv(const float *a, const float *b, int n)
