@@ -3,6 +3,8 @@
 // (numpy emulation of the int8 scheme, and fp32 = Ollama). Throwaway spike code.
 // CHATS-3: the test texts are tokenised on the device (../../tok) and the ids checked
 // against mxtest.bin before each pass.
+// CHATS-10: Kata on Fleet. The self-test is also a new image's health check (ota.h), and an update
+// borrows the model's internal buffers between passes (model.h).
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,18 +14,23 @@
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_rom_crc.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
 #include "ff.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "mxcrc.h"
 #include "tok.h"
+#include "fleet.h"
+#include "model.h"
 #include "net.h"
+#include "ota.h"
 #include "vcore.h"
 #include "selftest.h"
 #include "longtest.h"
@@ -352,48 +359,88 @@ static int vocab_load(void)
 
 
 
-_Static_assert(N_SELFTEST == N_TEXTS + N_LONG, "selftest.h: one CRC per test text and long text");
-static int st_pass, st_fail, st_new, st_done[N_SELFTEST];
-// the bit-exact check of one output vector (the [CLS] row of x) against selftest.h
-static void selftest(int i)
+// ---- the model and an update take turns with internal RAM (model.h, CHATS-10) ----------------
+static SemaphoreHandle_t model_mx;           // held for a pass, or by an update for its whole length
+static volatile bool model_ready, model_lent, in_pass, checking;
+
+// The internal buffers an update borrows. xq first, while the 100 KB is most likely in one piece.
+static bool model_buffers(void)
 {
-    uint32_t c = esp_rom_crc32_le(0, (const uint8_t *)x, D * 4), want = i < N_SELFTEST ? SELFTEST_CRC[i] : 0;
-    if (i < N_SELFTEST) st_done[i] = 1;
-    if (!want) st_new++;
-    else if (c == want) st_pass++;
-    else st_fail++;
-    printf("  selftest %d: vector crc %08lx, %s\n", i, (unsigned long)c, !want ? "not recorded" : c == want ? "bit-exact" : "WRONG");
+    xq = heap_caps_aligned_alloc(16, XQ_MAX, MALLOC_CAP_INTERNAL);
+    wbuf[0] = heap_caps_aligned_alloc(16, WBUF, MALLOC_CAP_INTERNAL);
+    wbuf[1] = heap_caps_aligned_alloc(16, WBUF, MALLOC_CAP_INTERNAL);
+    att_scr[0] = (float *)xq;                 // xq is idle during attention: the blocked scratch, per core
+    att_scr[1] = xq ? (float *)(xq + ATT_SCR) : NULL;
+    return xq && wbuf[0] && wbuf[1];
 }
 
-void app_main(void)
-{
-    vcore_boost(1250);                       // 240 MHz needs >= 1.25 V on some chips: see vcore.c
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    printf("\n== HOME-432 step 3: whole mxbai on the S3, weights from SD ==\n");
-    const esp_app_desc_t *app = esp_app_get_description();   // version.txt, or CI's x.y.z (CHATS-10)
-    printf("%s %s, built %s %s with ESP-IDF %s\n", app->project_name, app->version, app->date, app->time, app->idf_ver);
-    printf("ROM crc32 check: %08lx (want cbf43926)\n", (unsigned long)esp_rom_crc32_le(0, (const uint8_t *)"123456789", 9));
+void model_pass_begin(void) { xSemaphoreTake(model_mx, portMAX_DELAY); in_pass = true; }
+void model_pass_end(void) { in_pass = false; xSemaphoreGive(model_mx); }
 
+bool model_lend(int timeout_ms)
+{
+    if (xSemaphoreTake(model_mx, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
+    // Every read a pass queued has completed by the time it ends, so the SD tasks are idle too.
+    heap_caps_free(xq); xq = NULL;
+    for (int i = 0; i < 2; i++) {
+        heap_caps_free(wbuf[i]); wbuf[i] = NULL;
+        heap_caps_free(abounce[i]); abounce[i] = NULL;
+    }
+    att_scr[0] = att_scr[1] = NULL;
+    model_lent = true;
+    return true;
+}
+
+void model_reclaim(void)
+{
+    if (model_ready) {
+        bool ok = model_buffers();
+        abounce[0] = in(ABOUNCE); abounce[1] = in(ABOUNCE);
+        if (!ok || !abounce[0] || !abounce[1]) {
+            net_heap("model: buffers not back");
+            printf("model: internal RAM too fragmented for the buffers after the update: restarting\n");
+            esp_restart();
+        }
+    }
+    model_lent = false;
+    xSemaphoreGive(model_mx);
+}
+
+const char *model_state(void)
+{
+    return model_lent ? "updating" : in_pass ? (checking ? "checking" : "embedding") : "idle";
+}
+
+static void run_pass(const int32_t *ids)
+{
+    model_pass_begin();
+    embed_in((const uint32_t *)ids);
+    pass_fwd();
+    model_pass_end();
+}
+
+// SD card, the model's tables and buffers, and the tasks; 0 when it's ready for passes.
+static FILE *ft;
+static int model_init(void)
+{
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     slot.width = 1; slot.clk = 39; slot.cmd = 38; slot.d0 = 40;
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
     esp_vfs_fat_sdmmc_mount_config_t mc = { .format_if_mount_failed = false, .max_files = 2 };
-    if (esp_vfs_fat_sdmmc_mount("/sd", &host, &slot, &mc, &card) != ESP_OK) { printf("SD mount failed\n"); return; }
-    FILE *ft = fopen("/sd/mxtest.bin", "rb");
-    if (!ft) { printf("open failed\n"); return; }
+    if (esp_vfs_fat_sdmmc_mount("/sd", &host, &slot, &mc, &card) != ESP_OK) { printf("SD mount failed\n"); return -1; }
+    ft = fopen("/sd/mxtest.bin", "rb");
+    if (!ft) { printf("open failed\n"); return -1; }
     abounce[0] = in(ABOUNCE); abounce[1] = in(ABOUNCE);
-    if (raw_open()) return;
+    if (raw_open()) return -1;
 
     hdr = ps(1024);
     ltab = ps(24 * sizeof *ltab);
     units = ps(MAXUNITS * sizeof *units);
-    uint32_t *want = ps(512 * 4);
-    int32_t *ids = ps(512 * 4);
-    if (!hdr || !ltab || !units || !want || !ids) { printf("alloc failed (tables)\n"); return; }
+    if (!hdr || !ltab || !units) { printf("alloc failed (tables)\n"); return -1; }
     sd_read(hdr, 0, 1024, 0);
-    if (memcmp(hdr, "MXB1", 4)) { printf("bad magic\n"); return; }
+    if (memcmp(hdr, "MXB1", 4)) { printf("bad magic\n"); return -1; }
     n_layer = hdr[2]; K = hdr[3]; n_vocab = hdr[4];
     memcpy(goff, hdr + 8, sizeof goff);
     memcpy(loff, hdr + 15, sizeof loff);
@@ -402,14 +449,12 @@ void app_main(void)
     printf("before buffers: internal free %u (largest %u), PSRAM free %u (largest %u)\n",
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    if (vocab_load()) return;                // first: its temporary copy leaves a hole the small buffers reuse
-    xq = heap_caps_aligned_alloc(16, XQ_MAX, MALLOC_CAP_INTERNAL);
-    wbuf[0] = heap_caps_aligned_alloc(16, WBUF, MALLOC_CAP_INTERNAL);
-    wbuf[1] = heap_caps_aligned_alloc(16, WBUF, MALLOC_CAP_INTERNAL);
+    if (vocab_load()) return -1;              // first: its temporary copy leaves a hole the small buffers reuse
+    model_buffers();
     x = ps((size_t)MAXTOK * D * sizeof(float)); arena = ps((size_t)MAXTOK * ARENA_TOK); xq1 = ps((size_t)MAXTOK * D);
     for (int i = 0; i < 2; i++) {
         stage[i] = ps(HALF); mws[i] = ps(FF * 4); mb[i] = ps(FF * 4); mwo[i] = ps(FF * 8 * 4); nrm[i] = ps(4 * D * 4);
-        if (!stage[i] || !mws[i] || !mb[i] || !mwo[i] || !nrm[i]) { printf("PSRAM alloc failed (pair %d)\n", i); return; }
+        if (!stage[i] || !mws[i] || !mb[i] || !mwo[i] || !nrm[i]) { printf("PSRAM alloc failed (pair %d)\n", i); return -1; }
     }
     xs = ps(MAXTOK * sizeof(float)); xo = ps(MAXTOK * K * sizeof(float)); hout = ps(MAXTOK * K * sizeof(float));
     tok_s = ps(n_vocab * 4); type0 = ps(D * 4); en_w = ps(D * 4); en_b = ps(D * 4); allo = ps(24 * sizeof *allo);
@@ -417,7 +462,7 @@ void app_main(void)
         !tok_s || !type0 || !en_w || !en_b || !allo || K > 8 || 2 * ATT_SCR > XQ_MAX) {
         printf("alloc failed: xq %p xs %p xo %p hout %p wbuf %p %p abounce %p %p x %p arena %p xq1 %p tok_s %p allo %p\n",
                xq, xs, xo, hout, wbuf[0], wbuf[1], abounce[0], abounce[1], x, arena, xq1, tok_s, allo);
-        return;
+        return -1;
     }
     printf("free: internal %u, PSRAM %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -425,8 +470,6 @@ void app_main(void)
     check("type0", 0, 3, sd_read(type0, goff[3], D * 4, 0), glob_crc[3]);
     check("en_w", 0, 4, sd_read(en_w, goff[4], D * 4, 0), glob_crc[4]);
     check("en_b", 0, 5, sd_read(en_b, goff[5], D * 4, 0), glob_crc[5]);
-    att_scr[0] = (float *)xq;                 // xq is idle during attention: the blocked scratch, per core
-    att_scr[1] = (float *)(xq + ATT_SCR);
     gelu_init();
     for (int li = 0; li < n_layer; li++) {
         sd_read(ltab[li], loff[li], sizeof *ltab, 0);
@@ -437,14 +480,71 @@ void app_main(void)
     workers_start();
     reader_start();
     printf("%d units per pass\n", n_units);
+    return 0;
+}
 
+// ---- the self-test, which is also a new image's health check (ota.h) --------------------------
+_Static_assert(N_SELFTEST == N_TEXTS + N_LONG, "selftest.h: one CRC per test text and long text");
+static int st_pass, st_fail, st_new, st_done[N_SELFTEST], tok_bad;
+static float st_min_cos = 2;                  // over the vectors with no CRC recorded
+// the bit-exact check of one output vector (the [CLS] row of x) against selftest.h; a vector with no
+// CRC recorded is judged by its cosine against Ollama instead (healthy())
+static void selftest(int i, float cos_ollama)
+{
+    uint32_t c = esp_rom_crc32_le(0, (const uint8_t *)x, D * 4), want = i < N_SELFTEST ? SELFTEST_CRC[i] : 0;
+    if (i < N_SELFTEST) st_done[i] = 1;
+    if (!want) st_new++;
+    else if (c == want) st_pass++;
+    else st_fail++;
+    if (!want && cos_ollama < st_min_cos) st_min_cos = cos_ollama;
+    printf("  selftest %d: vector crc %08lx, %s\n", i, (unsigned long)c, !want ? "not recorded" : c == want ? "bit-exact" : "WRONG");
+}
+
+typedef enum { ST_PASSED, ST_NOT_VERIFIED, ST_FAILED } verdict_t;
+// The self-test's verdict so far: FAILED if any vector is wrong, any test didn't run, or any CRC or
+// tokeniser check failed; NOT VERIFIED if some vector has no CRC recorded; else PASSED.
+static verdict_t verdict(bool loud)
+{
+    int skipped = 0;
+    for (int i = 0; i < N_SELFTEST; i++) skipped += !st_done[i];
+    verdict_t v = st_fail || skipped || crc_bad || tok_bad ? ST_FAILED : st_new ? ST_NOT_VERIFIED : ST_PASSED;
+    if (!loud) return v;
+    if (v == ST_FAILED)
+        printf("\n!!! SELF-TEST FAILED: %d vectors wrong, %d tests not run, %d CRC and %d tokeniser mismatches. "
+               "Don't use this board's results. !!!\n\n", st_fail, skipped, crc_bad, tok_bad);
+    else if (v == ST_NOT_VERIFIED)
+        printf("\n!!! SELF-TEST NOT VERIFIED: %d vectors have no recorded CRC (selftest.h; host/selftest_crcs.py). !!!\n\n", st_new);
+    else printf("self-test PASSED: %d vectors bit-exact\n", st_pass);
+    return v;
+}
+
+// A new image's health check (ota.h): the self-test PASSED. selftest.h has every CRC recorded, so
+// that's the rule. The fallback is for a build whose arithmetic changed and whose CRCs were zeroed
+// until re-recorded: NOT VERIFIED counts as healthy only if every unrecorded vector is within
+// HEALTH_MIN_COS of Ollama (healthy boards give 0.99937-0.99978).
+static bool healthy(void)
+{
+    verdict_t v = verdict(true);
+    bool ok = v == ST_PASSED || (v == ST_NOT_VERIFIED && st_min_cos >= HEALTH_MIN_COS);
+#ifdef CONFIG_KATA_OTA_FAIL_SELFTEST
+    printf("health: TEST BUILD (CONFIG_KATA_OTA_FAIL_SELFTEST): reporting the self-test as failed\n");
+    ok = false;
+#endif
+    fleet_set_selftest(!ok ? "failed" : v == ST_PASSED ? "bit-exact" : "cos");
+    printf("health: %s\n", ok ? "good" : "BAD");
+    return ok;
+}
+
+static float *ref0;                           // test 0's Ollama vector, for the Wi-Fi passes at the end
+static int32_t *ids;
+static void selftest_run(void)
+{
+    uint32_t *want = ps(512 * 4);
+    ref0 = ps(D * 4);
+    if (ref0) memset(ref0, 0, D * 4);         // test 0 may not run: then the Wi-Fi passes' cos is 0, not garbage
     uint32_t th[3];
-    fread(th, 4, 3, ft);
-    if (memcmp(th, "MXT1", 4)) { printf("bad test magic\n"); return; }
-    int tok_bad = 0;
-    float *ref0 = ps(D * 4);                  // test 0's Ollama vector, for the Wi-Fi check at the end
-    if (!ref0) { printf("alloc failed: ref0\n"); return; }
-    memset(ref0, 0, D * 4);
+    if (!want || !ref0 || fread(th, 4, 3, ft) != 3 || memcmp(th, "MXT1", 4)) { printf("bad test magic\n"); return; }
+    checking = true;
     for (int ti = 0; ti < (int)th[1]; ti++) {
         uint32_t n;
         fread(&n, 4, 1, ft);
@@ -470,6 +570,7 @@ void app_main(void)
         }
         if (!same) { heap_caps_free(emu); heap_caps_free(ref); continue; }   // emu and ref belong to mxtest.bin's ids
         if (n > MAXTOK) { printf("test %d: %lu tokens > %d, skipped\n", ti, (unsigned long)n, MAXTOK); heap_caps_free(emu); heap_caps_free(ref); continue; }
+        model_pass_begin();
         n_tok = n;
         t_sd = t_att = t_quant = t_stall = 0;
         cyc_cp[0] = cyc_cp[1] = cyc_pie[0] = cyc_pie[1] = 0;
@@ -480,11 +581,13 @@ void app_main(void)
         printf("  embeddings in %.2f s; pass %.1f s, of which %.1f s waiting on the card\n", (te - t0) / 1e6,
                (esp_timer_get_time() - te) / 1e6, t_stall / 1e6);
         int64_t total = esp_timer_get_time() - t0;
+        float c = cosv(x, ref, D);
         printf("test %d: %3d tokens  cos vs emulation %.6f  vs Ollama %.6f  |  %.1f s total: sync SD %.1f s, "
                "stalled %.1f s (attention %.1f, quantise %.1f)%s\n",
-               ti, n_tok, cosv(x, emu, D), cosv(x, ref, D), total / 1e6, t_sd / 1e6, t_stall / 1e6,
+               ti, n_tok, cosv(x, emu, D), c, total / 1e6, t_sd / 1e6, t_stall / 1e6,
                t_att / 1e6, t_quant / 1e6, crc_bad ? "  CRC ERRORS" : "");
-        selftest(ti);
+        selftest(ti, c);
+        model_pass_end();
         if (ti == 0) memcpy(ref0, ref, D * 4);
         heap_caps_free(emu); heap_caps_free(ref);
     }
@@ -492,44 +595,81 @@ void app_main(void)
     for (int li = 0; li < N_LONG; li++) {
         int nt = tok_encode(&vocab, LONG[li].text, strlen(LONG[li].text), ids, MAXTOK, NULL);
         if (nt < 1 || nt != LONG[li].n_tok) { printf("long %d: %d tokens, host says %d\n", li, nt, LONG[li].n_tok); tok_bad++; continue; }
+        model_pass_begin();
         n_tok = nt;
         t_sd = t_att = t_quant = t_stall = 0;
         int64_t t0 = esp_timer_get_time();
         embed_in((const uint32_t *)ids);
         pass_fwd();
+        float c = cosv(x, LONG[li].ref, D);
         printf("long %d: %3d tokens  cos vs emulation %.6f  vs Ollama %.6f  |  %.1f s total, stalled %.1f s "
-               "(attention %.1f, quantise %.1f)%s\n", li, n_tok, cosv(x, LONG[li].emu, D), cosv(x, LONG[li].ref, D),
+               "(attention %.1f, quantise %.1f)%s\n", li, n_tok, cosv(x, LONG[li].emu, D), c,
                (esp_timer_get_time() - t0) / 1e6, t_stall / 1e6, t_att / 1e6, t_quant / 1e6, crc_bad ? "  CRC ERRORS" : "");
-        selftest(5 + li);
+        selftest(5 + li, c);
+        model_pass_end();
         net_heap("after long pass");
     }
+    checking = false;
+}
 
-    // CHATS-4: Wi-Fi and TLS next to the model, then test 0 three times with the radio up and an HTTPS
-    // request between passes: the network and a pass share internal RAM and both cores.
+void app_main(void)
+{
+    vcore_boost(1250);                       // 240 MHz needs >= 1.25 V on some chips: see vcore.c
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    printf("\n== HOME-432 step 3: whole mxbai on the S3, weights from SD ==\n");
+    const esp_app_desc_t *app = esp_app_get_description();   // version.txt, or CI's x.y.z (CHATS-10)
+    printf("%s %s, built %s %s with ESP-IDF %s\n", app->project_name, app->version, app->date, app->time, app->idf_ver);
+    printf("ROM crc32 check: %08lx (want cbf43926)\n", (unsigned long)esp_rom_crc32_le(0, (const uint8_t *)"123456789", 9));
+
+    // CHATS-10: the default nvs partition records an update (ota.c); prov is the board's own.
+    esp_err_t e = nvs_flash_init();
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        e = nvs_flash_init();
+    }
+    if (e != ESP_OK) printf("nvs: %s (an update can't report its outcome)\n", esp_err_to_name(e));
+    bool probation = ota_boot();
+    model_mx = xSemaphoreCreateMutex();
+
+    // The model first: its 100 KB tile needs internal RAM in one piece, before Wi-Fi breaks it up.
+    model_ready = model_init() == 0;
+    ids = ps(512 * 4);
+    if (!model_ready || !ids) printf("model not loaded: no self-test, no embedding (Fleet can still update this board)\n");
+
+    // CHATS-10: then the network and Fleet, so the board shows up (and can be updated) while the
+    // self-test runs. CHATS-4: what Wi-Fi and MQTT's TLS cost in internal RAM next to the model.
+    static prov_t prov;                      // static: fleet.c and the Wi-Fi driver keep pointers into it
     net_heap("before wifi");
-    if (net_up(20000) == 0) {
+    bool online = prov_load(&prov) && net_up(&prov, 20000) == 0;
+    if (online) {
         net_heap("wifi up");
+        fleet_start(&prov);                   // connects in the background; net_heap("mqtt connected")
+    }
+
+    // The self-test, and on probation the health check: a bad new image rolls back here.
+    if (model_ready && ids) selftest_run();
+    ota_health(model_ready && ids && healthy());
+    printf("== self-test done (%d CRC mismatches, %d tokeniser mismatches)%s ==\n", crc_bad, tok_bad,
+           probation ? ", new image" : "");
+
+    // CHATS-4: an HTTPS request next to the model, then test 0 three times with the radio (and now
+    // MQTT) up and an HTTPS request between passes: the network and a pass share internal RAM and
+    // both cores. An update may take the model meanwhile (run_pass waits for it).
+    if (online && model_ready && ids && ref0) {
         net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         net_heap("after https");
         for (int r = 0; r < 3; r++) {             // with Wi-Fi up, a corrupted pass shows as cos well below 0.999
             n_tok = tok_encode(&vocab, TEXTS[0], strlen(TEXTS[0]), ids, MAXTOK, NULL);
             if (n_tok < 1) { printf("wifi up, pass %d: tokeniser failed\n", r); tok_bad++; break; }
-            embed_in((const uint32_t *)ids);
-            pass_fwd();
-            printf("wifi up, pass %d: test 0 cos vs Ollama %.6f\n", r, cosv(x, ref0, D));
-            selftest(0);                          // the conditions the corruption was found under
+            run_pass(ids);
+            float c = cosv(x, ref0, D);
+            printf("wifi up, pass %d: test 0 cos vs Ollama %.6f\n", r, c);
+            selftest(0, c);                       // the conditions the corruption was found under
             net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         }
-        net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         net_heap("end");
     }
-    int st_skipped = 0;
-    for (int i = 0; i < N_SELFTEST; i++) st_skipped += !st_done[i];
-    if (st_fail || st_skipped || crc_bad || tok_bad)
-        printf("\n!!! SELF-TEST FAILED: %d vectors wrong, %d tests not run, %d CRC and %d tokeniser mismatches. "
-               "Don't use this board's results. !!!\n\n", st_fail, st_skipped, crc_bad, tok_bad);
-    else if (st_new)
-        printf("\n!!! SELF-TEST NOT VERIFIED: %d vectors have no recorded CRC (selftest.h; host/selftest_crcs.py). !!!\n\n", st_new);
-    else printf("self-test PASSED: %d vectors bit-exact\n", st_pass);
-    printf("== done (%d CRC mismatches, %d tokeniser mismatches) ==\n", crc_bad, tok_bad);
+    if (model_ready && ids) verdict(true);   // again, with the Wi-Fi passes counted
+    printf("== done (%d CRC mismatches, %d tokeniser mismatches): idle; Fleet can update this board ==\n", crc_bad, tok_bad);
+    // Returning ends the main task and frees its 16 KB stack; MQTT, the heartbeat and updates carry on.
 }

@@ -107,12 +107,13 @@ In numpy (`host/lean.py`) the leaner layout costs nothing measurable against the
 | `host/selftest_crcs.py` | Reads a board's log and writes the known-good vector CRCs into `firmware/full/main/selftest.h` |
 | `host/serial_log.py` | Logs the board's serial output to a file without resetting it |
 | `host/corpus.py` | Samples real messages from local Claude Code transcripts for tokeniser testing (stays local) |
-| `firmware/full/` | Kata's firmware: the whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin`. `build.sh`, `sign.sh` and `flash.sh` build, sign and flash it; `tools/` is for CI |
+| `firmware/full/` | Kata's firmware: the whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin`; joins Fleet over MQTT and takes updates from it. `build.sh`, `sign.sh` and `flash.sh` build, sign and flash it; `tools/` is for CI |
 | `firmware/layer0/` | One layer from a flash partition, plus the self-tests that found the PIE bug, an SD speed test and a GPIO pull-up probe |
 | `firmware/bench/` | int8 matmul benchmark for the S3 (esp-nn) |
 | `firmware/wroom-bench/` | int8 dot-product benchmark for the original ESP32 |
 | `tok/test_tok.c` | The tokeniser on a tiny made-up vocab: what CI can check without the real one |
-| `infra/` | CDK (pnpm): the GitHub Actions roles that publish the firmware, plus `scripts/provision.sh` and `scripts/ota-signing-key.sh` |
+| `otacmd/` | Fleet's command parser, copied from tinycrypt with its host tests (`test_ota_cmd.py`) |
+| `infra/` | CDK (pnpm): the boards as IoT Things, and the GitHub Actions roles that publish the firmware, plus `scripts/provision.sh` and `scripts/ota-signing-key.sh` |
 
 ## Running it
 
@@ -136,21 +137,29 @@ To test the tokeniser on the Mac, start a private `llama-server` on Ollama's GGU
 
 The SD pins are those of the ESP32-S3 CAM board's onboard slot (1-bit: CLK 39, CMD 38, D0 40). For a 4-bit breakout, see CHATS-6.
 
+### Identity
+
+Each board is an AWS IoT Thing, `kata-{env}-{board}`: `blue`, `green` and `red` in sandbox, none in prod yet. The list is `infra/boards.json`, and every deploy declares all of them, so a board left out has its Thing deleted (and the deploy fails while its certificate is still attached). `ClaudeChatsKataDeviceStack` makes the Things, with the attributes Fleet reads (`project=kata`, `deviceType=embedder`, `capabilities=ota,ota-signed`), and one IoT policy for all of them. Through policy variables, a board may connect only as its own Thing, and only use its own topics: it subscribes to `kata/{thing}/commands` and publishes to `kata/{thing}/responses` and `kata/{thing}/status`. There's no `ota-approval`: nobody is there to approve an update, so the board's own checks decide.
+
+The stack also has what CHATS-5 will need to reach the embedding queue with the same certificate: a role that the IoT credentials provider assumes (`kata-worker-{env}`), the role alias `kata-{env}`, and `iot:AssumeRoleWithCertificate` on it in the board policy. Until the queue exists, the role can do nothing. Deploying with `--parameters ClaudeChatsKataDeviceStack:EmbeddingQueueArn=<arn>` gives it receive, delete and change-visibility on that queue, and nothing else.
+
 ### Provisioning
 
-Nothing secret is in the build: every board runs the same image, so CI can publish it. What's particular to a board lives in its own `prov` partition (NVS, namespace `kata`), which the firmware reads at boot. Today that's the house Wi-Fi; device identity (the IoT endpoint, Thing name, certificate and key) joins it later. The boards are `blue`, `green` and `red`, and each will be the Thing `kata-{env}-{board}`.
+Nothing secret is in the build: every board runs the same image, so CI can publish it. What's particular to a board lives in its own `prov` partition (NVS, namespace `kata`), which the firmware reads at boot: the house Wi-Fi, the IoT endpoint, the Thing name, and the board's certificate and private key. Also the credentials-provider endpoint and role alias, which nothing reads until CHATS-5.
 
 ```bash
-infra/scripts/provision.sh blue          # NPM_ENVIRONMENT=prod for a prod board
+infra/scripts/provision.sh blue          # NPM_ENVIRONMENT=prod for a prod board; --new for a fresh certificate
 ```
 
-This reads the Wi-Fi SSID and password from SSM (`/Nakomis/Wifi/*`, in the sandbox account), builds `firmware/full/certs/kata-sandbox-blue/prov.bin` with ESP-IDF's NVS partition generator, and shreds the CSV it went through. `certs/` is gitignored. `prov.bin` holds the Wi-Fi password in plain text, and so will the board's flash.
+This is tinycrypt's `provision-key.sh`, and it's safe to re-run. It checks the Thing exists, makes a certificate the first time (`aws iot create-keys-and-certificate`), and attaches it to the Thing and the board policy. `--new` retires the old certificates first: use it if a board's key may have leaked. It reads the Wi-Fi SSID and password from SSM (`/Nakomis/Wifi/*`, in the sandbox account), builds `firmware/full/certs/kata-sandbox-blue/prov.bin` with ESP-IDF's NVS partition generator, and shreds the CSV it went through. The certificate and key are kept beside it, so a re-run reuses them. `certs/` is gitignored.
 
-A board that isn't provisioned still runs the model and its self-tests; it just says `prov: not provisioned` and skips Wi-Fi.
+**It's insecure.** The private key is made on the Mac and flashed in plain text, and so is the Wi-Fi password: anyone holding the board can read both. The private key never passes through CloudFormation, though, and a board's certificate can be revoked on its own.
+
+A board that isn't provisioned still runs the model and its self-tests; it just says `prov: not provisioned` and skips Wi-Fi. A board provisioned before identity existed gets Wi-Fi but not Fleet, and says so.
 
 ### Flashing
 
-Images are signed (RSA-3072, the secure boot v2 scheme), USB builds included: once Fleet can update the boards, each one will only take an update signed by the key that signed the image it's running. So build and flash with the scripts, not `idf.py flash`, which would write the unsigned image:
+Images are signed (RSA-3072, the secure boot v2 scheme), USB builds included: each board only takes an update from Fleet if it's signed by the key that signed the image it's running. So build and flash with the scripts, not `idf.py flash`, which would write the unsigned image:
 
 ```bash
 cd firmware/full
@@ -162,6 +171,44 @@ cd firmware/full
 
 The partition table is tinycrypt's, with the room 16 MB allows: `nvs`, `phy_init`, `otadata`, `prov`, two 4 MB OTA app slots (the app is about 1.1 MB) and a core dump. Rollback is on. A board still on the old single-app layout needs this full flash once.
 
+### Fleet
+
+Once it's provisioned, Kata is a device in Fleet (`nakomis-fleet`): it shows up there with its version and a status heartbeat, and its firmware is updated from there, not over USB. USB is for the first flash and for provisioning.
+
+**MQTT** (`main/fleet.c`, tinycrypt's `notifier.c`): TLS to IoT Core on port 8883, with Amazon Root CA 1 (`AmazonRootCA1.pem`, public) and the board's own certificate. On every connect, Kata sends `{"type":"version","version":…,"project":"kata"}`. Every minute it publishes a heartbeat on `kata/{thing}/status`, which keeps it live in Fleet. The heartbeat carries the state (`checking` during the self-test, `embedding`, `updating` or `idle`), the self-test's verdict, and the free internal RAM, its low-water mark and the free PSRAM.
+
+**Commands** are Fleet's ESP32 protocol, which mustn't change. Kata uses tinycrypt's parser (`otacmd/ota_cmd.c`, copied with its host tests) and answers `get_version`, `ping`, `ota_update`, `url_chunk` and `ota_cancel`. Anything else is refused: Kata takes no reboot, wipe or settings from the cloud.
+
+**An update** (`main/ota.c`, tinycrypt's `ota.c` without the approval step):
+1. Kata waits for the pass in progress to end (up to 7 minutes, as Fleet's presigned URL lasts 10).
+2. It downloads the image over HTTPS into the spare slot, hashing it as it goes, and reports `ota_progress` every 10%.
+3. It refuses the image unless the SHA-256 is the one Fleet sent, the signature is by the key that signed the running image, the image says it's `kata` at that version, and that version is newer than the one running.
+4. It switches slots and restarts.
+
+A failure is reported as `ota_error` with the reason, and Kata backs off before taking another update (30 s, doubling to 15 minutes). The same URL delivered twice is ignored, as IoT Core's redeliveries are.
+
+**Memory** (CHATS-4) is why an update waits. Between passes, the model holds about 164 KB of internal SRAM: the 100 KB input tile, two 16 KB weight-row buffers and two 16 KB SD bounce buffers. Wi-Fi and MQTT's TLS session fit beside them. A second TLS session for the download, plus the flash writes, wouldn't leave a safe margin. So the update borrows those buffers (`main/model.h`): it frees them once the pass ends, downloads, and either restarts or allocates them again. If internal RAM is too fragmented by then for the 100 KB tile, Kata restarts, which loses nothing. The model is loaded before Wi-Fi starts, so the tile still finds 100 KB in one piece. mbedTLS works in PSRAM.
+
+Here's where internal RAM should land. The image itself costs ~6 KB more static RAM than before Fleet (DIRAM 98.2 → 104.6 KB). The rest are estimates from CHATS-4's measurements, still to be confirmed on a board with `net_heap` and the heartbeat:
+
+| When | Internal free (expected) |
+|---|---|
+| model loaded | ~88 KB |
+| Wi-Fi up | ~48 KB |
+| MQTT connected (task stack 6 KB, buffers 2.5 KB, the TLS and socket structures) | ~34 KB |
+| lowest, an HTTPS request with MQTT up | ~16 KB |
+| lowest during an update, with the buffers lent (less the 8 KB update task, the download's TLS and buffers) | ~175 KB |
+
+**Rollback.** A new image starts on probation (`ESP_OTA_IMG_PENDING_VERIFY`). It's kept only when both of these hold, within 30 minutes of boot:
+- **It's healthy.** The self-test is the health check, and it must say PASSED: all seven tests run, every vector bit for bit what `selftest.h` records, and no CRC or tokeniser mismatches. There's one fallback, for a build whose arithmetic changed and whose CRCs were zeroed until they're recorded again. That build's verdict is NOT VERIFIED, and it counts as healthy only if every unrecorded vector is within cos 0.999 of Ollama. A healthy board gives 0.99937–0.99978.
+- **It has subscribed to its commands on IoT Core.** Otherwise it couldn't be updated again.
+
+A failed self-test rolls back at once. A crash, or the deadline passing, rolls back too. The old image then reports `ota_error {message: "rolled back"}`, and a kept image reports `ota_complete`. The self-test takes about 15 minutes at 240 MHz, but the board is on MQTT within seconds of booting. Fleet sees the new version straight away, and a rollback afterwards still shows as one. Updates sent while an image is on probation are refused.
+
+To check rollback, build with `CONFIG_KATA_OTA_FAIL_SELFTEST` (menuconfig, "Kata"): the image passes everything, then reports its self-test as failed. CI's image checks refuse to publish such a build, so it's published by hand to sandbox only, and never promoted.
+
+**Not covered:** the 345 MB `mxbai.bin` on the SD card. A new model still means swapping the card.
+
 ### Versioning
 
 `firmware/full/version.txt` (`x.y.z`, starting at 0.1.0) labels local builds; ESP-IDF puts it in the app descriptor, and the firmware prints it at boot. It's only a seed. In CI the version comes from the shared deployment tracker (project `kata`): one patch past sandbox's latest, or a minor or major bump with `--bump-minor` or `--bump-major` alone on a line in the PR description. A version already in the bucket is never reused; CI steps past it.
@@ -171,7 +218,8 @@ The partition table is tinycrypt's, with the room 16 MB allows: `nvs`, `phy_init
 `.github/workflows/esp32-embedder.yml` runs on every PR and push to main, and does its work only when something under `esp32-embedder/` changed:
 
 - the tokeniser's host test (`tok/test_tok.c`, under ASan and UBSan)
-- the firmware, built in `espressif/idf:v5.4.4`, with the image checks from `tools/image-checks.sh`: the right version, rollback and signed updates on, and no per-board strings (no `kata-{env}-` name, no IoT endpoint, and in sandbox, not the Wi-Fi SSID)
+- Fleet's command parser: tinycrypt's tests against the copy in `otacmd/` (with cJSON, under ASan and UBSan)
+- the firmware, built in `espressif/idf:v5.4.4`, with the image checks from `tools/image-checks.sh`: the right version, rollback and signed updates on, no rollback test build, and no per-board strings (no `kata-{env}-` name, no IoT endpoint, and in sandbox, not the Wi-Fi SSID)
 - the CDK type-checked and synthesised for both environments
 - `CI Status`, the one check to require
 
@@ -179,8 +227,9 @@ On a PR, the build is signed with the sandbox key and published to `s3://nakomis
 
 ```bash
 cd infra && pnpm install
-pnpm run deploy-sandbox                                   # the CI role
+pnpm run deploy-sandbox                                   # the CI role, and the boards' Things and policy
 NPM_ENVIRONMENT=sandbox scripts/ota-signing-key.sh        # then commit firmware/full/ota-signing/sandbox.pub.pem
+scripts/provision.sh blue                                 # for each board: its certificate and prov.bin, then flash.sh
 ```
 
 \* As an Amazon Associate I earn from qualifying purchases.
