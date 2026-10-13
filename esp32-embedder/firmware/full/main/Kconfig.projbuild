@@ -1,0 +1,12 @@
+menu "Kata"
+
+config KATA_OTA_FAIL_SELFTEST
+    bool "TEST ONLY: fail the health check, to check rollback"
+    default n
+    help
+        An image built with this reports its self-test as failed, so after an update through Fleet
+        the bootloader goes back to the previous image, which reports "rolled back". The self-test
+        itself still runs, so the log shows the real result too. Never publish one for real use, and
+        never promote one to prod. CI never sets it (sdkconfig.defaults).
+
+endmenu

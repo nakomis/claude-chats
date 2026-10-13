@@ -17,6 +17,11 @@ check_image_config() { # sdkconfig.h
     for option in CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT; do
         grep -q "^#define ${option} 1$" "$1" || { echo "the build lacks ${option}: not publishing" >&2; exit 1; }
     done
+    # A rollback test build (CHATS-10) fails its health check on purpose: never from CI.
+    if grep -q "^#define CONFIG_KATA_OTA_FAIL_SELFTEST 1$" "$1"; then
+        echo "the build fails its health check on purpose (CONFIG_KATA_OTA_FAIL_SELFTEST): not publishing" >&2
+        exit 1
+    fi
 }
 
 # No secrets or per-board settings (they live in the prov partition, infra/scripts/provision.sh): no
