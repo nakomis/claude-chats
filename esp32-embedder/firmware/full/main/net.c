@@ -1,6 +1,6 @@
 // CHATS-4: Wi-Fi station plus one HTTPS request, to measure what the network stack costs
-// in internal SRAM next to the model. Credentials come from wifi_secrets.h (gitignored,
-// written by host/gen_wifi_secrets.sh from SSM).
+// in internal SRAM next to the model. Credentials come from the prov partition (prov.c, CHATS-10),
+// never the build.
 #include <stdio.h>
 #include <string.h>
 
@@ -15,7 +15,7 @@
 #include "freertos/event_groups.h"
 
 #include "net.h"
-#include "wifi_secrets.h"
+#include "prov.h"
 
 #define GOT_IP BIT0
 static EventGroupHandle_t ev;
@@ -45,6 +45,8 @@ int net_up(int timeout_ms)
 {
     int64_t t = esp_timer_get_time();
     esp_err_t e;
+    static prov_t prov;                       // static: off the main task's stack, and kept for reconnects
+    if (!prov_load(&prov)) return -1;
     ev = xEventGroupCreate();
     if (esp_netif_init() != ESP_OK || esp_event_loop_create_default() != ESP_OK) { printf("wifi: netif init failed\n"); return -1; }
     esp_netif_create_default_wifi_sta();
@@ -54,8 +56,8 @@ int net_up(int timeout_ms)
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_event, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_event, NULL);
     wifi_config_t wc = { 0 };
-    strncpy((char *)wc.sta.ssid, WIFI_SSID, sizeof wc.sta.ssid);
-    strncpy((char *)wc.sta.password, WIFI_PASS, sizeof wc.sta.password);
+    memcpy(wc.sta.ssid, prov.wifi_ssid, sizeof wc.sta.ssid);           // 32 + NUL, 64 + NUL: both fit
+    memcpy(wc.sta.password, prov.wifi_password, sizeof wc.sta.password);
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wc);
     if ((e = esp_wifi_start()) != ESP_OK) { printf("wifi: start failed: %s\n", esp_err_to_name(e)); return -1; }

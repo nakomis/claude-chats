@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_rom_crc.h"
@@ -369,6 +370,8 @@ void app_main(void)
     vcore_boost(1250);                       // 240 MHz needs >= 1.25 V on some chips: see vcore.c
     vTaskDelay(pdMS_TO_TICKS(1500));
     printf("\n== HOME-432 step 3: whole mxbai on the S3, weights from SD ==\n");
+    const esp_app_desc_t *app = esp_app_get_description();   // version.txt, or CI's x.y.z (CHATS-10)
+    printf("%s %s, built %s %s with ESP-IDF %s\n", app->project_name, app->version, app->date, app->time, app->idf_ver);
     printf("ROM crc32 check: %08lx (want cbf43926)\n", (unsigned long)esp_rom_crc32_le(0, (const uint8_t *)"123456789", 9));
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();

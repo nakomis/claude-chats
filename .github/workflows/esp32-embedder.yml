@@ -1,0 +1,269 @@
+name: esp32-embedder
+
+# Kata, the ESP32-S3 embedder (esp32-embedder/, CHATS-10): tinycrypt's CI, for this repository.
+# A PR that touches esp32-embedder/ computes the next firmware version once, builds it once
+# (unsigned), signs that with the sandbox key and publishes it to sandbox. Its merge: the same
+# unsigned build, signed with the prod key, to prod. Fleet then offers it.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A PR's firmware is published to sandbox; a newer push to the same PR supersedes it. Main's runs
+# (which publish to prod) are never cancelled.
+concurrency:
+  group: esp32-embedder-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: eu-west-2
+  ESPTOOL_VERSION: "4.11.0"         # ESP-IDF v5.4.4's
+
+jobs:
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      embedder: ${{ steps.filter.outputs.embedder }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            embedder:
+              - 'esp32-embedder/**'
+              - '.github/workflows/esp32-embedder.yml'
+
+  tokeniser:
+    name: Tokeniser (host)
+    needs: changes
+    if: needs.changes.outputs.embedder == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: esp32-embedder/tok
+    steps:
+      - uses: actions/checkout@v4
+      # host/test_tok.py (id for id against llama-server) needs Ollama's GGUF; this needs nothing.
+      - name: Build and run test_tok.c
+        run: |
+          cc -std=c99 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined -o test_tok test_tok.c tok.c
+          ./test_tok
+
+  # ── Firmware publishing ───────────────────────────────────────────────────────────────────
+  # Until the CI roles exist (AWS_SANDBOX_ROLE_ARN / AWS_PROD_ROLE_ARN repo variables), the build
+  # still runs, labelled with version.txt, and nothing is published.
+  firmware-version:
+    name: Firmware version
+    needs: changes
+    if: >-
+      github.event_name == 'pull_request' && needs.changes.outputs.embedder == 'true'
+      && vars.AWS_SANDBOX_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      version: ${{ steps.free.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_SANDBOX_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      # The tracker's sandbox latest is the high-water mark; version.txt only seeds it (and labels
+      # local builds).
+      - name: Seed from version.txt
+        run: |
+          printf '{"version": "%s"}\n' "$(tr -d '[:space:]' < esp32-embedder/firmware/full/version.txt)" > version.json
+      - name: Compute version
+        id: compute
+        uses: nakomis/nakomis-infra/.github/actions/compute-version@main
+        env:
+          # The bump keyword (alone on a line) is read from the PR, not the synthetic merge commit.
+          COMMIT_MESSAGE: |
+            ${{ github.event.pull_request.title }}
+            ${{ github.event.pull_request.body }}
+        with:
+          project: kata
+          environment: sandbox
+          version-file: version.json
+      # A version already in the bucket (published by hand, or a run that failed before recording
+      # it) is never reused: step past it.
+      - name: Skip versions already published
+        id: free
+        env:
+          VERSION: ${{ steps.compute.outputs.version }}
+        run: |
+          v=$VERSION
+          while aws s3api head-object --bucket nakomis-firmware-sandbox --key "kata/$v/firmware.bin" > /dev/null 2>&1; do
+            IFS=. read -r a b c <<< "$v"; v="$a.$b.$((c + 1))"
+          done
+          [ "$v" = "$VERSION" ] || echo "::notice::$VERSION is already published; using $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  # Every change is built and checked; only a PR's build with a computed version is published.
+  firmware-build:
+    name: Firmware build
+    needs: [changes, firmware-version]
+    if: >-
+      !cancelled() && needs.changes.outputs.embedder == 'true'
+      && needs.firmware-version.result != 'failure'
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.4.4   # what the boards are built with by hand (vcore.c uses IDF internals)
+    defaults:
+      run:
+        shell: bash
+        working-directory: esp32-embedder/firmware/full
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (unsigned) and check the image
+        env:
+          VERSION: ${{ needs.firmware-version.outputs.version }}
+        run: |
+          git config --global --add safe.directory '*'
+          . "$IDF_PATH/export.sh"
+          if [ -n "$VERSION" ]; then echo "$VERSION" > version.txt; else VERSION=$(tr -d '[:space:]' < version.txt); fi
+          idf.py build
+          . tools/image-checks.sh
+          check_image_version build/kata.bin "$VERSION"
+          check_image_config build/config/sdkconfig.h
+          check_image_strings build/kata.bin sandbox
+          check_image_strings build/kata.bin prod
+          out="$GITHUB_WORKSPACE/firmware"
+          mkdir -p "$out"
+          cp build/kata.bin "$out/kata-unsigned.bin"
+          printf '{\n  "version": "%s"\n}\n' "$VERSION" > "$out/version.json"
+          # What main must hold for the merge to publish these bytes (see firmware-prod).
+          git rev-parse 'HEAD^{tree}' > "$out/tree"
+      - if: needs.firmware-version.result == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: firmware/
+          if-no-files-found: error
+
+  firmware-sandbox:
+    name: Firmware publish (sandbox)
+    needs: [firmware-version, firmware-build]
+    if: needs.firmware-version.result == 'success' && needs.firmware-build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: firmware
+      - run: pip install --quiet "esptool==${ESPTOOL_VERSION}"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_SANDBOX_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Sign and publish
+        env:
+          VERSION: ${{ needs.firmware-version.outputs.version }}
+        run: esp32-embedder/firmware/full/tools/ci-publish.sh sandbox firmware/kata-unsigned.bin "$VERSION"
+      - name: Record deployment
+        uses: nakomis/nakomis-infra/.github/actions/record-deployment@main
+        with:
+          project: kata
+          environment: sandbox
+          version-file: firmware/version.json
+
+  firmware-prod:
+    name: Firmware publish (prod)
+    if: github.event_name == 'push' && vars.AWS_PROD_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      # The merged PR's last successful run of this workflow built (and sandbox published) these
+      # bytes, from the same tree main now holds. Anything else (a direct push, main moved on since,
+      # a PR that changed no firmware) publishes nothing.
+      - name: Find the PR's build
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          skip() { echo "::notice::$1: nothing published to prod"; echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          pr=$(gh api "repos/$REPO/commits/$GITHUB_SHA/pulls" --jq '.[0].number // empty')
+          [ -n "$pr" ] || skip "not from a PR"
+          head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
+          run=$(gh run list -R "$REPO" --workflow esp32-embedder.yml --commit "$head" --event pull_request --status success \
+                --json databaseId --jq '.[0].databaseId // empty')
+          [ -n "$run" ] || skip "PR #$pr has no successful esp32-embedder run at its head"
+          gh run download "$run" -R "$REPO" -n firmware -D firmware 2> /dev/null || skip "PR #$pr published no firmware"
+          if [ "$(cat firmware/tree)" != "$(git rev-parse 'HEAD^{tree}')" ]; then
+            echo "::error::main isn't the tree PR #$pr's build came from (main moved on): re-run its CI, or publish by hand"
+            exit 1
+          fi
+          echo "version=$(jq -r .version firmware/version.json)" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+      - if: steps.find.outputs.publish == 'true'
+        run: pip install --quiet "esptool==${ESPTOOL_VERSION}"
+      - if: steps.find.outputs.publish == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Sign and publish
+        if: steps.find.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.find.outputs.version }}
+        run: esp32-embedder/firmware/full/tools/ci-publish.sh prod firmware/kata-unsigned.bin "$VERSION"
+      - name: Record deployment
+        if: steps.find.outputs.publish == 'true'
+        uses: nakomis/nakomis-infra/.github/actions/record-deployment@main
+        with:
+          project: kata
+          environment: prod
+          version-file: firmware/version.json
+
+  infra:
+    name: Infra (CDK)
+    needs: changes
+    if: needs.changes.outputs.embedder == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: esp32-embedder/infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: esp32-embedder/infra/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: esp32-embedder/infra/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Type-check
+        run: pnpm run build
+      - name: Synth (sandbox and prod)
+        run: pnpm run ci-synth-sandbox && pnpm run ci-synth-prod
+
+  # One check to require on main, whatever ran.
+  ci-status:
+    name: CI Status
+    if: always()
+    needs: [changes, tokeniser, infra, firmware-version, firmware-build, firmware-sandbox, firmware-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key)=\(.value.result)"'
+          # Every job passed or was skipped (nothing in esp32-embedder/ changed, the CI roles aren't
+          # set up yet, or it's the other event's job); a failure or cancellation fails the check.
+          echo "$RESULTS" | jq -e 'to_entries | all(.value.result == "success" or .value.result == "skipped")' > /dev/null
