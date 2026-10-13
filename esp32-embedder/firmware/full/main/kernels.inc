@@ -154,6 +154,10 @@ static void mm_rows(void *arg)
             sw[r] = m->ws[rb0 + r]; bb[r] = m->b[rb0 + r];
             memcpy(wo + r * K, m->wo + (size_t)(rb0 + r) * K, K * sizeof(float));
         }
+        // No task switch on this core while PIE and FPU state are live: with Wi-Fi up (more
+        // switches), core 0's results came out intermittently corrupted, which points at the lazy
+        // coprocessor save/restore. Interrupts stay on, so DMA and the network keep running.
+        vTaskSuspendAll();
         for (int t = 0; t < j->tc; t++) {
             const int8_t *xr = xq + (size_t)t * m->in;
             const float *o = xo + (j->t0 + t) * K;
@@ -167,6 +171,7 @@ static void mm_rows(void *arg)
             }
             store_rows(m, j->t0 + t, rb0, n, yb);
         }
+        xTaskResumeAll();
         cyc_pie[core] += esp_cpu_get_cycle_count() - c1;
     }
 }
