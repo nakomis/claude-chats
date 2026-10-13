@@ -8,6 +8,8 @@ Since CHATS-4 a pass holds a whole message (up to 512 tokens, Ollama's own limit
 
 This is spike code (HOME-432 → CHATS-1): proven on the bench, not yet a service. The plan to turn it into an embedding worker that takes over from Cal is in Plane under **CHATS-1**.
 
+The board is called **Kata**.
+
 ## Results
 
 ESP32-S3 N16R8 (ESP32-S3 CAM board), 32 GB SDHC card in the onboard slot, whole 24-layer model, [CLS] pooling:
@@ -105,29 +107,26 @@ In numpy (`host/lean.py`) the leaner layout costs nothing measurable against the
 | `host/selftest_crcs.py` | Reads a board's log and writes the known-good vector CRCs into `firmware/full/main/selftest.h` |
 | `host/serial_log.py` | Logs the board's serial output to a file without resetting it |
 | `host/corpus.py` | Samples real messages from local Claude Code transcripts for tokeniser testing (stays local) |
-| `firmware/full/` | The whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin` |
+| `firmware/full/` | Kata's firmware: the whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin`. `build.sh`, `sign.sh` and `flash.sh` build, sign and flash it; `tools/` is for CI |
 | `firmware/layer0/` | One layer from a flash partition, plus the self-tests that found the PIE bug, an SD speed test and a GPIO pull-up probe |
 | `firmware/bench/` | int8 matmul benchmark for the S3 (esp-nn) |
 | `firmware/wroom-bench/` | int8 dot-product benchmark for the original ESP32 |
+| `tok/test_tok.c` | The tokeniser on a tiny made-up vocab: what CI can check without the real one |
+| `infra/` | CDK (pnpm): the GitHub Actions roles that publish the firmware, plus `scripts/provision.sh` and `scripts/ota-signing-key.sh` |
 
 ## Running it
 
-You need [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) 5.4 or later, Ollama with `mxbai-embed-large` pulled, and Python 3.11+.
+You need [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) 5.4.4 (what CI builds with; `vcore.c` reaches into ESP-IDF internals, so other versions need a check), Ollama with `mxbai-embed-large` pulled, and Python 3.11+.
 
 ```bash
 cd host
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python prep_full.py mxbai.bin mxtest.bin        # a few minutes; prints cos vs Ollama per test
-.venv/bin/python gen_crc.py mxbai.bin ../firmware/full/main/mxcrc.h
 ```
 
-Format a card FAT32 and copy `mxbai.bin` and `mxtest.bin` to its root. **Then eject it, reinsert it and compare the copy byte for byte.** Put the card in the board's slot, and:
+`firmware/full/main/mxcrc.h` (the CRC of every section of `mxbai.bin`) and `longtest.h` (the long test texts and their vectors) are generated but committed, so CI can build without the 345 MB model or Ollama. If you remake `mxbai.bin`, regenerate them (`gen_crc.py mxbai.bin ../firmware/full/main/mxcrc.h`, `gen_long.py`) and commit both.
 
-```bash
-cd firmware/full
-idf.py set-target esp32s3 && idf.py build
-idf.py -p /dev/cu.usbmodem1101 flash
-```
+Format a card FAT32 and copy `mxbai.bin` and `mxtest.bin` to its root. **Then eject it, reinsert it and compare the copy byte for byte.** Put the card in the board's slot.
 
 To test the tokeniser on the Mac, start a private `llama-server` on Ollama's GGUF (the command is in `host/ollama_ids.py`), then:
 
@@ -135,13 +134,53 @@ To test the tokeniser on the Mac, start a private `llama-server` on Ollama's GGU
 .venv/bin/python ollama_ids.py && .venv/bin/python test_tok.py
 ```
 
-On the ESP32-S3 CAM board, flash over the native USB port. `idf.py flash` ends with a USB reset, which leaves the chip in download mode, so either tap **RST** afterwards or flash with esptool and a watchdog reset, which needs no hands:
+The SD pins are those of the ESP32-S3 CAM board's onboard slot (1-bit: CLK 39, CMD 38, D0 40). For a 4-bit breakout, see CHATS-6.
+
+### Provisioning
+
+Nothing secret is in the build: every board runs the same image, so CI can publish it. What's particular to a board lives in its own `prov` partition (NVS, namespace `kata`), which the firmware reads at boot. Today that's the house Wi-Fi; device identity (the IoT endpoint, Thing name, certificate and key) joins it later. The boards are `blue`, `green` and `red`, and each will be the Thing `kata-{env}-{board}`.
 
 ```bash
-python -m esptool --chip esp32s3 -p /dev/cu.usbmodem1101 -b 460800 --after watchdog_reset write_flash 0x10000 build/s3full.bin
+infra/scripts/provision.sh blue          # NPM_ENVIRONMENT=prod for a prod board
 ```
- If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
 
-The SD pins are those of the ESP32-S3 CAM board's onboard slot (1-bit: CLK 39, CMD 38, D0 40). For a 4-bit breakout, see CHATS-6.
+This reads the Wi-Fi SSID and password from SSM (`/Nakomis/Wifi/*`, in the sandbox account), builds `firmware/full/certs/kata-sandbox-blue/prov.bin` with ESP-IDF's NVS partition generator, and shreds the CSV it went through. `certs/` is gitignored. `prov.bin` holds the Wi-Fi password in plain text, and so will the board's flash.
+
+A board that isn't provisioned still runs the model and its self-tests; it just says `prov: not provisioned` and skips Wi-Fi.
+
+### Flashing
+
+Images are signed (RSA-3072, the secure boot v2 scheme), USB builds included: once Fleet can update the boards, each one will only take an update signed by the key that signed the image it's running. So build and flash with the scripts, not `idf.py flash`, which would write the unsigned image:
+
+```bash
+cd firmware/full
+./build.sh                                            # idf.py build, then sign.sh
+./flash.sh /dev/cu.usbmodem1101 kata-sandbox-blue     # app + prov
+```
+
+`sign.sh` takes the key from the login Keychain (`kata-ota-signing`, account `sandbox` or `prod`), fetching it once from SSM if it isn't there, and checks the result against the committed `ota-signing/{env}.pub.pem`. `flash.sh` writes the bootloader, partition table, OTA data, the signed app and the board's `prov.bin`, never `nvs`. Like tinycrypt's, it doesn't reset the chip first (`--before no_reset`): hold **BOOT**, tap **RST**, release **BOOT**, then run it, or set `BEFORE=default_reset` to let esptool do that over the native USB port. It ends with a watchdog reset, because a plain reset over the native USB port leaves the chip in download mode. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
+
+The partition table is tinycrypt's, with the room 16 MB allows: `nvs`, `phy_init`, `otadata`, `prov`, two 4 MB OTA app slots (the app is about 1.1 MB) and a core dump. Rollback is on. A board still on the old single-app layout needs this full flash once.
+
+### Versioning
+
+`firmware/full/version.txt` (`x.y.z`, starting at 0.1.0) labels local builds; ESP-IDF puts it in the app descriptor, and the firmware prints it at boot. It's only a seed. In CI the version comes from the shared deployment tracker (project `kata`): one patch past sandbox's latest, or a minor or major bump with `--bump-minor` or `--bump-major` alone on a line in the PR description. A version already in the bucket is never reused; CI steps past it.
+
+### CI
+
+`.github/workflows/esp32-embedder.yml` runs on every PR and push to main, and does its work only when something under `esp32-embedder/` changed:
+
+- the tokeniser's host test (`tok/test_tok.c`, under ASan and UBSan)
+- the firmware, built in `espressif/idf:v5.4.4`, with the image checks from `tools/image-checks.sh`: the right version, rollback and signed updates on, and no per-board strings (no `kata-{env}-` name, no IoT endpoint, and in sandbox, not the Wi-Fi SSID)
+- the CDK type-checked and synthesised for both environments
+- `CI Status`, the one check to require
+
+On a PR, the build is signed with the sandbox key and published to `s3://nakomis-firmware-sandbox/kata/<x.y.z>/firmware.bin`. When the PR merges, the same unsigned bytes are signed with the prod key and published to `nakomis-firmware-prod`, provided main holds exactly the tree the PR built. Both are recorded in the deployment tracker. CI assumes `nakomis-claude-chats-github-ci-{sandbox,prod}` through GitHub's OIDC (the repo variables `AWS_SANDBOX_ROLE_ARN` and `AWS_PROD_ROLE_ARN`); until they're set, it builds and checks but publishes nothing. Setting up an environment, once:
+
+```bash
+cd infra && pnpm install
+pnpm run deploy-sandbox                                   # the CI role
+NPM_ENVIRONMENT=sandbox scripts/ota-signing-key.sh        # then commit firmware/full/ota-signing/sandbox.pub.pem
+```
 
 \* As an Amazon Associate I earn from qualifying purchases.
