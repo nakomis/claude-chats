@@ -14,9 +14,13 @@ typedef struct {
     char iot_endpoint[96];
     char thing_name[48];
     char *device_cert, *device_key;          // PEM, in PSRAM
-    // CHATS-5: where the certificate buys AWS credentials (empty if not provisioned; unused so far)
+    // CHATS-5: where the certificate buys AWS credentials, the queues, and the board's age identity
+    // (each empty if not provisioned: then the worker doesn't start, and says why)
     char cred_endpoint[96];
     char role_alias[48];
+    char queue_url[160];              // conversation-memory's ingest queue
+    char results_url[160];            // and its results queue
+    char *age_id;                     // "AGE-SECRET-KEY-1...", in PSRAM; NULL if none
 } prov_t;
 
 // Reads the partition. False (and a line saying what's missing) if the board has no Wi-Fi settings;

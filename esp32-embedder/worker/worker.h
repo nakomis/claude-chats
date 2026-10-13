@@ -42,6 +42,7 @@
 
 #include "age.h"
 #include "kw.h"
+#include "pass_info.h"
 #include "result.h"
 #include "sqs.h"
 
@@ -60,13 +61,6 @@
 #define WORKER_CARD_HISTORY 15           // passes in the card-wait median
 #define WORKER_NORM_MIN 10.0             // a raw [CLS] vector's norm, as Cal checks it (results.rs)
 #define WORKER_NORM_MAX 30.0
-
-typedef struct {
-    uint32_t ms;                         // the pass, end to end
-    uint32_t card_wait_ms;               // of which waiting on the SD card
-    int crc_bad;                         // section CRC mismatches in this pass
-    const char *why;                     // set when the pass is bad
-} worker_pass_info_t;
 
 typedef struct {
     void *ctx;
@@ -152,6 +146,9 @@ void worker_free(worker_t *w);
 // One network phase and at most one pass. Returns the seconds to wait (with MQTT up) before the
 // next step: 0 to go straight on.
 int worker_step(worker_t *w);
+
+// Start sick (the boot self-test failed): everything goes to Cal until a health check passes.
+void worker_set_sick(worker_t *w, const char *why);
 
 // For an update (CHATS-10): from another task. The next step hands off, releases the rest, and parks.
 void worker_request_park(worker_t *w);

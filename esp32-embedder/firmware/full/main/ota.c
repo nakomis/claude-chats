@@ -1,6 +1,7 @@
 // OTA through Fleet (CHATS-10): tinycrypt's embedded/esp32s3/main/ota.c, less the approval. See ota.h.
 #include "ota.h"
 #include "fleet.h"
+#include "kata_worker.h"
 #include "model.h"
 #include "net.h"
 
@@ -364,13 +365,18 @@ static void ota_task(void *arg)
     const esp_partition_t *slot = esp_ota_get_next_update_partition(NULL);
     printf("ota: update to %s: into %s, once the model is free\n", job_version, slot ? slot->label : "(none)");
 
-    // 1. The model's internal buffers (model.h): the pass in progress finishes first.
-    bool lent = false;
+    // 1. CHATS-5: the worker hands off what it has finished and gives back what it hasn't (no job is
+    // held through an update: CHATS-10's criterion 4), then the model's internal buffers (model.h).
+    bool lent = false, parked = false;
     if (strcmp(model_state(), "idle") != 0) respond_progress("waiting for the current pass", 0, job_version);
-    for (int waited = 0; !cancel && waited < OTA_MODEL_WAIT_S; waited += 5)
+    int64_t wait_start = now_ms();
+    parked = kata_worker_park(OTA_MODEL_WAIT_S * 1000);
+    int waited = (int)((now_ms() - wait_start) / 1000);
+    for (; parked && !cancel && waited < OTA_MODEL_WAIT_S; waited += 5)
         if ((lent = model_lend(5000))) break;
     if (!slot) failed = "no update slot";
     else if (cancel) failed = "cancelled";
+    else if (!parked) failed = "busy: the worker didn't hand its jobs back";
     else if (!lent) failed = "busy: the model didn't come free";
     else {
         taskENTER_CRITICAL(&lock);
@@ -408,8 +414,9 @@ static void ota_task(void *arg)
         failed = "install failed";
     }
 
-    // 3. It failed: back off, give the model its buffers back, and say why.
+    // 3. It failed: back off, give the model its buffers back, the worker its queue, and say why.
     if (lent) model_reclaim();
+    kata_worker_resume();
     taskENTER_CRITICAL(&lock);
     backoff_s = backoff_s == 0 ? OTA_BACKOFF_FIRST_S : backoff_s >= OTA_BACKOFF_MAX_S / 2 ? OTA_BACKOFF_MAX_S : backoff_s * 2;
     retry_after_ms = now_ms() + (int64_t)backoff_s * 1000;

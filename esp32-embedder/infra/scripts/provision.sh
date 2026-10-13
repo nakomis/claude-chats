@@ -15,7 +15,9 @@
 #   prov.bin   the board's prov partition: Wi-Fi, IoT endpoint, Thing name, certificate and private
 #              key, the credentials-provider endpoint and role alias, and (CHATS-5) the board's age
 #              identity from SSM /kata/{env}/boards/<board>/age-identity (make it first with
-#              age-identity.sh <board>; without it the board can't decrypt jobs, and says so).
+#              age-identity.sh <board>; without it the board can't decrypt jobs, and says so),
+#              and the ingest and results queues' URLs (/conversation-memory/{env}/queue-url,
+#              results-queue-url, from home-infra; without them the worker doesn't start).
 #              firmware/full/flash.sh writes it alongside the app; none of it is in the firmware
 #              image, so every board runs the same (published) image.
 #
@@ -113,15 +115,24 @@ else
     exit 1
 fi
 unset age_out
+# CHATS-5: the queues the worker uses, as home-infra's ConversationMemoryIngestStack publishes them
+# (HOME-439). Optional too: without them the worker doesn't start, and the board says so.
+queue_param() {
+    aws ssm get-parameter --name "/conversation-memory/${env}/$1" --query Parameter.Value --output text 2> /dev/null || true
+}
+queue_url=$(queue_param queue-url)
+results_url=$(queue_param results-queue-url)
+[ -n "$queue_url" ] && [ -n "$results_url" ] ||
+    echo "no /conversation-memory/${env}/queue-url or results-queue-url: prov.bin will have no queues (deploy home-infra first)" >&2
 
 IDF_PATH="${IDF_PATH:-$HOME/esp/esp-idf}"
 # shellcheck disable=SC1091
 . "$IDF_PATH/export.sh" > /dev/null 2>&1   # for its Python, which has the NVS partition generator
 trap 'rm -P "${dir}/prov.csv" 2> /dev/null || true' EXIT   # it holds the Wi-Fi password and age key
 prov_size=$(awk -F', *' '$1 == "prov" { print $5 }' "${fw}/partitions.csv")
-python3 - "$dir" "$endpoint" "$thing" "$cred_endpoint" "$role_alias" <<'PY'
+python3 - "$dir" "$endpoint" "$thing" "$cred_endpoint" "$role_alias" "$queue_url" "$results_url" <<'PY'
 import csv, os, sys
-d, endpoint, thing, cred_endpoint, role_alias = sys.argv[1:]
+d, endpoint, thing, cred_endpoint, role_alias, queue_url, results_url = sys.argv[1:]
 ssid, password = os.environ["KATA_SSID"], os.environ["KATA_PASSWORD"]
 age_id = os.environ["KATA_AGE_ID"]
 if age_id and (len(age_id) != 74 or not age_id.startswith("AGE-SECRET-KEY-1")):
@@ -140,12 +151,19 @@ rows = [
     ("thing", "data", "string", thing),
     ("cert", "file", "string", os.path.join(d, "device.pem.crt")),
     ("key", "file", "string", os.path.join(d, "device.pem.key")),
-    # CHATS-5: the certificate buys AWS credentials here (nothing reads these yet).
+    # CHATS-5: the certificate buys AWS credentials here, for the worker.
     ("cred_ep", "data", "string", cred_endpoint),
     ("role_alias", "data", "string", role_alias),
 ]
+for url in (queue_url, results_url):
+    if url and (len(url) > 159 or not url.startswith("https://sqs.")):
+        sys.exit(f"{url}: not an SQS queue URL that fits prov.h")
+if queue_url and results_url:
+    # CHATS-5: the worker's queues (firmware/full/main/kata_worker.c)
+    rows.append(("queue_url", "data", "string", queue_url))
+    rows.append(("results_url", "data", "string", results_url))
 if age_id:
-    # CHATS-5: the board's age identity, to decrypt conversation-memory jobs (nothing reads it yet).
+    # CHATS-5: the board's age identity, to decrypt conversation-memory jobs.
     rows.append(("age_id", "data", "string", age_id))
 with open(os.path.join(d, "prov.csv"), "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)

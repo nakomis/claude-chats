@@ -524,6 +524,14 @@ int worker_step(worker_t *w)
     return arrived ? 5 : WORKER_IDLE_S;      // more may be waiting (a sick Kata forwarding, say)
 }
 
+void worker_set_sick(worker_t *w, const char *why)
+{
+    w->bad_in_row = WORKER_BAD_PASSES;
+    snprintf(w->last_error, sizeof w->last_error, "%s", why);
+    go_sick(w);
+    w->state = "sick";
+}
+
 void worker_request_park(worker_t *w) { w->park_requested = true; }
 bool worker_is_parked(const worker_t *w) { return w->parked; }
 

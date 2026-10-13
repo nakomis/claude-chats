@@ -5,6 +5,8 @@
 // against mxtest.bin before each pass.
 // CHATS-10: Kata on Fleet. The self-test is also a new image's health check (ota.h), and an update
 // borrows the model's internal buffers between passes (model.h).
+// CHATS-5: Kata the worker (kata_worker.c): several messages per pass (segments, from PR #21), a
+// section CRC mismatch aborts the pass, and the card's health is counted for the heartbeat.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +34,8 @@
 #include "net.h"
 #include "ota.h"
 #include "vcore.h"
+#include "kata_worker.h"
+#include "kw.h"
 #include "selftest.h"
 #include "longtest.h"
 
@@ -49,7 +53,9 @@ static void *ps(size_t n) { return heap_caps_aligned_alloc(64, (n + 63) & ~(size
 #define ABOUNCE (16 * 1024)
 static uint8_t *abounce[2];               // SD DMA bounce buffers, internal
 static int64_t t_sd;
-static int crc_bad;
+// CHATS-5: the card's health, for the heartbeat. Written by the cp and sd tasks too.
+static volatile int crc_bad, read_retries;
+static char crc_last[48];                 // the last section that failed its CRC
 
 // Sections are read as raw sectors through the file's cluster map (FatFs seeks walk the
 // cluster chain: seconds per seek in a 345 MB file). The map is built once at start-up.
@@ -97,7 +103,7 @@ static uint32_t sd_read(void *dst, uint32_t off, size_t len, uint32_t crc)
         size_t ns = (n + 511) / 512;
         uint32_t lba = frag_lba[f] + (off - frag_off[f]) / 512;
         esp_err_t e = sdmmc_read_sectors(card, abounce[0], lba, ns);
-        if (e != ESP_OK) e = sdmmc_read_sectors(card, abounce[0], lba, ns);
+        if (e != ESP_OK) { read_retries++; e = sdmmc_read_sectors(card, abounce[0], lba, ns); }
         if (e != ESP_OK) { printf("SD: read at lba %lu failed: %s\n", (unsigned long)lba, esp_err_to_name(e)); abort(); }
         crc = esp_rom_crc32_le(crc, abounce[0], n);
         memcpy(d, abounce[0], n);
@@ -109,8 +115,11 @@ static uint32_t sd_read(void *dst, uint32_t off, size_t len, uint32_t crc)
 
 static void check(const char *what, int a, int b, uint32_t got, uint32_t want)
 {
-    if (got != want) { crc_bad++; printf("CRC mismatch: %s %d/%d got %08lx want %08lx\n", what, a, b,
-                                         (unsigned long)got, (unsigned long)want); }
+    if (got != want) {
+        snprintf(crc_last, sizeof crc_last, "%s %d/%d", what, a, b);
+        crc_bad++;
+        printf("CRC mismatch: %s %d/%d got %08lx want %08lx\n", what, a, b, (unsigned long)got, (unsigned long)want);
+    }
 }
 
 // ---- background reads ---------------------------------------------------------------
@@ -148,7 +157,7 @@ static void sd_task(void *arg)
             uint32_t lba = frag_lba[f] + (off - frag_off[f]) / 512;
             xSemaphoreTake(bfree[bi], portMAX_DELAY);
             esp_err_t e = sdmmc_read_sectors(card, abounce[bi], lba, ns);
-            if (e != ESP_OK) e = sdmmc_read_sectors(card, abounce[bi], lba, ns);
+            if (e != ESP_OK) { read_retries++; e = sdmmc_read_sectors(card, abounce[bi], lba, ns); }
             if (e != ESP_OK) { printf("SD: read at lba %lu failed: %s\n", (unsigned long)lba, esp_err_to_name(e)); abort(); }
             chunk_t c = { r, d, bi, n, first, len == n };
             xQueueSend(cq, &c, portMAX_DELAY);
@@ -270,8 +279,11 @@ static void issue(int u)
 }
 
 static int64_t t_att;
-static void pass_fwd(void)
+// The pass. CHATS-5: a section CRC mismatch aborts it (the card's data can't be trusted, so neither can
+// any vector from it): -1, once the reads already queued have landed. 0 when it ran to the end.
+static int pass_fwd(void)
 {
+    int crc0 = crc_bad;
     size_t nd = (size_t)n_tok * D;
     uint16_t *q = (uint16_t *)arena, *k = q + nd, *v = k + nd;      // fp16; o is written over q
     int8_t *h = (int8_t *)arena;                                     // FFN hidden: int8 [n][FF] ...
@@ -284,6 +296,12 @@ static void pass_fwd(void)
         int p = u & 1, mp = (t->li * 6 + t->mi) & 1, mi = t->mi;
         if (u + 1 < n_units) issue(u + 1);       // u - 1 is finished, so its buffers take u + 1's reads
         for (int i = 0; i < n_ureq[p]; i++) wait_rd(ureq[p][i]);
+        if (crc_bad != crc0) {
+            // u + 1's reads are queued; they complete in order, so waiting for the last is enough
+            if (u + 1 < n_units && n_ureq[(u + 1) & 1]) wait_rd(ureq[(u + 1) & 1][n_ureq[(u + 1) & 1] - 1]);
+            printf("pass aborted at layer %d: section CRC mismatch (%s)\n", t->li, crc_last);
+            return -1;
+        }
         mat_t m = { stage[p] - (size_t)t->r0 * MIN[mi], mws[mp], mb[mp], allo[t->li][mi], mwo[mp], MIN[mi], MOUT[mi],
                     mode[mi], yout[mi], hs, allo[t->li][5] };
         if (t->j == 0) {
@@ -304,19 +322,43 @@ static void pass_fwd(void)
             layernorm(x, nw + 2 * D, nw + 3 * D);
         }
     }
+    return 0;
 }
 
-// token + position + type embeddings, then layernorm
+// CHATS-5 (PR #21): the pass's segments, from the token counts of the messages packed into ids
+static int set_segs(const int *len, int n)
+{
+    if (n < 1 || n > MAXSEG) return -1;
+    int t = 0;
+    for (int s = 0; s < n; s++) {
+        if (len[s] < 1 || t + len[s] > MAXTOK) return -1;
+        seg0[s] = t; t += len[s];
+    }
+    seg0[n] = t;
+    n_seg = n; n_tok = t;
+    return 0;
+}
+
+static void one_seg(int n) { set_segs(&n, 1); }
+
+// segment s's embedding: its [CLS] row, once the pass is done
+static const float *seg_vec(int s) { return x + (size_t)seg0[s] * D; }
+
+// token + position + type embeddings, then layernorm; positions restart at 0 in every segment
 static void embed_in(const uint32_t *ids)
 {
     int8_t row[D];
     float *pos = (float *)arena;             // the arena is free here
-    sd_read(pos, goff[2], (size_t)n_tok * D * 4, 0);
-    for (int t = 0; t < n_tok; t++) {
-        sd_read(row, goff[0] + ids[t] * D, D, 0);
-        float s = tok_s[ids[t]], *r = x + (size_t)t * D;
-        for (int j = 0; j < D; j++) r[j] = row[j] * s + pos[(size_t)t * D + j] + type0[j];
-    }
+    int np = 0;
+    for (int s = 0; s < n_seg; s++) np = seg0[s + 1] - seg0[s] > np ? seg0[s + 1] - seg0[s] : np;
+    sd_read(pos, goff[2], (size_t)np * D * 4, 0);
+    for (int s = 0; s < n_seg; s++)
+        for (int t = seg0[s]; t < seg0[s + 1]; t++) {
+            sd_read(row, goff[0] + ids[t] * D, D, 0);
+            float sc = tok_s[ids[t]], *r = x + (size_t)t * D;
+            const float *pp = pos + (size_t)(t - seg0[s]) * D;
+            for (int j = 0; j < D; j++) r[j] = row[j] * sc + pp[j] + type0[j];
+        }
     layernorm(x, en_w, en_b);
 }
 
@@ -411,12 +453,37 @@ const char *model_state(void)
     return model_lent ? "updating" : in_pass ? (checking ? "checking" : "embedding") : "idle";
 }
 
-static void run_pass(const int32_t *ids)
+// ---- the model for the worker (model.h, CHATS-5) ---------------------------------------------
+int model_tokenise(const char *text, size_t len, int32_t *out, int max) { return tok_encode(&vocab, text, len, out, max, NULL); }
+
+int model_embed(const int32_t *in, const int *lens, int n, float *vecs, worker_pass_info_t *info)
 {
+    if (!model_ready) { info->why = "the model isn't loaded"; return -1; }
     model_pass_begin();
-    embed_in((const uint32_t *)ids);
-    pass_fwd();
+    if (set_segs(lens, n)) { model_pass_end(); info->why = "bad segments"; return -1; }
+    t_sd = t_att = t_quant = t_stall = 0;
+    int crc0 = crc_bad;
+    int64_t t0 = esp_timer_get_time();
+    embed_in((const uint32_t *)in);
+    int rc = pass_fwd();
+    info->ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    info->card_wait_ms = (uint32_t)(t_stall / 1000);
+    info->crc_bad = crc_bad - crc0;
+    if (!rc && info->crc_bad) rc = -1;        // a mismatch in the last unit's reads
+    if (!rc) for (int s = 0; s < n; s++) memcpy(vecs + (size_t)s * D, seg_vec(s), D * sizeof(float));
     model_pass_end();
+    if (rc) {
+        static char why[80];
+        snprintf(why, sizeof why, "section CRC mismatch (%s)", crc_last);
+        info->why = why;
+    }
+    return rc;
+}
+
+void model_card_health(int *crc_mismatches, int *retries)
+{
+    *crc_mismatches = crc_bad;
+    *retries = read_retries;
 }
 
 // SD card, the model's tables and buffers, and the tasks; 0 when it's ready for passes.
@@ -438,7 +505,8 @@ static int model_init(void)
     hdr = ps(1024);
     ltab = ps(24 * sizeof *ltab);
     units = ps(MAXUNITS * sizeof *units);
-    if (!hdr || !ltab || !units) { printf("alloc failed (tables)\n"); return -1; }
+    seg0 = ps((MAXSEG + 1) * sizeof *seg0);
+    if (!hdr || !ltab || !units || !seg0) { printf("alloc failed (tables)\n"); return -1; }
     sd_read(hdr, 0, 1024, 0);
     if (memcmp(hdr, "MXB1", 4)) { printf("bad magic\n"); return -1; }
     n_layer = hdr[2]; K = hdr[3]; n_vocab = hdr[4];
@@ -535,15 +603,12 @@ static bool healthy(void)
     return ok;
 }
 
-static float *ref0;                           // test 0's Ollama vector, for the Wi-Fi passes at the end
 static int32_t *ids;
 static void selftest_run(void)
 {
     uint32_t *want = ps(512 * 4);
-    ref0 = ps(D * 4);
-    if (ref0) memset(ref0, 0, D * 4);         // test 0 may not run: then the Wi-Fi passes' cos is 0, not garbage
     uint32_t th[3];
-    if (!want || !ref0 || fread(th, 4, 3, ft) != 3 || memcmp(th, "MXT1", 4)) { printf("bad test magic\n"); return; }
+    if (!want || fread(th, 4, 3, ft) != 3 || memcmp(th, "MXT1", 4)) { printf("bad test magic\n"); return; }
     checking = true;
     for (int ti = 0; ti < (int)th[1]; ti++) {
         uint32_t n;
@@ -571,7 +636,7 @@ static void selftest_run(void)
         if (!same) { heap_caps_free(emu); heap_caps_free(ref); continue; }   // emu and ref belong to mxtest.bin's ids
         if (n > MAXTOK) { printf("test %d: %lu tokens > %d, skipped\n", ti, (unsigned long)n, MAXTOK); heap_caps_free(emu); heap_caps_free(ref); continue; }
         model_pass_begin();
-        n_tok = n;
+        one_seg((int)n);
         t_sd = t_att = t_quant = t_stall = 0;
         cyc_cp[0] = cyc_cp[1] = cyc_pie[0] = cyc_pie[1] = 0;
         int64_t t0 = esp_timer_get_time();
@@ -588,7 +653,6 @@ static void selftest_run(void)
                t_att / 1e6, t_quant / 1e6, crc_bad ? "  CRC ERRORS" : "");
         selftest(ti, c);
         model_pass_end();
-        if (ti == 0) memcpy(ref0, ref, D * 4);
         heap_caps_free(emu); heap_caps_free(ref);
     }
     // CHATS-4: whole long messages in one pass (references from host/gen_long.py)
@@ -596,7 +660,7 @@ static void selftest_run(void)
         int nt = tok_encode(&vocab, LONG[li].text, strlen(LONG[li].text), ids, MAXTOK, NULL);
         if (nt < 1 || nt != LONG[li].n_tok) { printf("long %d: %d tokens, host says %d\n", li, nt, LONG[li].n_tok); tok_bad++; continue; }
         model_pass_begin();
-        n_tok = nt;
+        one_seg(nt);
         t_sd = t_att = t_quant = t_stall = 0;
         int64_t t0 = esp_timer_get_time();
         embed_in((const uint32_t *)ids);
@@ -612,11 +676,46 @@ static void selftest_run(void)
     checking = false;
 }
 
+// CHATS-5: a sick worker's health check (worker.h): the five short self-test texts in one batched
+// pass, each bit for bit what selftest.h records. A message gets the same arithmetic in a batch as on
+// its own (PR #21; test/test_att.c), so the single-pass CRCs apply. About 75 s.
+int model_health(void)
+{
+    if (!model_ready) return -1;
+    int32_t *q = ps(MAXTOK * sizeof *q);
+    float *v = ps((size_t)N_TEXTS * D * sizeof *v);
+    int lens[N_TEXTS], t = 0, bad = 0, rc = -1;
+    if (q && v) {
+        rc = 0;
+        for (int i = 0; i < N_TEXTS && !rc; i++) {
+            lens[i] = tok_encode(&vocab, TEXTS[i], strlen(TEXTS[i]), q + t, MAXTOK - t, NULL);
+            if (lens[i] < 2 || t + lens[i] > MAXTOK) rc = -1;
+            else t += lens[i];
+        }
+        worker_pass_info_t info = { 0 };
+        if (!rc) rc = model_embed(q, lens, N_TEXTS, v, &info);
+        for (int i = 0; !rc && i < N_TEXTS; i++) {
+            uint32_t c = esp_rom_crc32_le(0, (const uint8_t *)(v + (size_t)i * D), D * 4);
+            if (c != SELFTEST_CRC[i]) { bad++; printf("health: test %d: vector crc %08lx, want %08lx\n", i, (unsigned long)c, (unsigned long)SELFTEST_CRC[i]); }
+        }
+        printf("health: %d texts in one pass: %s\n", N_TEXTS, rc ? (info.why ? info.why : "the pass failed") : bad ? "WRONG" : "bit-exact");
+    }
+    heap_caps_free(q);
+    heap_caps_free(v);
+    return rc || bad ? -1 : 0;
+}
+
+// kw.h's allocations (the worker's bodies, results and JSON) go to PSRAM
+static void *ps_alloc(size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); }
+static void *ps_realloc(void *p, size_t n) { return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM); }
+
 void app_main(void)
 {
-    vcore_boost(1250);                       // 240 MHz needs >= 1.25 V on some chips: see vcore.c
+    int vcore_mv = vcore_boost(1250);        // 240 MHz needs >= 1.25 V on some chips: see vcore.c
+    static const kw_mem_t psram = { ps_alloc, ps_realloc, heap_caps_free };
+    kw_set_mem(&psram);
     vTaskDelay(pdMS_TO_TICKS(1500));
-    printf("\n== HOME-432 step 3: whole mxbai on the S3, weights from SD ==\n");
+    printf("\n== Kata: mxbai-embed-large on the S3, weights from SD ==\n");
     const esp_app_desc_t *app = esp_app_get_description();   // version.txt, or CI's x.y.z (CHATS-10)
     printf("%s %s, built %s %s with ESP-IDF %s\n", app->project_name, app->version, app->date, app->time, app->idf_ver);
     printf("ROM crc32 check: %08lx (want cbf43926)\n", (unsigned long)esp_rom_crc32_le(0, (const uint8_t *)"123456789", 9));
@@ -641,6 +740,7 @@ void app_main(void)
     static prov_t prov;                      // static: fleet.c and the Wi-Fi driver keep pointers into it
     net_heap("before wifi");
     bool online = prov_load(&prov) && net_up(&prov, 20000) == 0;
+    kata_worker_status_init(vcore_mv);       // the heartbeat's card, temperature and worker fields
     if (online) {
         net_heap("wifi up");
         fleet_start(&prov);                   // connects in the background; net_heap("mqtt connected")
@@ -648,28 +748,14 @@ void app_main(void)
 
     // The self-test, and on probation the health check: a bad new image rolls back here.
     if (model_ready && ids) selftest_run();
-    ota_health(model_ready && ids && healthy());
+    bool ok = model_ready && ids && healthy();
+    ota_health(ok);
     printf("== self-test done (%d CRC mismatches, %d tokeniser mismatches)%s ==\n", crc_bad, tok_bad,
            probation ? ", new image" : "");
 
-    // CHATS-4: an HTTPS request next to the model, then test 0 three times with the radio (and now
-    // MQTT) up and an HTTPS request between passes: the network and a pass share internal RAM and
-    // both cores. An update may take the model meanwhile (run_pass waits for it).
-    if (online && model_ready && ids && ref0) {
-        net_https_check("https://sqs.eu-west-2.amazonaws.com/");
-        net_heap("after https");
-        for (int r = 0; r < 3; r++) {             // with Wi-Fi up, a corrupted pass shows as cos well below 0.999
-            n_tok = tok_encode(&vocab, TEXTS[0], strlen(TEXTS[0]), ids, MAXTOK, NULL);
-            if (n_tok < 1) { printf("wifi up, pass %d: tokeniser failed\n", r); tok_bad++; break; }
-            run_pass(ids);
-            float c = cosv(x, ref0, D);
-            printf("wifi up, pass %d: test 0 cos vs Ollama %.6f\n", r, c);
-            selftest(0, c);                       // the conditions the corruption was found under
-            net_https_check("https://sqs.eu-west-2.amazonaws.com/");
-        }
-        net_heap("end");
-    }
-    if (model_ready && ids) verdict(true);   // again, with the Wi-Fi passes counted
-    printf("== done (%d CRC mismatches, %d tokeniser mismatches): idle; Fleet can update this board ==\n", crc_bad, tok_bad);
+    // CHATS-5: Kata the worker, from here on, in this task (its 16 KB of internal stack). A board
+    // whose self-test failed still works the queue, sick: everything goes to Cal until it's well.
+    if (model_ready) kata_worker_run(&prov, online, ok);
+    printf("== no worker: idle; Fleet can update this board ==\n");
     // Returning ends the main task and frees its 16 KB stack; MQTT, the heartbeat and updates carry on.
 }

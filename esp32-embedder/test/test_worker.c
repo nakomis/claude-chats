@@ -403,6 +403,24 @@ static void bad_passes(void)
     board_free(&b, &w);
 }
 
+static void sick_from_boot(void)
+{
+    printf("-- a board whose boot self-test failed starts sick\n");
+    board_t b;
+    worker_t w;
+    board_init(&b, &w, NULL);
+    worker_set_sick(&w, "the boot self-test failed");
+    char *j = make_job_text(&b, "u-boot", "while sick from boot");
+    worker_step(&w);
+    CHECK(b.passes == 0 && !strcmp(reason_of(&b, "u-boot"), "kata-unhealthy") && fq_live(fq_queue(&b.f, INGEST)) == 0,
+          "straight to Cal, no pass: %s", reason_of(&b, "u-boot"));
+    b.f.now += WORKER_HEALTH_EVERY_S;
+    worker_step(&w);
+    CHECK(b.health_calls == 1 && !w.sick, "well after a health check");
+    kw_free(j);
+    board_free(&b, &w);
+}
+
 static void faults(void)
 {
     printf("-- the results queue refusing, the network failing, an update\n");
@@ -592,6 +610,7 @@ int main(void)
     happy_path();
     sorting();
     bad_passes();
+    sick_from_boot();
     faults();
     big_results();
     soak();

@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 
+#include "kw.h"
 #include "prov.h"
 
 #define FLEET_STATUS_S 60
@@ -21,3 +22,13 @@ bool fleet_start(const prov_t *prov);
 bool fleet_respond(const char *json);
 // The self-test's verdict, for the heartbeat: "bit-exact", "cos", "failed" or "not run".
 void fleet_set_selftest(const char *verdict);
+
+// CHATS-5: the worker's fields, appended to every heartbeat (",\"key\":value..." into out).
+void fleet_set_status_extra(void (*extra)(jbuf_t *out));
+// A heartbeat now (after a state change), if connected.
+void fleet_status_now(void);
+// CHATS-5: MQTT steps aside while the worker talks to SQS (one TLS session at a time), and comes
+// back after. Commands sent meanwhile wait at IoT Core (persistent session, QoS 1).
+void fleet_pause(void);
+void fleet_resume(void);
+bool fleet_connected(void);

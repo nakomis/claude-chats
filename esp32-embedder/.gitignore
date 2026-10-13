@@ -1,5 +1,6 @@
 # ESP-IDF build output and generated config
 firmware/*/build/
+firmware/*/build-*/
 firmware/*/managed_components/
 firmware/*/sdkconfig
 firmware/*/sdkconfig.old
