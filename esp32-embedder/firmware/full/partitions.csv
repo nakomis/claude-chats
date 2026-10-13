@@ -1,2 +1,12 @@
-# Name,   Type, SubType, Offset,   Size
-factory,  app,  factory, 0x10000,  0x200000
+# Name,   Type, SubType,  Offset,   Size
+# tinycrypt's layout (CHATS-10), with the room 16 MB allows. prov holds this board's settings
+# (infra/scripts/provision.sh), so every board runs the same image and a published image holds no
+# secrets. Two 4 MB app slots for OTA with rollback (the app is ~1.1 MB). The model is on the SD
+# card, not in flash, so the last ~7.8 MB is spare.
+nvs,      data, nvs,      0x9000,   0x6000
+phy_init, data, phy,      0xf000,   0x1000
+otadata,  data, ota,      0x10000,  0x2000
+prov,     data, nvs,      0x12000,  0x6000
+ota_0,    app,  ota_0,    0x20000,  4M
+ota_1,    app,  ota_1,    0x420000, 4M
+coredump, data, coredump, 0x820000, 64K

@@ -36,3 +36,15 @@ CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
 # a panic halts rather than rebooting: a halted chip still answers esptool over USB, a boot loop may not
 CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+# CHATS-10: tinycrypt's OTA groundwork, ahead of Fleet. Two app slots (partitions.csv), and a new
+# image that fails before it's marked valid is rolled back by the bootloader. Images are signed
+# (RSA-3072, the secure boot v2 scheme) outside the build (sign.sh locally, tools/ci-publish.sh in
+# CI); an update will be checked against the key that signed the running app, so USB-flashed
+# builds are signed too. Without secure boot this protects updates, not a USB cable.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=n
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y

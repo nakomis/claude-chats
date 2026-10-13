@@ -1,1 +1,1 @@
-idf_component_register(SRCS "full.c" "net.c" "vcore.c" "../../../tok/tok.c" INCLUDE_DIRS "." "../../../tok" PRIV_REQUIRES esp_hw_support esp_timer esp_driver_sdmmc sdmmc fatfs esp_rom esp_wifi esp_netif esp_event esp_http_client mbedtls)
+idf_component_register(SRCS "full.c" "net.c" "vcore.c" "prov.c" "../../../tok/tok.c" INCLUDE_DIRS "." "../../../tok" PRIV_REQUIRES esp_hw_support esp_timer esp_driver_sdmmc sdmmc fatfs esp_rom esp_wifi esp_netif esp_event esp_http_client mbedtls nvs_flash esp_app_format)
