@@ -1,7 +1,7 @@
 // otacmd: run Kata's Fleet command parser (ota_cmd.c) from the command line, so test_ota_cmd.py can
 // feed it commands (CHATS-10). tinycrypt's sim/otacmd_main.c (2d490fd, CC0), less --approval.
 //
-//   cc -std=c11 -Wall -Wextra -Werror -o otacmd otacmd_main.c ota_cmd.c $(pkg-config --cflags --libs libcjson)
+//   cc -std=gnu11 -Wall -Wextra -Werror -o otacmd otacmd_main.c ota_cmd.c $(pkg-config --cflags --libs libcjson)
 //
 //   otacmd                        one JSON command per line on stdin; one JSON result per line
 //                                 ({"_now": ms} sets the parser's clock, with no result)

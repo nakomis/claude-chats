@@ -68,7 +68,7 @@ jobs:
           pip install --quiet pytest
       - name: Build otacmd and run test_ota_cmd.py
         run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined -o otacmd otacmd_main.c ota_cmd.c \
+          cc -std=gnu11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined -o otacmd otacmd_main.c ota_cmd.c \
             $(pkg-config --cflags --libs libcjson)
           python -m pytest -q test_ota_cmd.py
 

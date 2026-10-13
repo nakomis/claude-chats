@@ -4,7 +4,7 @@ tinycrypt's embedded/tests/test_ota_cmd.py (2d490fd, CC0), less the approval tes
 the same code. The wire format is Fleet's (nakomis-fleet docs/architecture/design.md and its mqtt
 tests): chunks are 0-based, at most 10, and sha256 rides on the last one.
 
-    cc -std=c11 -Wall -Wextra -Werror -o otacmd otacmd_main.c ota_cmd.c $(pkg-config --cflags --libs libcjson)
+    cc -std=gnu11 -Wall -Wextra -Werror -o otacmd otacmd_main.c ota_cmd.c $(pkg-config --cflags --libs libcjson)
     python -m pytest test_ota_cmd.py
 """
 
