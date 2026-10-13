@@ -1,8 +1,10 @@
 # esp32-embedder
 
-`mxbai-embed-large`, the model conversation-memory embeds every message with, running on an **ESP32-S3**: a dual-core 240 MHz microcontroller with 8 MB of PSRAM, on a board that costs about £6. The 335-million-parameter model doesn't fit in the chip's memory, so the weights stream off an SD card, one matrix at a time, on every pass.
+`mxbai-embed-large`, the model conversation-memory embeds every message with, running on an **ESP32-S3**: a dual-core 240 MHz microcontroller with 8 MB of PSRAM, on a board that costs from about £6 ([the one used](https://link.amazon/B00Ka0e27)\*; its camera isn't needed, only the microSD slot). The 335-million-parameter model doesn't fit in the chip's memory, so the weights stream off an SD card, one matrix at a time, on every pass.
 
 It works. On five test texts the S3's embeddings match Ollama's to a cosine similarity of **0.9994–0.9996**. That is exactly what the int8 scheme predicts in numpy, so the microcontroller adds no error of its own.
+
+Since CHATS-4 a pass holds a whole message (up to 512 tokens, Ollama's own limit), with Wi-Fi and TLS running alongside, and every result is checked bit for bit against known-good vectors.
 
 This is spike code (HOME-432 → CHATS-1): proven on the bench, not yet a service. The plan to turn it into an embedding worker that takes over from Cal is in Plane under **CHATS-1**.
 
@@ -17,6 +19,8 @@ ESP32-S3 N16R8 (ESP32-S3 CAM board), 32 GB SDHC card in the onboard slot, whole 
 | 13 | 0.999434 | 72.2 s |
 | 115 | 0.999472 | 75.5 s |
 | 140 | 0.999376 | 78.2 s |
+| 391 | 0.999436 | 205 s |
+| 512 | 0.999524 | 288 s |
 
 **It is SD-bound.** The onboard slot is wired for 1-bit SDMMC, which tops out at 4.8 MB/s; the firmware gets about 4.3 MB/s. Every pass reads all ~310 MB of weights, so a pass costs about 72 s whatever it carries, until compute catches up at around 150 tokens. Compute alone is ~0.3 s per layer at 13 tokens and ~1.6 s per layer at 115.
 
@@ -33,7 +37,7 @@ So **batching is nearly free.** A pass carrying 140 tokens of queued messages co
 - Attention splits heads across the cores, with register-blocked loops and a fast `exp`.
 
 **Streaming** (`firmware/full/main/full.c`):
-- A pass is a flat list of 288 units: (layer, matrix, 1 MB block of rows).
+- A pass is a flat list of 576 units: (layer, matrix, 512 KB block of rows).
 - While unit *u* computes, unit *u + 1* is already being read.
 - An `sd` task on core 0 keeps the card busy, alternating two 16 KB DMA buffers in internal RAM.
 - A `cp` task on core 1 copies each chunk to PSRAM and checks its CRC32 against `mxcrc.h`.
@@ -58,13 +62,27 @@ None of it matters for search:
 
 Recalibrating the outliers on 300 real messages (`host/recal.py`) made the tail *worse* at K = 8 and only slightly better at K = 32. So the 10-text calibration stays, and the corpus doesn't need re-embedding when the embedder changes.
 
+**Whole messages** (CHATS-4). A quarter of real messages are longer than the 168 tokens a pass used to hold. Activations now take ~11 KB per token in PSRAM instead of ~16, so 512 tokens fit:
+- the residual stream is fp32, and matmuls add straight into it;
+- q, k and v are fp16, and attention's output is written over q;
+- the FFN's hidden layer is int8 with a scale per 16 rows (its outlier channels kept exact), requantised in place for the down-projection;
+- attention is blocked, with an online softmax, so its scratch in internal RAM is fixed (64 queries × 32 keys) whatever the length.
+
+In numpy (`host/lean.py`) the leaner layout costs nothing measurable against the old one. Internal RAM free after loading went from 34 KB to ~130 KB, which leaves room for Wi-Fi and TLS: with the radio up and an HTTPS request done, the lowest it has been is ~36 KB.
+
+**Core voltage** (`firmware/full/main/vcore.c`). At boot, the firmware raises the chip's core voltage for 240 MHz to at least 1.25 V. See the first lesson below.
+
+**Self-test** (`firmware/full/main/selftest.h`). Every healthy board produces the same output bits for the same text. Each test vector's CRC32 is checked against a committed table, and the board says loudly if any is wrong. The table changes whenever the kernels' arithmetic does: record it again from a known-good board's log with `host/selftest_crcs.py`.
+
 ## Lessons (the expensive way)
 
-- **Never let both cores run PIE loads through the external-memory cache at the same time.** Two cores reading flash-mapped or PSRAM weights with 128-bit vector loads occasionally get garbage: a few dot products in 100,000 come back as random int32s. One core is fine, and so is internal SRAM; masking interrupts changes nothing. Each core therefore copies a block of weight rows into its own internal buffer, and PIE only ever reads internal SRAM.
+- **Some ESP32-S3s miscompute at 240 MHz with both cores flat out.** ESP-IDF sets each chip's core voltage for 240 MHz from its factory calibration (eFuse `DIG_DBIAS_HVT` + 3 steps, capped at 1.30 V). On three boards from one batch, the two given 1.218 V and 1.228 V got the odd dot product wrong whenever both cores ran PIE flat out: one garbage value in millions, different every run, no crash, no CRC error. The one given 1.249 V never did. At 160 MHz, or at 240 MHz raised to ≥ 1.25 V, all three are bit-exact (14 and more consecutive long passes each). Wi-Fi, SD activity and interrupts only made it more frequent. It took a day of software theories to find, and a second board to settle; `vcore_boost(1250)` is the fix. Read a board's calibration with `espefuse summary`; never burn eFuses for it.
+
+- **Feed PIE from internal SRAM.** Early on, two cores reading flash-mapped or PSRAM weights with 128-bit vector loads occasionally got garbage dot products (probably the same core-voltage margin as above, found before it was understood). Each core copies a block of weight rows into its own internal buffer, and PIE only reads internal SRAM, which is faster anyway.
 - **FatFs seeks are O(file size).** Seeking in a 345 MB file walks the FAT cluster chain, and one 1 MB matrix took 24 s. The firmware builds the cluster map once (`FF_USE_FASTSEEK`, `CREATE_LINKMAP`) and reads raw sectors.
 - **SD DMA into PSRAM is ~6× slower** than into internal RAM (0.8 vs 4.8 MB/s), so reads bounce through internal buffers.
-- **Internal SRAM is the scarce resource,** not PSRAM. The 168 KB input tile, weight-row buffers, bounce buffers and task stacks fight over ~320 KB. Task creation is checked: a failed `xTaskCreate` used to mean a silent hang.
-- **Verify the card.** One Mac card reader flipped 3, then 35, bytes while writing the 345 MB file. Remount and compare after copying, and the on-device CRCs catch anything else.
+- **Internal SRAM is the scarce resource,** not PSRAM. The 100 KB input tile (also attention's scratch), weight-row buffers, bounce buffers and task stacks fight over ~320 KB. Task creation is checked: a failed `xTaskCreate` used to mean a silent hang.
+- **Verify the card.** USB card readers have flipped bytes while writing the 345 MB file (3, then 35; another time 36, then 1). Copy through the Mac's built-in slot, remount and compare after copying, and the on-device CRCs catch anything else. A card that has got slow (a pass's "waiting on the card" well above ~60 s) is a card to retire.
 - **The original ESP32 (WROOM-32) is ~18× slower** with plain C (76 MMAC/s on two cores), and `MALLOC_CAP_INTERNAL` can hand back IRAM, which faults on byte access.
 
 ## Layout
@@ -82,6 +100,9 @@ Recalibrating the outliers on 300 real messages (`host/recal.py`) made the tail 
 | `host/emu_bin.py` | The device's arithmetic on the Mac, reading the weights back from `mxbai.bin` |
 | `host/tail.py` | Device-vs-Ollama cosine over the corpus: mean, minimum, low percentiles |
 | `host/recal.py` | Tries choosing the outlier channels on real messages, for several K |
+| `host/lean.py` | The whole-message layout (fp16 q/k/v, block-int8 FFN hidden) emulated, against the old one |
+| `host/gen_long.py` | Writes `firmware/full/main/longtest.h`: two long texts (391 and 512 tokens) with Ollama's and the emulation's vectors |
+| `host/selftest_crcs.py` | Reads a board's log and writes the known-good vector CRCs into `firmware/full/main/selftest.h` |
 | `host/serial_log.py` | Logs the board's serial output to a file without resetting it |
 | `host/corpus.py` | Samples real messages from local Claude Code transcripts for tokeniser testing (stays local) |
 | `firmware/full/` | The whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin` |
@@ -122,3 +143,5 @@ python -m esptool --chip esp32s3 -p /dev/cu.usbmodem1101 -b 460800 --after watch
  If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
 
 The SD pins are those of the ESP32-S3 CAM board's onboard slot (1-bit: CLK 39, CMD 38, D0 40). For a 4-bit breakout, see CHATS-6.
+
+\* As an Amazon Associate I earn from qualifying purchases.
