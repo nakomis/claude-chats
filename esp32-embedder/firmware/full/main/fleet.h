@@ -4,7 +4,7 @@
 // FLEET_STATUS_S, which keeps the board's lastSeen and status live in Fleet.
 //
 // Small on purpose (CHATS-4): a 2 KB receive buffer (Fleet sends at most 1.5 KB in one message and
-// chunks anything longer), a 512-byte send buffer, and mbedTLS in PSRAM. What it costs in internal
+// chunks anything longer), a 1.5 KB send buffer (the status heartbeat), and mbedTLS in PSRAM. What it costs in internal
 // RAM is printed (net_heap) once it's connected.
 #pragma once
 

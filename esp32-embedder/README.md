@@ -6,7 +6,7 @@ It works. On five test texts the S3's embeddings match Ollama's to a cosine simi
 
 Since CHATS-4 a pass holds a whole message (up to 512 tokens, Ollama's own limit), with Wi-Fi and TLS running alongside, and every result is checked bit for bit against known-good vectors.
 
-This is spike code (HOME-432 → CHATS-1): proven on the bench, not yet a service. The plan to turn it into an embedding worker that takes over from Cal is in Plane under **CHATS-1**.
+It started as spike code (HOME-432 → CHATS-1). Since CHATS-5 it is also a worker: it takes conversation-memory's jobs from SQS, embeds several in each pass, and hands each one to Cal with its vector (see [The worker](#the-worker)). That part is built and tested on the Mac, and still to be brought up on a board.
 
 The board is called **Kata**.
 
@@ -113,6 +113,9 @@ In numpy (`host/lean.py`) the leaner layout costs nothing measurable against the
 | `firmware/wroom-bench/` | int8 dot-product benchmark for the original ESP32 |
 | `tok/test_tok.c` | The tokeniser on a tiny made-up vocab: what CI can check without the real one |
 | `otacmd/` | Fleet's command parser, copied from tinycrypt with its host tests (`test_ota_cmd.py`) |
+| `worker/` | Kata the worker (CHATS-5), portable C: SigV4, the SQS client, the credentials provider, age decryption, the canonical text, the results message, the planner and the worker's state machine |
+| `test/` | Host tests of `worker/` and of the segmented attention (`make`; mbedTLS and cJSON from ESP-IDF's tree), with AWS's SigV4 test suite (`sigv4/`, Apache 2.0) and age's test kit (`age-testkit/`, C2SP CCTV) |
+| `host/convmem-wire/` | Track C's golden fixtures from home-infra `cal/convmem-wire` (TEST-ONLY keys): the contract with Cal |
 | `infra/` | CDK (pnpm): the boards as IoT Things, and the GitHub Actions roles that publish the firmware, plus `scripts/provision.sh` and `scripts/ota-signing-key.sh` |
 
 ## Running it
@@ -147,7 +150,7 @@ Both queues belong to home-infra's `ConversationMemoryIngestStack` (HOME-439), i
 
 ### Provisioning
 
-Nothing secret is in the build: every board runs the same image, so CI can publish it. What's particular to a board lives in its own `prov` partition (NVS, namespace `kata`), which the firmware reads at boot: the house Wi-Fi, the IoT endpoint, the Thing name, and the board's certificate and private key. Also the credentials-provider endpoint and role alias, and the board's age identity (NVS key `age_id`), which nothing reads until CHATS-5.
+Nothing secret is in the build: every board runs the same image, so CI can publish it. What's particular to a board lives in its own `prov` partition (NVS, namespace `kata`), which the firmware reads at boot: the house Wi-Fi, the IoT endpoint, the Thing name, and the board's certificate and private key. Also, for the worker (CHATS-5): the credentials-provider endpoint and role alias, the ingest and results queues' URLs (`queue_url`, `results_url`, from home-infra's `/conversation-memory/{env}/queue-url` and `results-queue-url`), and the board's age identity (`age_id`). Without any of them the board still runs, joins Fleet and self-tests, and says which is missing instead of starting the worker.
 
 Each board has its **own age key** for decrypting conversation-memory jobs, so a lost board can be revoked on its own. Make it before provisioning:
 
@@ -192,7 +195,7 @@ The partition table is tinycrypt's, with the room 16 MB allows: `nvs`, `phy_init
 
 Once it's provisioned, Kata is a device in Fleet (`nakomis-fleet`): it shows up there with its version and a status heartbeat, and its firmware is updated from there, not over USB. USB is for the first flash and for provisioning.
 
-**MQTT** (`main/fleet.c`, tinycrypt's `notifier.c`): TLS to IoT Core on port 8883, with Amazon Root CA 1 (`AmazonRootCA1.pem`, public) and the board's own certificate. On every connect, Kata sends `{"type":"version","version":…,"project":"kata"}`. Every minute it publishes a heartbeat on `kata/{thing}/status`, which keeps it live in Fleet. The heartbeat carries the state (`checking` during the self-test, `embedding`, `updating` or `idle`), the self-test's verdict, and the free internal RAM, its low-water mark and the free PSRAM.
+**MQTT** (`main/fleet.c`, tinycrypt's `notifier.c`): TLS to IoT Core on port 8883, with Amazon Root CA 1 (`AmazonRootCA1.pem`, public) and the board's own certificate. On every connect, Kata sends `{"type":"version","version":…,"project":"kata"}`. Every minute, and after each step of the worker, it publishes a heartbeat on `kata/{thing}/status`, which keeps it live in Fleet. It's **retained** (CHATS-5), so BD-1 can read a board's last status with IoT Core's `GetRetainedMessage` (HOME-441); the board policy allows `iot:RetainPublish` on that topic alone. The heartbeat carries the state (`checking` during the self-test, `embedding`, `updating` or `idle`), the self-test's verdict, uptime, the free internal RAM, its low-water mark and the free PSRAM, the chip's temperature (`temp_c`), the core voltage `vcore.c` applied (`vcore_mv`), the card's health and the worker's (see [The worker](#the-worker)).
 
 **Commands** are Fleet's ESP32 protocol, which mustn't change. Kata uses tinycrypt's parser (`otacmd/ota_cmd.c`, copied with its host tests) and answers `get_version`, `ping`, `ota_update`, `url_chunk` and `ota_cancel`. Anything else is refused: Kata takes no reboot, wipe or settings from the cloud.
 
@@ -226,6 +229,76 @@ To check rollback, build with `CONFIG_KATA_OTA_FAIL_SELFTEST` (menuconfig, "Kata
 
 **Not covered:** the 345 MB `mxbai.bin` on the SD card. A new model still means swapping the card.
 
+### The worker
+
+Kata takes over conversation-memory's embedding from Cal (CHATS-5). The design is in Plane (CHATS-5, 13 Oct): **custody hand-off through a results queue**. Kata receives a job from the ingest queue, embeds it, and sends a results message to a second queue. That message holds the original ingest body byte for byte (still age-encrypted, and still carrying the forwarder's signature), plus Kata's vector and tags. Only once SQS has accepted it does Kata delete the ingest job. Cal decrypts the envelope with its own key, stores the row with Kata's vector, commits, and only then deletes the result. **A job is always held by at least one queue until its row is committed.** Kata never sees Postgres, never touches S3 and never encrypts anything.
+
+The state machine is portable C in `worker/` (`worker.c`), tested on the Mac against a fake SQS. The board's side is `firmware/full/main/kata_worker.c`. It runs in `app_main`'s task once the self-test is done. Each step is a network phase, then at most one pass.
+
+**The network phase.** Internal RAM allows one TLS session at a time (CHATS-4; the spike measured 32.7 KB as the lowest free with Wi-Fi and one HTTPS session). So the phase works like this:
+1. MQTT steps aside: a clean DISCONNECT, then the client stops. The session is persistent (`clean_session=false`), so IoT Core keeps the subscription and queues QoS 1 commands until MQTT is back.
+2. A phase won't start with under 24 KB of internal RAM free.
+3. If the credentials expire within ten minutes, Kata fetches new ones from the IoT credentials provider. That's mTLS with the board's certificate and the role alias `kata-{env}`, about once an hour, and the connection is closed straight after.
+4. Kata opens one HTTPS session to `sqs.eu-west-2` and keeps it alive across the phase's requests (`worker/sqs.c`: SQS's JSON protocol, signed with SigV4, `worker/sigv4.c`).
+5. **Hand-off.** Kata sends the finished results with `SendMessageBatch`. A batch holds at most 10 messages and 256 KiB **in total**, so a result near the limit (an inline body can be up to 240,000 bytes) goes alone. Then it deletes, with `DeleteMessageBatch`, only the ingest jobs SQS accepted. A result SQS refused stays in the pool. Its job stays hidden (visibility extended), and no new pass starts until it's through.
+6. **Top-up.** `ReceiveMessage` (visibility 900 s; a 20 s long poll only when the pool is empty) runs while the pool holds fewer than 150 tokens and fits its PSRAM budget. Each job is sorted as it arrives:
+
+| The job | What Kata does |
+|---|---|
+| an S3 claim check | hands it to Cal unembedded, `claim-check` |
+| delivered for the third time or more | `retries`: it may be what crashed Kata |
+| arrives while Kata is sick | `kata-unhealthy`: Cal embeds it at once |
+| won't decrypt with this board's key, the uuids disagree, or it isn't a job | `decrypt-failed`: Cal decides. This includes jobs encrypted before the forwarder knew this board |
+| delivered for the second time | pooled, but embedded in a pass of its own |
+| anything else | decrypted (age, `worker/age.c`), made canonical, tokenised, pooled |
+| not an envelope at all | left alone: no result could carry it, so it reaches the ingest DLQ |
+
+7. Kata extends the visibility of any pooled job that could come back before the next phase, closes the session, and brings MQTT back.
+
+When the queue is empty, a cycle is a 20 s long poll followed by 40 s of MQTT.
+
+**The canonical text** (`worker/prep.c`) is what Cal embeds, exactly:
+1. Each NUL becomes the two characters `\0` (`sanitise_nuls`; Kata rewrites the `\u0000` escape in the job's JSON before parsing it).
+2. The text is cut to 800 characters (Unicode scalar values, not bytes; `ollama::truncate`).
+3. It's tokenised. Over 512 tokens it keeps `[CLS]` + the first 510 + `[SEP]`, as Ollama does.
+
+**The pass.** PR #21's planner (`worker/batch.c`) takes the oldest job and fills the pass up to about 150 tokens, the point where the card stops being the bottleneck. A job on its second delivery goes alone. The pass carries the messages as segments: positions restart in each, and attention stays within each (PR #21's segmented kernels). So every message gets the same bits it would in a pass of its own (`test/test_att.c`). A pass must come back clean:
+- **A section CRC mismatch aborts it.** None of its vectors are delivered, and its jobs go to Cal as `kata-unhealthy` (cheap cards, replaced when they die: CHATS-5's card policy).
+- A non-finite vector, or a raw norm outside Cal's 10–30 band (real `[CLS]` rows measure 15–19), makes it bad too.
+- Vectors go **raw**, never normalised: Cal normalises them, and raw bits can be compared between boards.
+
+**Sick.** Three bad passes in a row make Kata sick. So does a failed boot self-test: a board whose self-test failed outside probation still works the queue, sick. A sick Kata hands every job to Cal straight away (Martin, 13 Oct), so nothing waits for the 36 h overflow. Every 30 minutes it runs a health check: the five short self-test texts in one batched pass, bit for bit against `selftest.h`. When that passes, it's well again.
+
+**Updates.** An `ota_update` parks the worker first. The worker hands off what it has finished and gives the rest back to the queue (visibility 0), so no job is held through an update (CHATS-10's criterion 4). If the update fails, the worker carries on.
+
+**A watchdog** restarts a worker that hasn't stepped for 15 minutes. Nothing is lost: a job is only deleted once its result is on the results queue.
+
+**The results message** is `convmem_wire::KataResult` v1 (home-infra `cal/convmem-wire`): `kind`, `message_uuid`, the `envelope` spliced in verbatim, `embedder`, `vector` (base64 of 1024 little-endian f32), `tokens`, `truncated_chars`, `reason`, `board` (the Thing name) and `fw` (the firmware version), plus `pass` and `ingest` for the logs. Cal stores `embedder`, `board` and `fw` with the row.
+
+**The embedder tag** is `EMBEDDER_TAG` in `selftest.h`, `esp32s3-mxbai-int8-v1`. Its `-vN` goes up exactly when the self-test's CRC table does, which is when the kernels' arithmetic changes. `test/test_tag.c` pins the table's CRC to the tag, so CI fails if the table changes and the tag doesn't. Cal accepts `esp32s3-mxbai-int8*`.
+
+**Status** (HOME-441), in every heartbeat:
+
+| Field | What |
+|---|---|
+| `version`, `uptime_s`, `selftest` | firmware, seconds since boot, the self-test's verdict |
+| `card` | `wait_last_s` and `wait_median_s` (the last 15 passes) waiting on the card, `crc_mismatches` and `read_retries` since boot. A healthy card waits about 60 s on the 1-bit slot. A slow card wait means the card *or the board*: swap the card first |
+| `worker` | `state` (`idle`, `receiving`, `embedding`, `handing-off`, `checking`, `sick`, `parked`), `sick`, `embedder`, `pool`, `passes` and `messages` (`boot`, `today`), `unembedded` (by reason), `bad_passes`, `last_pass` (`n_seg`, `tokens`, `ms`, `card_wait_ms`, `at`), `last_handoff_at`, `last_error` |
+| `internal_lowest`, `temp_c`, `vcore_mv` | internal RAM's low point since boot, the chip's temperature, the core voltage applied |
+
+**Memory, expected** (to be measured on a board; the heartbeat and the phase's `net_heap` lines report it):
+- Static internal RAM is DIRAM 105.8 KB, up 1.2 KB on the Fleet build.
+- During an SQS phase MQTT is down, which frees its task stack (6 KB) and its TLS session. The phase adds the HTTP client's 2 KB receive and 3 KB transmit buffers and a socket; mbedTLS is in PSRAM.
+- So the low point should sit near the Fleet build's figure with MQTT up (~34 KB), and no lower than the spike's 32.7 KB. That's 8 KB or more above the 24 KB floor the worker checks.
+- Bodies, results, ids, responses and parsed JSON all live in PSRAM. The pool's budget is a third of the PSRAM free after loading less 384 KB, capped at 1 MB. A receive asks for at most budget ÷ 256 KiB messages.
+
+**Bring-up** on a sandbox board, in order:
+1. Deploy home-infra #356 (the results queue and its SSM parameters) to sandbox, then this repo's `ClaudeChatsKataDeviceStack` (`pnpm run deploy-sandbox`). The board policy's new `iot:RetainPublish` **must be live before the firmware**, or IoT Core drops a board that publishes a retained status.
+2. `infra/scripts/age-identity.sh blue`, then `infra/scripts/provision.sh blue`. Check it doesn't warn about missing queues.
+3. `firmware/full/build.sh`, then `flash.sh` with the board's prov.
+4. Watch the boot log: the self-test, then `worker: starting as kata-sandbox-blue, tag esp32s3-mxbai-int8-v1; pool budget …`, the first phase's `heap worker: after an SQS phase` line, and `fleet: connected` after each phase.
+5. Send a test job, encrypted to the board's key and Cal's, to the sandbox ingest queue. Check its result on the results queue: `kind: embedded`, and a vector within cos 0.999 of Ollama's for the same text. Then soak it, and compare bit for bit with a spare board.
+
 ### Versioning
 
 `firmware/full/version.txt` (`x.y.z`, starting at 0.1.0) labels local builds; ESP-IDF puts it in the app descriptor, and the firmware prints it at boot. It's only a seed. In CI the version comes from the shared deployment tracker (project `kata`): one patch past sandbox's latest, or a minor or major bump with `--bump-minor` or `--bump-major` alone on a line in the PR description. A version already in the bucket is never reused; CI steps past it.
@@ -236,6 +309,7 @@ To check rollback, build with `CONFIG_KATA_OTA_FAIL_SELFTEST` (menuconfig, "Kata
 
 - the tokeniser's host test (`tok/test_tok.c`, under ASan and UBSan)
 - Fleet's command parser: tinycrypt's tests against the copy in `otacmd/` (with cJSON, under ASan and UBSan)
+- the worker (`test/`, in the `espressif/idf:v5.4.4` image so mbedTLS and cJSON are the firmware's own): SigV4 against AWS's test suite, age against its test kit and track C's fixtures, the SQS and credentials clients and the worker against fakes, the results message against the fixtures, the embedder tag's pin, and PR #21's planner and segmented attention, under ASan, UBSan and LeakSanitizer
 - the firmware, built in `espressif/idf:v5.4.4`, with the image checks from `tools/image-checks.sh`: the right version, rollback and signed updates on, no rollback test build, and no per-board strings (no `kata-{env}-` name, no IoT endpoint, and in sandbox, not the Wi-Fi SSID)
 - the CDK type-checked and synthesised for both environments
 - `CI Status`, the one check to require

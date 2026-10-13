@@ -266,6 +266,20 @@ static void happy_path(void)
     CHECK(st && cJSON_GetObjectItem(st, "last_pass") && cJSON_GetObjectItem(cJSON_GetObjectItem(st, "passes"), "today"),
           "status: %s", s.p);
     CHECK(st && (int)cJSON_GetNumberValue(cJSON_GetObjectItem(cJSON_GetObjectItem(st, "messages"), "boot")) == 5, "status messages");
+    // The heartbeat's MQTT buffer is 1.5 KB (fleet.c), shared with ~450 bytes of board fields: the
+    // worker's object, at its fullest (every reason counted, sick, a long error), must stay well under.
+    for (int i = 0; i < 5; i++) w.boot.unembedded[i] = 99999;
+    w.sick = true;
+    w.sick_since = 1791914400;
+    memset(w.last_error, 'e', sizeof w.last_error - 1);
+    w.last_handoff_at = 1791914400;
+    jb_reset(&s);
+    worker_status_json(&w, &s);
+    printf("    the worker's status object, at its fullest: %zu bytes\n", s.n);
+    cJSON *full = cJSON_Parse(s.p);
+    CHECK(s.n < 900 && full != NULL, "status too big: %zu", s.n);
+    cJSON_Delete(full);
+    w.sick = false;
     cJSON_Delete(st);
     jb_free(&s);
     uint32_t last, med;
