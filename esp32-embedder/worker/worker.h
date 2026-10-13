@@ -26,7 +26,8 @@
 //     3. extend the visibility of pooled jobs that could expire before the next phase
 //   pass (MQTT up)
 //     the planner (batch.h) picks the oldest job and fills the pass up to the target; the pass
-//     (io->embed) must come back clean: no section CRC mismatch, every vector finite and non-zero.
+//     (io->embed) must come back clean: no section CRC mismatch, every vector finite with a raw norm in
+//     Cal's band (10-30). Vectors go raw, never normalised: Cal normalises, and boards compare bit for bit.
 //     A bad pass delivers no vectors: its jobs go to Cal as "kata-unhealthy". Three bad passes in
 //     a row and Kata is sick: everything goes to Cal straight away (Martin, 13 Oct) until a health
 //     check (io->health, every 30 minutes) passes.
@@ -57,6 +58,8 @@
 #define WORKER_RETRIES_RECEIVE 3         // from its third, it goes to Cal unembedded
 #define WORKER_WORST_BODY 262144         // a receive's worst case per message
 #define WORKER_CARD_HISTORY 15           // passes in the card-wait median
+#define WORKER_NORM_MIN 10.0             // a raw [CLS] vector's norm, as Cal checks it (results.rs)
+#define WORKER_NORM_MAX 30.0
 
 typedef struct {
     uint32_t ms;                         // the pass, end to end

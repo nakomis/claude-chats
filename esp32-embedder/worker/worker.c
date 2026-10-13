@@ -377,6 +377,8 @@ static int backoff(worker_t *w)
 }
 
 // ---- the pass -----------------------------------------------------------------------------
+// Finite, and a raw norm in Cal's band (results.rs: real mxbai [CLS] rows measure 15.1-19.1).
+// Outside it Cal would refuse the vector into the results DLQ; as a bad pass, Cal embeds the jobs.
 static bool vector_ok(const float *v)
 {
     double ss = 0;
@@ -384,7 +386,7 @@ static bool vector_ok(const float *v)
         if (!isfinite(v[i])) return false;
         ss += (double)v[i] * v[i];
     }
-    return ss > 0;
+    return ss >= WORKER_NORM_MIN * WORKER_NORM_MIN && ss <= WORKER_NORM_MAX * WORKER_NORM_MAX;
 }
 
 static void go_sick(worker_t *w)
@@ -425,7 +427,7 @@ static void pass(worker_t *w)
     worker_pass_info_t info = { 0 };
     int rc = w->io.embed(w->io.ctx, ids, seg, np, vecs, &info);
     for (int k = 0; !rc && k < np; k++)
-        if (!vector_ok(vecs + (size_t)k * RESULT_DIMS)) { rc = -1; info.why = "a vector isn't finite, or is zero"; }
+        if (!vector_ok(vecs + (size_t)k * RESULT_DIMS)) { rc = -1; info.why = "a vector isn't finite, or its norm is outside 10-30"; }
     w->last_pass.n_seg = np;
     w->last_pass.tokens = tokens;
     w->last_pass.ms = info.ms;
@@ -544,9 +546,9 @@ void worker_card_wait(const worker_t *w, uint32_t *last_ms, uint32_t *median_ms)
     *median_ms = !n ? 0 : n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
+// From another task (the heartbeat): reads only, so a count may be one step stale.
 void worker_status_json(worker_t *w, jbuf_t *b)
 {
-    roll_today(w);
     int ub = 0, ut = 0;
     for (int i = 0; i < 5; i++) { ub += w->boot.unembedded[i]; ut += w->today.unembedded[i]; }
     jb_printf(b, "{\"state\":\"%s\",\"sick\":%s,\"embedder\":", w->state, w->sick ? "true" : "false");
@@ -569,7 +571,7 @@ void worker_status_json(worker_t *w, jbuf_t *b)
     if (w->sick) jb_printf(b, ",\"sick_since\":%lld", (long long)w->sick_since);
     if (w->last_error[0]) {
         jb_puts(b, ",\"last_error\":");
-        jb_json_str(b, w->last_error, strlen(w->last_error));
+        jb_json_str(b, w->last_error, strnlen(w->last_error, sizeof w->last_error - 1));   // racy reads stay bounded
     }
     jb_putc(b, '}');
 }

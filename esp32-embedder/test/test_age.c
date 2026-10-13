@@ -163,6 +163,11 @@ static void fixtures(void)
     CHECK(age_identity_parse("AGE-SECRET-KEY-1QYPQXPQ9QCRSSZG2PVXQ6RS0ZQG3YYC5Z5TPWXQERGD3C8G7RUSQGPQYEF", &id) == -1, "bad checksum");
     CHECK(age_identity_parse("age-secret-key-1QYPQXPQ9QCRSSZG2PVXQ6RS0ZQG3YYC5Z5TPWXQERGD3C8G7RUSQGPQYEE", &id) == -1, "mixed case");
     CHECK(age_identity_parse("AGE-SECRET-KEY-1", &id) == -1, "empty");
+    // and ciphertext.age, the same file raw
+    size_t raw_len;
+    uint8_t *raw = (uint8_t *)read_file_or_die("../../host/convmem-wire/ciphertext.age", &raw_len);
+    CHECK(raw_len == (size_t)n && !memcmp(raw, ct, raw_len), "ciphertext.age is the envelope's ciphertext");
+    free(raw);
     free(ct);
     free(job);
     cJSON_Delete(env);
