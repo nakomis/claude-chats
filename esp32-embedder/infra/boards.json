@@ -1,4 +1,4 @@
 {
   "sandbox": ["blue", "green", "red"],
-  "prod": []
+  "prod": ["green"]
 }
