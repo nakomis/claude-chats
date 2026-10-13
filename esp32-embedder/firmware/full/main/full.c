@@ -24,6 +24,7 @@
 #include "mxcrc.h"
 #include "tok.h"
 #include "net.h"
+#include "batch.h"
 #include "driver/temperature_sensor.h"
 #include "longtest.h"
 
@@ -431,17 +432,40 @@ static void pass_fwd(void)
     }
 }
 
-// token + position + type embeddings, then layernorm
+// CHATS-5: the pass's segments, from the token counts of the messages packed into ids
+static int set_segs(const int *len, int n)
+{
+    if (n < 1 || n > MAXSEG) return -1;
+    int t = 0;
+    for (int s = 0; s < n; s++) {
+        if (len[s] < 1 || t + len[s] > MAXTOK) return -1;
+        seg0[s] = t; t += len[s];
+    }
+    seg0[n] = t;
+    n_seg = n; n_tok = t;
+    return 0;
+}
+
+static void one_seg(int n) { set_segs(&n, 1); }
+
+// segment s's embedding: its [CLS] row, once the pass is done
+static const float *seg_vec(int s) { return x + (size_t)seg0[s] * D; }
+
+// token + position + type embeddings, then layernorm; positions restart at 0 in every segment
 static void embed_in(const uint32_t *ids)
 {
     int8_t row[D];
     float *pos = (float *)arena;             // the arena is free here
-    sd_read(pos, goff[2], (size_t)n_tok * D * 4, 0);
-    for (int t = 0; t < n_tok; t++) {
-        sd_read(row, goff[0] + ids[t] * D, D, 0);
-        float s = tok_s[ids[t]], *r = x + (size_t)t * D;
-        for (int j = 0; j < D; j++) r[j] = row[j] * s + pos[(size_t)t * D + j] + type0[j];
-    }
+    int np = 0;
+    for (int s = 0; s < n_seg; s++) np = seg0[s + 1] - seg0[s] > np ? seg0[s + 1] - seg0[s] : np;
+    sd_read(pos, goff[2], (size_t)np * D * 4, 0);
+    for (int s = 0; s < n_seg; s++)
+        for (int t = seg0[s]; t < seg0[s + 1]; t++) {
+            sd_read(row, goff[0] + ids[t] * D, D, 0);
+            float sc = tok_s[ids[t]], *r = x + (size_t)t * D;
+            const float *p = pos + (size_t)(t - seg0[s]) * D;
+            for (int j = 0; j < D; j++) r[j] = row[j] * sc + p[j] + type0[j];
+        }
     layernorm(x, en_w, en_b);
 }
 
@@ -505,9 +529,10 @@ void app_main(void)
     hdr = ps(1024);
     ltab = ps(24 * sizeof *ltab);
     units = ps(MAXUNITS * sizeof *units);
+    seg0 = ps((MAXSEG + 1) * sizeof *seg0);
     uint32_t *want = ps(512 * 4);
     int32_t *ids = ps(512 * 4);
-    if (!hdr || !ltab || !units || !want || !ids) { printf("alloc failed (tables)\n"); return; }
+    if (!hdr || !ltab || !units || !seg0 || !want || !ids) { printf("alloc failed (tables)\n"); return; }
     sd_read(hdr, 0, 1024, 0);
     if (memcmp(hdr, "MXB1", 4)) { printf("bad magic\n"); return; }
     n_layer = hdr[2]; K = hdr[3]; n_vocab = hdr[4];
@@ -557,8 +582,11 @@ void app_main(void)
     uint32_t th[3];
     fread(th, 4, 3, ft);
     if (memcmp(th, "MXT1", 4)) { printf("bad test magic\n"); return; }
-    int tok_bad = 0;
+    int tok_bad = 0, batch_bad = 0;
     float *ref0 = ps(D * 4);                  // test 0's Ollama vector, for the Wi-Fi check at the end
+    float *dev = ps(N_TEXTS * D * 4), *refs = ps(N_TEXTS * D * 4);   // each text's vector from a pass of its own
+    int have[N_TEXTS] = { 0 };
+    if (!dev || !refs) { printf("alloc failed (test vectors)\n"); return; }
 #ifdef EXPT
     for (int ti = 0; ti < 1; ti++) {
 #else
@@ -588,7 +616,7 @@ void app_main(void)
         }
         if (!same) { heap_caps_free(emu); heap_caps_free(ref); continue; }   // emu and ref belong to mxtest.bin's ids
         if (n > MAXTOK) { printf("test %d: %lu tokens > %d, skipped\n", ti, (unsigned long)n, MAXTOK); heap_caps_free(emu); heap_caps_free(ref); continue; }
-        n_tok = n;
+        one_seg(n);
         t_sd = t_att = t_quant = t_stall = 0;
         cyc_cp[0] = cyc_cp[1] = cyc_pie[0] = cyc_pie[1] = 0;
         int64_t t0 = esp_timer_get_time();
@@ -603,8 +631,52 @@ void app_main(void)
                ti, n_tok, cosv(x, emu, D), cosv(x, ref, D), total / 1e6, t_sd / 1e6, t_stall / 1e6,
                t_att / 1e6, t_quant / 1e6, crc_bad ? "  CRC ERRORS" : "");
         if (ti == 0) memcpy(ref0, ref, D * 4);
+        memcpy(dev + (size_t)ti * D, seg_vec(0), D * 4);
+        memcpy(refs + (size_t)ti * D, ref, D * 4);
+        have[ti] = 1;
         heap_caps_free(emu); heap_caps_free(ref);
     }
+#ifndef EXPT
+    // CHATS-5: the same texts again, packed several to a pass by the planner. Each must come out bit
+    // for bit as it did in a pass of its own.
+    int32_t *qids = ps((size_t)N_TEXTS * MAXTOK * 4);
+    int qn = 0, q[N_TEXTS], qlen[N_TEXTS], pick[N_TEXTS], len[N_TEXTS];
+    for (int ti = 0; ti < N_TEXTS && qids; ti++)
+        if (have[ti]) {
+            qlen[qn] = tok_encode(&vocab, TEXTS[ti], strlen(TEXTS[ti]), qids + (size_t)ti * MAXTOK, MAXTOK, NULL);
+            q[qn++] = ti;
+        }
+    while (qn) {
+        int np = batch_plan(qlen, qn, MAXTOK, MAXTOK, pick), nt = 0;
+        for (int i = 0; i < np; i++) {
+            memcpy(ids + nt, qids + (size_t)q[pick[i]] * MAXTOK, qlen[pick[i]] * 4);
+            nt += len[i] = qlen[pick[i]];
+        }
+        set_segs(len, np);
+        t_sd = t_att = t_quant = t_stall = 0;
+        int64_t t0 = esp_timer_get_time();
+        embed_in((const uint32_t *)ids);
+        pass_fwd();
+        printf("batch: %d messages, %d tokens in one pass: %.1f s, stalled %.1f s (attention %.1f)\n", np, n_tok,
+               (esp_timer_get_time() - t0) / 1e6, t_stall / 1e6, t_att / 1e6);
+        for (int i = 0; i < np; i++) {
+            int ti = q[pick[i]], same = !memcmp(seg_vec(i), dev + (size_t)ti * D, D * 4);
+            batch_bad += !same;
+            printf("  test %d: %3d tokens  cos vs Ollama %.6f  %s its own pass\n", ti, len[i],
+                   cosv(seg_vec(i), refs + (size_t)ti * D, D), same ? "bit for bit as in" : "DIFFERENT FROM");
+        }
+        int k = 0;                            // the rest stay queued, in order
+        for (int i = 0, p = 0; i < qn; i++) {
+            if (p < np && pick[p] == i) { p++; continue; }
+            q[k] = q[i]; qlen[k] = qlen[i]; k++;
+        }
+        qn = k;
+    }
+    heap_caps_free(qids);
+#else
+    (void)have;                               // no batch test while the EXPT runs
+#endif
+
     // CHATS-4: whole long messages in one pass (references from host/gen_long.py)
 #ifdef EXPT
     temperature_sensor_handle_t tsens;
@@ -630,7 +702,7 @@ void app_main(void)
 #endif
         int nt = tok_encode(&vocab, LONG[li].text, strlen(LONG[li].text), ids, MAXTOK, NULL);
         if (nt != LONG[li].n_tok) { printf("long %d: %d tokens, host says %d\n", li, nt, LONG[li].n_tok); tok_bad++; continue; }
-        n_tok = nt;
+        one_seg(nt);
         t_sd = t_att = t_quant = t_stall = 0;
         int64_t t0 = esp_timer_get_time();
         embed_in((const uint32_t *)ids);
@@ -657,7 +729,7 @@ void app_main(void)
         net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         net_heap("after https");
         for (int r = 0; r < 3; r++) {             // with Wi-Fi up, a corrupted pass shows as cos well below 0.999
-            n_tok = tok_encode(&vocab, TEXTS[0], strlen(TEXTS[0]), ids, MAXTOK, NULL);
+            one_seg(tok_encode(&vocab, TEXTS[0], strlen(TEXTS[0]), ids, MAXTOK, NULL));
             embed_in((const uint32_t *)ids);
             pass_fwd();
             printf("wifi up, pass %d: test 0 cos vs Ollama %.6f\n", r, cosv(x, ref0, D));
@@ -666,5 +738,5 @@ void app_main(void)
         net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         net_heap("end");
     }
-    printf("== done (%d CRC mismatches, %d tokeniser mismatches) ==\n", crc_bad, tok_bad);
+    printf("== done (%d CRC mismatches, %d tokeniser mismatches, %d batch mismatches) ==\n", crc_bad, tok_bad, batch_bad);
 }
