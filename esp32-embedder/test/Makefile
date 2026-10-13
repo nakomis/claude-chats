@@ -31,7 +31,7 @@ $(B)/mbedtls/%.o: $(MBEDTLS)/library/%.c | $(B)
 	@mkdir -p $(B)/mbedtls
 	@$(CC) -O2 -std=gnu11 -I$(MBEDTLS)/include -I$(MBEDTLS)/library -c $< -o $@
 $(B)/libmbedcrypto.a: $(MBED_OBJS)
-	ar rcs $@ $^
+	@ar rcs $@ $^
 $(B)/cjson.o: $(CJSON)/cJSON.c | $(B)
 	$(CC) -O2 -std=gnu11 -c $< -o $@
 
@@ -39,8 +39,8 @@ WORKER := $(wildcard $(W)/*.c)
 HDRS := $(wildcard $(W)/*.h) testutil.h
 LIBS := $(B)/libmbedcrypto.a $(B)/cjson.o
 
-$(B)/test_%: test_%.c $(WORKER) $(HDRS) $(LIBS) ../tok/tok.h | $(B)
-	$(CC) $(CFLAGS) $(INC) -I../tok -o $@ $< $(WORKER) $(LIBS) $(LDLIBS)
+$(B)/test_%: test_%.c fake_sqs.c fake_sqs.h $(WORKER) $(HDRS) $(LIBS) ../tok/tok.h | $(B)
+	$(CC) $(CFLAGS) $(INC) -I../tok -o $@ $< fake_sqs.c $(WORKER) $(LIBS) $(LDLIBS)
 
 # the selftest.h tag pin (embedder tag vs CRC table)
 $(B)/test_tag: test_tag.c $(FW)/selftest.h | $(B)
