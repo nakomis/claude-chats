@@ -61,6 +61,10 @@ bool prov_load(prov_t *prov)
     }
     get_fixed(h, "cred_ep", prov->cred_endpoint, sizeof prov->cred_endpoint, true);
     get_fixed(h, "role_alias", prov->role_alias, sizeof prov->role_alias, true);
+    get_fixed(h, "queue_url", prov->queue_url, sizeof prov->queue_url, true);
+    get_fixed(h, "results_url", prov->results_url, sizeof prov->results_url, true);
+    size_t age_len = 0;
+    if (nvs_get_str(h, "age_id", NULL, &age_len) == ESP_OK) prov->age_id = get_alloc(h, "age_id");
     nvs_close(h);
     if (!id) {
         heap_caps_free(prov->device_cert);

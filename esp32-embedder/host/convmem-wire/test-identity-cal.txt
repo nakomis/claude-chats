@@ -1,0 +1,5 @@
+# TEST ONLY: the Cal identity for the convmem-wire golden fixtures (HOME-440).
+# Committed on purpose so the fixtures can be decrypted in tests on both
+# sides (Rust here, C in claude-chats esp32-embedder/host). Never a real key.
+# public key: age148ulf6pefhu5ggmkgw6w60hzxc5za262ytmuz3rs6y3fp9rvre5scr6f0q
+AGE-SECRET-KEY-1CPPYCGE62JKWU9YQKMQZ4ZZATLXSFC07ZMURLHA87HU8C3XCCWSSVL7A9N

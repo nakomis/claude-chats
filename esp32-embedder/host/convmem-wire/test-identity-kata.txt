@@ -1,0 +1,5 @@
+# TEST ONLY: the Kata identity for the convmem-wire golden fixtures (HOME-440).
+# Committed on purpose so the fixtures can be decrypted in tests on both
+# sides (Rust here, C in claude-chats esp32-embedder/host). Never a real key.
+# public key: age1ewwhhspcnvu4364200mx5culxj8assgsa5sq2h80f4e5uz6dky0qdkkdpq
+AGE-SECRET-KEY-15TCW69QPNATJCY4C486AAMZPV85D69TCU6U4GPQWLUR036LM8Q0QHRDWUW

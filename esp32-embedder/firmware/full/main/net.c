@@ -3,12 +3,14 @@
 // never the build. The station reconnects by itself; MQTT (fleet.c) rides on it.
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -64,6 +66,9 @@ int net_up(const prov_t *prov, int timeout_ms)
         return -1;
     }
     printf("wifi: up in %.1f s\n", (esp_timer_get_time() - t) / 1e6);
+    // CHATS-5: SigV4 needs the time. SNTP keeps it from here on; net_time_ok says when it's set.
+    esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    if (esp_netif_sntp_init(&sntp) != ESP_OK) printf("sntp: didn't start: the worker can't sign requests\n");
     return 0;
 }
 
@@ -81,3 +86,10 @@ int net_https_check(const char *url)
     return status;
 }
 
+
+bool net_time_ok(int wait_ms)
+{
+    if (time(NULL) > 1700000000) return true;   // set already (late 2023 is "set")
+    if (wait_ms > 0) esp_netif_sntp_sync_wait(pdMS_TO_TICKS(wait_ms));
+    return time(NULL) > 1700000000;
+}

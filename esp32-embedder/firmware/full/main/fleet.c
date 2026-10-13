@@ -11,12 +11,17 @@
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "mqtt_client.h"
+
+#include "kw.h"
 
 extern const char root_ca_start[] asm("_binary_AmazonRootCA1_pem_start");
 
 #define MQTT_BUFFER_SIZE 2048     // in: one Fleet command (<= 1.5 KB, longer URLs come in chunks)
-#define MQTT_OUT_BUFFER_SIZE 512  // out: our messages are a few hundred bytes at most
+#define MQTT_OUT_BUFFER_SIZE 1536 // out: the status heartbeat (CHATS-5) is about 1 KB; the rest are smaller
 
 static const prov_t *prov;
 static char commands_topic[sizeof prov->thing_name + 16];
@@ -28,25 +33,61 @@ static int subscribe_msg_id = -1;
 static const char *volatile selftest = "not run";
 static esp_timer_handle_t status_timer;
 static bool heap_logged;
+static volatile bool paused;
+static SemaphoreHandle_t status_mx;      // the heartbeat runs from the esp_timer task and the worker's
+static void (*status_extra)(jbuf_t *);
 
 void fleet_set_selftest(const char *verdict) { selftest = verdict; }
+void fleet_set_status_extra(void (*extra)(jbuf_t *out)) { status_extra = extra; }
 
-// The heartbeat (esp_timer task): what Fleet shows as the board's status.
+// The heartbeat (esp_timer task): what Fleet shows as the board's status, and (CHATS-5, HOME-441)
+// what BD-1 reads: retained, so IoT Core's GetRetainedMessage has the latest between heartbeats.
+// The worker adds its own fields (status_extra: card health, passes, sick, temperature, voltage).
 static void send_status(void *arg)
 {
     (void)arg;
-    if (!connected) return;
-    static char msg[320];
-    snprintf(msg, sizeof msg,
-             "{\"type\":\"status\",\"version\":\"%s\",\"state\":\"%s\",\"selftest\":\"%s\",\"uptime_s\":%lld,"
-             "\"internal_free\":%u,\"internal_largest\":%u,\"internal_lowest\":%u,\"psram_free\":%u}",
-             esp_app_get_description()->version, model_state(), selftest, (long long)(esp_timer_get_time() / 1000000),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    esp_mqtt_client_enqueue(mqtt, status_topic, msg, 0, 0, 0, true);   // QoS 0: the next one is a minute away
+    if (!connected || paused || !status_mx || xSemaphoreTake(status_mx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+    jbuf_t b;                                 // PSRAM (kw.h)
+    jb_init(&b);
+    jb_printf(&b, "{\"type\":\"status\",\"version\":\"%s\",\"state\":\"%s\",\"selftest\":\"%s\",\"uptime_s\":%lld,"
+                  "\"internal_free\":%u,\"internal_largest\":%u,\"internal_lowest\":%u,\"psram_free\":%u",
+              esp_app_get_description()->version, model_state(), selftest, (long long)(esp_timer_get_time() / 1000000),
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    if (status_extra) status_extra(&b);
+    jb_putc(&b, '}');
+    if (b.oom) printf("fleet: out of memory for the status\n");
+    else if (b.n > MQTT_OUT_BUFFER_SIZE - 64) printf("fleet: status of %u bytes is too big for the buffer: not sent\n", (unsigned)b.n);
+    // QoS 0, retained: the next one is a minute away, and the latest is what's kept
+    else esp_mqtt_client_enqueue(mqtt, status_topic, b.p, (int)b.n, 0, 1, true);
+    jb_free(&b);
+    xSemaphoreGive(status_mx);
 }
+
+void fleet_status_now(void) { send_status(NULL); }
+
+// CHATS-5: one TLS session at a time (CHATS-4). MQTT steps aside for the worker's SQS phase: a clean
+// DISCONNECT, then the client stops (its task and TLS session go). The session is persistent, so
+// IoT Core keeps the subscription and queues QoS 1 commands until it's back.
+void fleet_pause(void)
+{
+    if (!mqtt || paused) return;
+    paused = true;
+    if (connected) esp_mqtt_client_disconnect(mqtt);
+    esp_mqtt_client_stop(mqtt);
+    connected = false;
+}
+
+void fleet_resume(void)
+{
+    if (!mqtt || !paused) return;
+    paused = false;
+    if (esp_mqtt_client_start(mqtt) != ESP_OK) printf("fleet: MQTT didn't restart\n");
+}
+
+bool fleet_connected(void) { return connected; }
 
 static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -56,7 +97,8 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         connected = true;
         printf("fleet: connected to IoT Core as %s\n", prov->thing_name);
         if (!heap_logged) { net_heap("mqtt connected"); heap_logged = true; }
-        // A clean session each time, so subscribe on every connect.
+        // Subscribe on every connect: a persistent session usually has it already, but not always
+        // (the first connect, or IoT Core expired the session).
         subscribe_msg_id = esp_mqtt_client_subscribe(mqtt, commands_topic, 1);
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -102,6 +144,7 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 bool fleet_start(const prov_t *p)
 {
     prov = p;
+    status_mx = xSemaphoreCreateMutex();
     if (!prov->has_identity) {
         printf("fleet: no IoT identity in prov: not connecting (run infra/scripts/provision.sh)\n");
         return false;
@@ -122,6 +165,7 @@ bool fleet_start(const prov_t *p)
             .authentication = { .certificate = prov->device_cert, .key = prov->device_key },
         },
         .session.keepalive = 60,
+        .session.disable_clean_session = true,    // CHATS-5: commands queue while the worker has the network
         .network.reconnect_timeout_ms = 5000,
         .buffer = { .size = MQTT_BUFFER_SIZE, .out_size = MQTT_OUT_BUFFER_SIZE },
     };

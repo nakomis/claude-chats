@@ -1,0 +1,1 @@
+{"v":1,"message_uuid":"3f1c2b8e-5d4a-4e7f-9a01-6b2c8d9e0f12","s3":{"bucket":"conversation-memory-payloads-prod","key":"payloads/3f1c2b8e-5d4a-4e7f-9a01-6b2c8d9e0f12"},"sig_key":"fixture-mac","sig":"mS4r2WLyETEESdtrJ/vdba5xv2l84HRDHsEuvgYC9Dx3Ev8EXBHVd32WA74jcvg+kJCgEaljgoCAntnRbFwpDQ=="}

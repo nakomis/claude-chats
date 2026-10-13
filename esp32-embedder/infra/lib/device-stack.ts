@@ -99,6 +99,14 @@ export class DeviceStack extends cdk.Stack {
                         Resource: [arn(`topic/${own('responses')}`), arn(`topic/${own('status')}`)],
                     },
                     {
+                        // CHATS-5 / HOME-441: the status heartbeat is retained, so BD-1 can read a
+                        // board's last status (GetRetainedMessage) between heartbeats. Without this,
+                        // IoT Core drops the connection of a client that publishes with retain.
+                        Effect: 'Allow',
+                        Action: 'iot:RetainPublish',
+                        Resource: arn(`topic/${own('status')}`),
+                    },
+                    {
                         Effect: 'Allow',
                         Action: 'iot:Subscribe',
                         Resource: arn(`topicfilter/${own('commands')}`),

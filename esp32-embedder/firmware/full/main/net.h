@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "prov.h"
 
 // Bring Wi-Fi up as a station with the provisioned credentials (prov.h); 0 once there's an IP,
@@ -9,3 +11,5 @@ int net_up(const prov_t *prov, int timeout_ms);
 int net_https_check(const char *url);
 // Print internal (free, largest block, lowest ever) and PSRAM free.
 void net_heap(const char *when);
+// CHATS-5: has SNTP set the clock (waiting up to wait_ms for it)? SigV4 signs with the time.
+bool net_time_ok(int wait_ms);

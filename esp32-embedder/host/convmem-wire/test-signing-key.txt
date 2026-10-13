@@ -1,0 +1,6 @@
+# TEST ONLY: the forwarder signing key for the convmem-wire golden fixtures
+# (HOME-440). Key id "fixture-mac". Line 1 below: private seed, base64;
+# line 2: public key, base64 (what /conversation-memory/<env>/forwarder-signing-keys/<id>
+# holds). Never a real key.
+CzBVep/E6Q4zWH2ix+wRNluApcrvFDleg6jN8hc8YYY=
+JMOklPoimWJmRLllqRMtp5z+ZxUf3ELeYAzwkJfbgkc=
