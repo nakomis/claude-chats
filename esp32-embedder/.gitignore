@@ -12,3 +12,5 @@ host/corpus.json
 host/corpus_ids.json
 # built by host/tok.py
 tok/libtok.so
+host/tail.npz
+host/recal.npz

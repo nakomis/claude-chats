@@ -48,6 +48,16 @@ The Unicode tables (`tok_tables.h`, ~36 KB of flash) are generated from that tag
 
 It matches `llama-server`'s `/tokenize` id for id on 3,000 real messages (full and cut to 800 characters) and 3,034 stress strings. HF `tokenizers` disagreed on 2 of the 3,000 real messages, and on 908 of 1,034 stress strings.
 
+**Tail quality** (CHATS-8). This compares 3,000 real messages, cut to 800 characters, with the device's arithmetic (`host/emu_bin.py`, read from `mxbai.bin` itself) against Ollama. Mean cos is 0.99938, the 1st percentile 0.99877 and the 0.1th percentile 0.99740.
+
+The minimum is 0.982, on `login`, and the other bad cases are similar: very short messages, pasted hex, `^^`. They all spike an unreserved channel in layer 0's FFN.
+
+None of it matters for search:
+- Stored as a device vector among Ollama vectors for everything else, every message is found by its own Ollama query at rank 0, apart from 12 near-duplicates (rank ≤ 2).
+- Top-10 neighbours agree about 96–97% of the time between a mixed index and an all-Ollama one.
+
+Recalibrating the outliers on 300 real messages (`host/recal.py`) made the tail *worse* at K = 8 and only slightly better at K = 32. So the 10-text calibration stays, and the corpus doesn't need re-embedding when the embedder changes.
+
 ## Lessons (the expensive way)
 
 - **Never let both cores run PIE loads through the external-memory cache at the same time.** Two cores reading flash-mapped or PSRAM weights with 128-bit vector loads occasionally get garbage: a few dot products in 100,000 come back as random int32s. One core is fine, and so is internal SRAM; masking interrupts changes nothing. Each core therefore copies a block of weight rows into its own internal buffer, and PIE only ever reads internal SRAM.
@@ -69,6 +79,9 @@ It matches `llama-server`'s `/tokenize` id for id on 3,000 real messages (full a
 | `host/tok.py` | `tok.c` from Python (ctypes); `mxbai.py` tokenises through it |
 | `host/ollama_ids.py` | Ground-truth ids for the corpus from a private `llama-server` (the binary Ollama ships) |
 | `host/test_tok.py` | `tok.c` against `llama-server`, id for id: the corpus plus random and hand-picked stress strings |
+| `host/emu_bin.py` | The device's arithmetic on the Mac, reading the weights back from `mxbai.bin` |
+| `host/tail.py` | Device-vs-Ollama cosine over the corpus: mean, minimum, low percentiles |
+| `host/recal.py` | Tries choosing the outlier channels on real messages, for several K |
 | `host/serial_log.py` | Logs the board's serial output to a file without resetting it |
 | `host/corpus.py` | Samples real messages from local Claude Code transcripts for tokeniser testing (stays local) |
 | `firmware/full/` | The whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin` |
@@ -101,6 +114,11 @@ To test the tokeniser on the Mac, start a private `llama-server` on Ollama's GGU
 .venv/bin/python ollama_ids.py && .venv/bin/python test_tok.py
 ```
 
-On the ESP32-S3 CAM board, flash over the native USB port. After flashing, tap **RST**: a USB reset leaves the chip in download mode. If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
+On the ESP32-S3 CAM board, flash over the native USB port. `idf.py flash` ends with a USB reset, which leaves the chip in download mode, so either tap **RST** afterwards or flash with esptool and a watchdog reset, which needs no hands:
+
+```bash
+python -m esptool --chip esp32s3 -p /dev/cu.usbmodem1101 -b 460800 --after watchdog_reset write_flash 0x10000 build/s3full.bin
+```
+ If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
 
 The SD pins are those of the ESP32-S3 CAM board's onboard slot (1-bit: CLK 39, CMD 38, D0 40). For a 4-bit breakout, see CHATS-6.
