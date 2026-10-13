@@ -1,2 +1,9 @@
+# CHATS-10: two OTA app slots, for updates over the air, and NVS for what the device keeps
+# (Wi-Fi credentials, its certificate and key, its age private key). 16 MB flash; the app is
+# ~1.06 MB, so a 4 MB slot leaves plenty of room. 0x1b000-0x20000 and everything after
+# 0x820000 (~7.9 MB) are free.
 # Name,   Type, SubType, Offset,   Size
-factory,  app,  factory, 0x10000,  0x200000
+nvs,      data, nvs,     0x9000,   0x10000
+otadata,  data, ota,     0x19000,  0x2000
+ota_0,    app,  ota_0,   0x20000,  0x400000
+ota_1,    app,  ota_1,   0x420000, 0x400000
