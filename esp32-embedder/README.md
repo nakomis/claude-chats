@@ -200,7 +200,7 @@ Here's where internal RAM should land. The image itself costs ~6 KB more static 
 | lowest during an update, with the buffers lent (less the 8 KB update task, the download's TLS and buffers) | ~175 KB |
 
 **Rollback.** A new image starts on probation (`ESP_OTA_IMG_PENDING_VERIFY`). It's kept only when both of these hold, within 30 minutes of boot:
-- **It's healthy.** The self-test is the health check. Where `selftest.h` has CRCs recorded, the vectors must match them bit for bit. None are recorded yet (all 0), so the fallback applies: all seven vectors computed, no CRC or tokeniser errors, and every one within cos 0.999 of Ollama. A healthy board gives 0.99937–0.99978.
+- **It's healthy.** The self-test is the health check, and it must say PASSED: all seven tests run, every vector bit for bit what `selftest.h` records, and no CRC or tokeniser mismatches. There's one fallback, for a build whose arithmetic changed and whose CRCs were zeroed until they're recorded again. That build's verdict is NOT VERIFIED, and it counts as healthy only if every unrecorded vector is within cos 0.999 of Ollama. A healthy board gives 0.99937–0.99978.
 - **It has subscribed to its commands on IoT Core.** Otherwise it couldn't be updated again.
 
 A failed self-test rolls back at once. A crash, or the deadline passing, rolls back too. The old image then reports `ota_error {message: "rolled back"}`, and a kept image reports `ota_complete`. The self-test takes about 15 minutes at 240 MHz, but the board is on MQTT within seconds of booting. Fleet sees the new version straight away, and a rollback afterwards still shows as one. Updates sent while an image is on probation are refused.
