@@ -288,6 +288,7 @@ static verdict_t arrive(worker_t *w, job_t *j)
     const char *reason = NULL;
     if (!ct && s3) reason = REASON_CLAIM_CHECK;
     else if (j->m.receive_count >= WORKER_RETRIES_RECEIVE) reason = REASON_RETRIES;
+    else if (j->m.body_len > WORKER_WORST_BODY) reason = REASON_TOO_LONG;  // a forwarder on the old limit
     else if (w->sick) reason = REASON_KATA_UNHEALTHY;
     else if (!ct || !w->cfg.identity) reason = REASON_DECRYPT_FAILED;
     else {
@@ -331,7 +332,7 @@ static verdict_t arrive(worker_t *w, job_t *j)
 static void handoff(worker_t *w)
 {
     sqs_t *s = w->io.sqs;
-    // A result SQS can never take (only if the forwarder broke the 240,000-byte inline ceiling):
+    // A result SQS can never take (only if a forwarder broke the 240,000-byte limit SQS allows):
     // dropped, so it can't block the pool; the ingest job is left to reach the DLQ.
     for (int i = 0; i < w->n; i++)
         if (w->pool[i].state == JOB_RESULT && w->pool[i].result_len > SQS_MAX_BATCH_BYTES) {

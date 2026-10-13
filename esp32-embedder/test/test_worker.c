@@ -710,7 +710,7 @@ static void faults(void)
 
 static void big_results(void)
 {
-    printf("-- results near SQS's limit go one to a batch\n");
+    printf("-- bodies over Kata's limit go to Cal as too-long, and near SQS's limit one to a batch\n");
     board_t b;
     worker_t w;
     board_init(&b, &w, NULL);
@@ -725,16 +725,23 @@ static void big_results(void)
     char *b1 = make_job(&b, "u-big1", content, to, 1);
     char *b2 = make_job(&b, "u-big2", content, to, 1);
     char *b3 = make_job_text(&b, "u-small", "small one");
-    printf("    a %zu-byte ingest body\n", strlen(b1));
+    // ~24 KB of content: a body just under WORKER_WORST_BODY, embedded from its first 800 characters
+    content[24 * 1024 + 1] = '"';
+    content[24 * 1024 + 2] = 0;
+    char *b4 = make_job(&b, "u-mid", content, to, 1);
+    printf("    %zu- and %zu-byte ingest bodies\n", strlen(b1), strlen(b4));
+    CHECK(strlen(b1) > WORKER_WORST_BODY && strlen(b4) < WORKER_WORST_BODY, "body sizes");
     for (int i = 0; i < 4; i++) worker_step(&w);
-    CHECK(results(&b) == 3 && fq_live(fq_queue(&b.f, INGEST)) == 0, "all three through: %d", results(&b));
+    CHECK(results(&b) == 4 && fq_live(fq_queue(&b.f, INGEST)) == 0, "all four through: %d", results(&b));
     CHECK(b.f.max_batch_seen <= SQS_MAX_BATCH_BYTES, "a batch of %lld bytes", (long long)b.f.max_batch_seen);
-    cJSON *r = result_for(&b, "u-big1");
+    CHECK(!strcmp(reason_of(&b, "u-big1"), REASON_TOO_LONG) && !strcmp(reason_of(&b, "u-big2"), REASON_TOO_LONG), "too-long");
+    cJSON *r = result_for(&b, "u-mid");
+    CHECK(r && !strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(r, "kind")), "embedded"), "u-mid embedded");
     CHECK(r && cJSON_IsTrue(cJSON_GetObjectItem(r, "truncated_chars")), "truncated_chars");
     cJSON_Delete(r);
     CHECK(b.f.bad_signatures == 0, "signatures");
     free(content);
-    kw_free(b1); kw_free(b2); kw_free(b3);
+    kw_free(b1); kw_free(b2); kw_free(b3); kw_free(b4);
     board_free(&b, &w);
 }
 

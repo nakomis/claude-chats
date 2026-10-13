@@ -240,13 +240,14 @@ The state machine is portable C in `worker/` (`worker.c`), tested on the Mac aga
 2. A phase won't start with under 24 KB of internal RAM free.
 3. If the credentials expire within ten minutes, Kata fetches new ones from the IoT credentials provider. That's mTLS with the board's certificate and the role alias `kata-{env}`, about once an hour, and the connection is closed straight after.
 4. Kata opens one HTTPS session to `sqs.eu-west-2` and keeps it alive across the phase's requests (`worker/sqs.c`: SQS's JSON protocol, signed with SigV4, `worker/sigv4.c`).
-5. **Hand-off.** Kata sends the finished results with `SendMessageBatch`. A batch holds at most 10 messages and 256 KiB **in total**, so a result near the limit (an inline body can be up to 240,000 bytes) goes alone. Then it deletes, with `DeleteMessageBatch`, only the ingest jobs SQS accepted. A result SQS refused stays in the pool. Its job stays hidden (visibility extended), and no new pass starts until it's through.
+5. **Hand-off.** Kata sends the finished results with `SendMessageBatch`. A batch holds at most 10 messages and 256 KiB **in total**, so a big result (one carrying a `too-long` body) goes alone. Then it deletes, with `DeleteMessageBatch`, only the ingest jobs SQS accepted. A result SQS refused stays in the pool. Its job stays hidden (visibility extended), and no new pass starts until it's through.
 6. **Top-up.** `ReceiveMessage` (visibility 900 s; a 20 s long poll only when the pool is empty) runs while the pool holds fewer than 150 tokens and fits its PSRAM budget. Each job is sorted as it arrives:
 
 | The job | What Kata does |
 |---|---|
 | an S3 claim check | hands it to Cal unembedded, `claim-check` |
 | delivered for the third time or more | `retries`: it may be what crashed Kata |
+| a body over 40 KB | `too-long`: more than Kata's PSRAM can take |
 | arrives while Kata is sick | `kata-unhealthy`: Cal embeds it at once |
 | won't decrypt with this board's key, the uuids disagree, or it isn't a job | `decrypt-failed`: Cal decides. This includes jobs encrypted before the forwarder knew this board |
 | delivered for the second time | pooled, but embedded in a pass of its own |
@@ -301,14 +302,15 @@ Otherwise a result would land in the results DLQ after its ingest job was delete
 - Static internal RAM is DIRAM 105.8 KB, up 1.2 KB on the Fleet build.
 - During an SQS phase MQTT is down, which frees its task stack (6 KB) and its TLS session. The phase adds the HTTP client's 2 KB receive and 3 KB transmit buffers and a socket; mbedTLS is in PSRAM.
 - So the low point should sit near the Fleet build's figure with MQTT up (~34 KB), and no lower than the spike's 32.7 KB. That's 8 KB or more above the 24 KB floor the worker checks.
-- Bodies, results, ids, responses and parsed JSON all live in PSRAM. A receive's peak is about five times its bodies (the response, cJSON's tree, the copies, the results built from them). So the pool's budget is a fifth of the PSRAM free after loading less 384 KB, capped at 1 MB. A receive asks for at most budget ÷ 256 KiB messages and keeps no more than it asked for. The SQS client gives its buffers back after any call over 64 KB.
+- Bodies, results, ids, responses and parsed JSON all live in PSRAM. A receive's peak is about five times its bodies (the response, cJSON's tree, the copies, the results built from them). So the pool's budget is a fifth of the PSRAM free after loading less 128 KB (for mbedTLS: one session measured 46 KB), capped at 1 MB. A receive asks for at most budget ÷ 40 KB messages and keeps no more than it asked for. The SQS client gives its buffers back after any call over 64 KB.
+- **The model leaves little PSRAM.** Its buffers take about 7.4 of the 8 MB (measured on Green, 13 Oct): the worker starts with about 366 KB free, a budget of about 47 KB. So Kata takes bodies of at most 40 KB (`WORKER_WORST_BODY`), and the forwarder sends at most 32,768 bytes of ciphertext inline (home-infra's `max-inline-bytes`, clamped by `convmem_wire::MAX_INLINE_BYTES_CEILING`). Anything bigger goes by S3 claim check, which Kata hands to Cal unembedded. In 30 days of conversation-memory (31,140 messages) the 99th percentile was 11.7 KB of content and the largest 66 KB, so about one message in 200 goes that way. A body over 40 KB that arrives anyway (a forwarder still on the old limit) goes to Cal as `too-long`.
 
 **Bring-up** on a sandbox board, in order:
 1. Deploy home-infra #356 (the results queue and its SSM parameters) to sandbox, then this repo's `ClaudeChatsKataDeviceStack` (`pnpm run deploy-sandbox`). The board policy's new `iot:RetainPublish` **must be live before the firmware**, or IoT Core drops a board that publishes a retained status.
 2. `infra/scripts/age-identity.sh blue`, then `infra/scripts/provision.sh blue`. Check it doesn't warn about missing queues.
 3. `firmware/full/build.sh`, then `flash.sh` with the board's prov.
 4. Watch the boot log: the self-test, then `worker: starting as kata-sandbox-blue, tag esp32s3-mxbai-int8-v1; pool budget …`, the first phase's `heap worker: after an SQS phase` line, and `fleet: connected` after each phase.
-5. Send a ~200 KB inline job (the largest the forwarder sends) and read that phase's `worker: phase moved up to …` and `heap …` lines. The internal free and its lowest-ever point show what the biggest body costs; nothing of it should come out of internal RAM.
+5. Send a ~40 KB inline job (the largest the forwarder sends) and read that phase's `worker: phase moved up to …` and `heap …` lines. The internal free and its lowest-ever point show what the biggest body costs; nothing of it should come out of internal RAM.
 6. Send a test job, encrypted to the board's key and Cal's, to the sandbox ingest queue. Check its result on the results queue: `kind: embedded`, and a vector within cos 0.999 of Ollama's for the same text. Then soak it, and compare bit for bit with a spare board.
 
 ### Versioning

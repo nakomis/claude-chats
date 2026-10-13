@@ -57,7 +57,9 @@
 #define WORKER_MAX_RECEIVE 3             // ReceiveMessage calls per phase
 #define WORKER_SOLO_RECEIVE 2            // a job's second delivery gets a pass to itself
 #define WORKER_RETRIES_RECEIVE 3         // from its third, it goes to Cal unembedded
-#define WORKER_WORST_BODY 262144         // a receive's worst case per message
+#define WORKER_WORST_BODY 40960          // the largest body Kata takes: the forwarder sends at most
+                                         // 32,768 bytes of ciphertext inline (convmem_wire), plus the
+                                         // envelope; anything bigger goes to Cal as too-long
 #define WORKER_CARD_HISTORY 15           // passes in the card-wait median
 #define WORKER_NORM_MIN 10.0             // a raw [CLS] vector's norm, as Cal checks it (results.rs)
 #define WORKER_NORM_MAX 30.0

@@ -28,7 +28,7 @@
 #define REASON_CLAIM_CHECK "claim-check"        // an S3 claim check: Kata never touches S3
 #define REASON_DECRYPT_FAILED "decrypt-failed"  // not for this board's key, a uuid mismatch, or not a job
 #define REASON_RETRIES "retries"                // ApproximateReceiveCount >= 3: it may be what crashes Kata
-#define REASON_TOO_LONG "too-long"              // (unused: over 512 tokens is truncated, as Ollama does)
+#define REASON_TOO_LONG "too-long"              // a body over WORKER_WORST_BODY: more than Kata's PSRAM can take
 #define REASON_KATA_UNHEALTHY "kata-unhealthy"  // a bad pass, or Kata is sick: Cal embeds it at once
 
 typedef struct {

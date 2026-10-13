@@ -31,7 +31,7 @@ extern const char root_ca_start[] asm("_binary_AmazonRootCA1_pem_start");
 #define TARGET_TOKENS 150             // the planner's soft target: the card-bound knee (README)
 #define POOL_MAX 40
 #define POOL_BUDGET_MAX (1024 * 1024)
-#define PSRAM_RESERVE (384 * 1024)    // left for mbedTLS (in PSRAM), JSON parsing and the heartbeat
+#define PSRAM_RESERVE (128 * 1024)    // left for mbedTLS (in PSRAM; one session measured 46 KB) and the heartbeat
 #define POOL_PEAK 5                   // a receive's peak is about this many times its bodies: the
                                       // response, cJSON's tree, our copies, the results built from them
 #define MQTT_MIN_S 15                 // MQTT's turn between SQS phases, at least: commands and updates
@@ -190,7 +190,7 @@ static void net_end(void *ctx)
         esp_http_client_cleanup(sqs_http);
         sqs_http = NULL;
     }
-    // The first few phases, any that moved a big body (the bring-up check: a ~200 KB inline job), then
+    // The first few phases, any that moved a big body (the bring-up check: a ~40 KB inline job), then
     // about hourly. The low point is the one to watch.
     static int phases;
     if (phases++ < 3 || phase_big > 64 * 1024 || phases % 60 == 0) {
