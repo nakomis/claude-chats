@@ -21,6 +21,8 @@ firmware/full/certs/
 # Old builds read Wi-Fi from a generated header; nothing does now, but one may linger
 firmware/*/main/wifi_secrets.h
 firmware/*/.cache/
+# host tests of the firmware's portable C (test/Makefile)
+test/build/
 # CDK
 infra/node_modules/
 infra/cdk.out/
