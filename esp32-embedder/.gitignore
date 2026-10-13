@@ -11,6 +11,7 @@ host/corpus.json
 host/corpus_ids.json
 # built by host/tok.py
 tok/libtok.so
+tok/test_tok
 host/tail.npz
 host/recal.npz
 # Per-board provisioning (infra/scripts/provision.sh): prov.bin holds the Wi-Fi password
