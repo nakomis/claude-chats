@@ -2,6 +2,14 @@
 -- home-infra at luke/deployment/claude-chats/init.sql, which is what runs on
 -- Luke. tests/test_pg_schema.py and that repo's check pin the same DDL checksum
 -- so the copy cannot silently drift — change one and both go red (HOME-194).
+-- Every statement here is re-run on each Luke playbook run, and several take
+-- ACCESS EXCLUSIVE on `messages` even when they turn out to be no-ops (ADD
+-- COLUMN IF NOT EXISTS does). Waiting for that lock queues every later query
+-- on the table behind it, so a long reader (a backup's pg_dump) would stall
+-- search for minutes. Give up after 5 s instead: the play fails loudly and
+-- can be re-run (HOME-440 review).
+SET lock_timeout = '5s';
+
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -73,6 +81,39 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_name TEXT;
 -- Model behind an author='claude' row. NULL otherwise. The corpus already
 -- spans several models; being able to slice by one later is worth the column.
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS model TEXT;
+
+-- Which embedder produced the row's vector (CHATS-5 / HOME-440). Kata, the
+-- ESP32-S3 embedder, writes int8 vectors that agree with Ollama's to cos
+-- ~0.9994: close, not identical, so a corpus mixing the two has to say which
+-- is which for drift to be measurable. Values: 'ollama-mxbai-q8' (Cal) or
+-- 'esp32s3-mxbai-int8[-vN]' (Kata; the suffix moves exactly when the kernels'
+-- arithmetic does). NULL = embedded before tagging, which in practice was
+-- Ollama on Cal or the Mac.
+--
+-- Board and firmware version are separate columns rather than one jsonb: the
+-- shape is fixed and known, they are what drift analysis groups by, and plain
+-- columns cannot quietly grow a misspelt key. NULL on Ollama rows (the tag
+-- alone identifies those). All three follow the vector on a re-embed, so the
+-- consumer overwrites them on conflict. Nullable with no default, so adding
+-- them is a catalogue-only change, not a rewrite of the table.
+-- Added in one statement, and only when missing (HOME-440 review): ALTER
+-- TABLE takes ACCESS EXCLUSIVE even when every IF NOT EXISTS turns out to be
+-- a no-op, and that queues behind any open reader and blocks every query
+-- behind it. This file is reapplied on every Luke playbook run, so re-runs
+-- check the catalogue first and take no lock at all; the first run is bound
+-- by the lock_timeout at the top.
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'messages'
+          AND column_name IN ('embedder', 'embedder_board', 'embedder_fw')) < 3 THEN
+        ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS embedder TEXT,
+            ADD COLUMN IF NOT EXISTS embedder_board TEXT,
+            ADD COLUMN IF NOT EXISTS embedder_fw TEXT;
+    END IF;
+END
+$$;
 
 -- Every projection and most search paths filter on author, and the values are
 -- few and skewed, so this earns its keep immediately.
