@@ -13,12 +13,14 @@
 # Writes, never committed, under firmware/full/certs/kata-{env}-<board>/:
 #   device.pem.crt, device.pem.key, certificate-arn
 #   prov.bin   the board's prov partition: Wi-Fi, IoT endpoint, Thing name, certificate and private
-#              key, plus the credentials-provider endpoint and role alias CHATS-5 will use.
+#              key, the credentials-provider endpoint and role alias, and (CHATS-5) the board's age
+#              identity from SSM /kata/{env}/boards/<board>/age-identity (make it first with
+#              age-identity.sh <board>; without it the board can't decrypt jobs, and says so).
 #              firmware/full/flash.sh writes it alongside the app; none of it is in the firmware
 #              image, so every board runs the same (published) image.
 #
-# INSECURE: the private key is made here and flashed in plain text, and the Wi-Fi password sits in
-# prov.bin and the board's flash. Anyone holding the board can read both.
+# INSECURE: the private key is made here and flashed in plain text, and the Wi-Fi password and the
+# age identity sit in prov.bin and the board's flash. Anyone holding the board can read all three.
 #
 # Needs AWS_PROFILE (default nakom.is-{env}) and NPM_ENVIRONMENT (default sandbox). The house Wi-Fi
 # credentials are read from SSM /Nakomis/Wifi/* via WIFI_PROFILE (default nakom.is-sandbox: they
@@ -94,16 +96,34 @@ export KATA_SSID KATA_PASSWORD
 KATA_SSID=$(aws ssm get-parameter --profile "$wifi_profile" --name /Nakomis/Wifi/SSID --query Parameter.Value --output text)
 KATA_PASSWORD=$(aws ssm get-parameter --profile "$wifi_profile" --name /Nakomis/Wifi/Password --with-decryption \
     --query Parameter.Value --output text)
+# CHATS-5: the board's own age identity (age-identity.sh). Only the AGE-SECRET-KEY-1… line, not
+# age-keygen's comments. Optional, so a board can still be provisioned for Fleet without it.
+export KATA_AGE_ID
+age_param="/kata/${env}/boards/${board}/age-identity"
+if age_out=$(aws ssm get-parameter --name "$age_param" --with-decryption --query Parameter.Value --output text 2>&1); then
+    KATA_AGE_ID=$(printf '%s\n' "$age_out" | grep '^AGE-SECRET-KEY-1' || true)
+    [ -n "$KATA_AGE_ID" ] || { echo "${age_param} holds no AGE-SECRET-KEY-1 line" >&2; exit 1; }
+elif [[ "$age_out" == *ParameterNotFound* ]]; then
+    KATA_AGE_ID=
+    echo "no ${age_param}: prov.bin will have no age identity (run age-identity.sh ${board} first)" >&2
+else
+    echo "$age_out" >&2
+    exit 1
+fi
+unset age_out
 
 IDF_PATH="${IDF_PATH:-$HOME/esp/esp-idf}"
 # shellcheck disable=SC1091
 . "$IDF_PATH/export.sh" > /dev/null 2>&1   # for its Python, which has the NVS partition generator
-trap 'rm -P "${dir}/prov.csv" 2> /dev/null || true' EXIT   # it holds the Wi-Fi password
+trap 'rm -P "${dir}/prov.csv" 2> /dev/null || true' EXIT   # it holds the Wi-Fi password and age key
 prov_size=$(awk -F', *' '$1 == "prov" { print $5 }' "${fw}/partitions.csv")
 python3 - "$dir" "$endpoint" "$thing" "$cred_endpoint" "$role_alias" <<'PY'
 import csv, os, sys
 d, endpoint, thing, cred_endpoint, role_alias = sys.argv[1:]
 ssid, password = os.environ["KATA_SSID"], os.environ["KATA_PASSWORD"]
+age_id = os.environ["KATA_AGE_ID"]
+if age_id and (len(age_id) != 74 or not age_id.startswith("AGE-SECRET-KEY-1")):
+    sys.exit("the age identity isn't a single AGE-SECRET-KEY-1 line of 74 characters")
 if len(ssid.encode()) > 32 or len(password.encode()) > 63:
     sys.exit("Wi-Fi SSID or password too long for ESP-IDF (32 / 63 bytes)")
 # Must fit prov.h's fixed sizes.
@@ -122,6 +142,9 @@ rows = [
     ("cred_ep", "data", "string", cred_endpoint),
     ("role_alias", "data", "string", role_alias),
 ]
+if age_id:
+    # CHATS-5: the board's age identity, to decrypt conversation-memory jobs (nothing reads it yet).
+    rows.append(("age_id", "data", "string", age_id))
 with open(os.path.join(d, "prov.csv"), "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
     w.writerow(("key", "type", "encoding", "value"))
