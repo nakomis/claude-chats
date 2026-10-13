@@ -16,3 +16,23 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_FATFS_USE_FASTSEEK=y
+# CHATS-4: Wi-Fi and TLS next to the model. Wi-Fi/lwIP buffers stay internal (putting them in PSRAM
+# didn't change the core-0 corruption, and internal ends up with more free this way); mbedTLS in PSRAM.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# Wi-Fi/lwIP hot paths live in flash, not IRAM (on the S3, IRAM comes out of the same SRAM)
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+CONFIG_LWIP_IRAM_OPTIMIZATION=n
+# fewer buffers: this is a client fetching small messages, not a throughput device
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_TX_BA_WIN=4
+CONFIG_ESP_WIFI_RX_BA_WIN=4
+# network tasks on core 1 (made no difference to the corruption, which stays on core 0)
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+# a panic halts rather than rebooting: a halted chip still answers esptool over USB, a boot loop may not
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
