@@ -1,0 +1,4 @@
+# pnpm settings for the infra package (single package, not a real workspace).
+
+# Refuse versions published in the last 24 h, a defence against freshly compromised releases.
+minimumReleaseAge: 1440

@@ -19,3 +19,6 @@ firmware/full/certs/
 # Old builds read Wi-Fi from a generated header; nothing does now, but one may linger
 firmware/*/main/wifi_secrets.h
 firmware/*/.cache/
+# CDK
+infra/node_modules/
+infra/cdk.out/

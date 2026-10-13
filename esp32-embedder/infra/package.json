@@ -1,0 +1,27 @@
+{
+  "name": "esp32-embedder-infra",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.5.1",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "synth-sandbox": "NPM_ENVIRONMENT=sandbox cdk synth --profile nakom.is-sandbox --all",
+    "diff-sandbox": "NPM_ENVIRONMENT=sandbox cdk diff --profile nakom.is-sandbox --all",
+    "deploy-sandbox": "NPM_ENVIRONMENT=sandbox cdk deploy --profile nakom.is-sandbox --all --require-approval never",
+    "synth-prod": "NPM_ENVIRONMENT=prod cdk synth --profile nakom.is-prod --all",
+    "diff-prod": "NPM_ENVIRONMENT=prod cdk diff --profile nakom.is-prod --all",
+    "deploy-prod": "NPM_ENVIRONMENT=prod cdk deploy --profile nakom.is-prod --all",
+    "ci-synth-sandbox": "NPM_ENVIRONMENT=sandbox CDK_DEFAULT_ACCOUNT=000000000000 cdk synth --all --output cdk.out/sandbox",
+    "ci-synth-prod": "NPM_ENVIRONMENT=prod CDK_DEFAULT_ACCOUNT=000000000000 cdk synth --all --output cdk.out/prod"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.257.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.x",
+    "aws-cdk": "^2.1125.0",
+    "ts-node": "^10.9.2",
+    "typescript": "~6.0.3"
+  }
+}
