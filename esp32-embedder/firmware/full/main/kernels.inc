@@ -266,7 +266,7 @@ static inline float fast_exp(float x)
     float p = 1.0f + f * (0.693147181f + f * (0.240226507f + f * (0.0555041087f + f * (0.00961812911f
                     + f * (0.00133335581f + f * 0.000154035304f)))));
     union { float f; int32_t i; } u = { .f = p };
-    u.i += ki << 23;
+    u.i += (int32_t)((uint32_t)ki << 23);     // ki < 0: shift as unsigned, no UB
     return u.f;
 }
 

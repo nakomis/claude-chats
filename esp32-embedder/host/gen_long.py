@@ -2,7 +2,7 @@
 
 mxtest.bin's texts stop at 140 tokens. CHATS-4 lets one pass carry a whole
 message (up to 512 tokens), so the firmware also embeds two long texts (public:
-this README) and checks them against Ollama and against the emulation of the
+slices of this README, frozen in long_texts.json) and checks them against Ollama and against the emulation of the
 lean layout (lean.py). Generated, like mxcrc.h; needs Ollama running.
 
     python gen_long.py [../firmware/full/main/longtest.h]
@@ -17,8 +17,9 @@ import numpy as np
 import lean
 import mxbai as M
 
-README = (Path(__file__).resolve().parent.parent / 'README.md').read_text()
-TEXTS = [README[:1100], README[:4000]]       # about 250 tokens, and well past 512 (truncated)
+# Frozen (long_texts.json): two slices of this README as it was on 12 Oct 2026, 391 tokens and
+# well past 512 (truncated). Frozen because the firmware's self-test pins their output vectors.
+TEXTS = json.loads((Path(__file__).resolve().parent / 'long_texts.json').read_text())
 
 
 def ollama(t):

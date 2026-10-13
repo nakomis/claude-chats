@@ -16,7 +16,14 @@ from pathlib import Path
 def main():
     log = Path(sys.argv[1]).read_text(errors='replace')
     dst = Path(sys.argv[2] if len(sys.argv) > 2 else Path(__file__).parent.parent / 'firmware/full/main/selftest.h')
-    crcs = {int(i): c for i, c in re.findall(r'selftest (\d+): vector crc ([0-9a-f]{8})', log)}
+    if 'WRONG' in log or 'SELF-TEST FAILED' in log:
+        sys.exit('the log has a wrong vector or a failed self-test: not a known-good board')
+    if not re.search(r'== done \(0 CRC mismatches, 0 tokeniser mismatches\) ==', log):
+        sys.exit('the run did not finish cleanly (0 CRC and 0 tokeniser mismatches)')
+    crcs = {}
+    for i, c in re.findall(r'selftest (\d+): vector crc ([0-9a-f]{8})', log):
+        if crcs.setdefault(int(i), c) != c:
+            sys.exit(f'test {i} gave two different vectors in one run: not a known-good board')
     src = dst.read_text()
     n = int(re.search(r'#define N_SELFTEST (\d+)', src).group(1))
     missing = [i for i in range(n) if i not in crcs]

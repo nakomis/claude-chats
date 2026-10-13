@@ -351,11 +351,13 @@ static int vocab_load(void)
 
 
 
-static int st_pass, st_fail, st_new;
+_Static_assert(N_SELFTEST == N_TEXTS + N_LONG, "selftest.h: one CRC per test text and long text");
+static int st_pass, st_fail, st_new, st_done[N_SELFTEST];
 // the bit-exact check of one output vector (the [CLS] row of x) against selftest.h
 static void selftest(int i)
 {
     uint32_t c = esp_rom_crc32_le(0, (const uint8_t *)x, D * 4), want = i < N_SELFTEST ? SELFTEST_CRC[i] : 0;
+    if (i < N_SELFTEST) st_done[i] = 1;
     if (!want) st_new++;
     else if (c == want) st_pass++;
     else st_fail++;
@@ -438,6 +440,8 @@ void app_main(void)
     if (memcmp(th, "MXT1", 4)) { printf("bad test magic\n"); return; }
     int tok_bad = 0;
     float *ref0 = ps(D * 4);                  // test 0's Ollama vector, for the Wi-Fi check at the end
+    if (!ref0) { printf("alloc failed: ref0\n"); return; }
+    memset(ref0, 0, D * 4);
     for (int ti = 0; ti < (int)th[1]; ti++) {
         uint32_t n;
         fread(&n, 4, 1, ft);
@@ -484,7 +488,7 @@ void app_main(void)
     // CHATS-4: whole long messages in one pass (references from host/gen_long.py)
     for (int li = 0; li < N_LONG; li++) {
         int nt = tok_encode(&vocab, LONG[li].text, strlen(LONG[li].text), ids, MAXTOK, NULL);
-        if (nt != LONG[li].n_tok) { printf("long %d: %d tokens, host says %d\n", li, nt, LONG[li].n_tok); tok_bad++; continue; }
+        if (nt < 1 || nt != LONG[li].n_tok) { printf("long %d: %d tokens, host says %d\n", li, nt, LONG[li].n_tok); tok_bad++; continue; }
         n_tok = nt;
         t_sd = t_att = t_quant = t_stall = 0;
         int64_t t0 = esp_timer_get_time();
@@ -506,16 +510,23 @@ void app_main(void)
         net_heap("after https");
         for (int r = 0; r < 3; r++) {             // with Wi-Fi up, a corrupted pass shows as cos well below 0.999
             n_tok = tok_encode(&vocab, TEXTS[0], strlen(TEXTS[0]), ids, MAXTOK, NULL);
+            if (n_tok < 1) { printf("wifi up, pass %d: tokeniser failed\n", r); tok_bad++; break; }
             embed_in((const uint32_t *)ids);
             pass_fwd();
             printf("wifi up, pass %d: test 0 cos vs Ollama %.6f\n", r, cosv(x, ref0, D));
+            selftest(0);                          // the conditions the corruption was found under
             net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         }
         net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         net_heap("end");
     }
-    if (st_fail) printf("\n!!! SELF-TEST FAILED: %d of %d vectors wrong. This board computes wrong results; don't use it. !!!\n\n",
-                        st_fail, st_pass + st_fail);
-    else printf("self-test: %d bit-exact, %d not recorded\n", st_pass, st_new);
+    int st_skipped = 0;
+    for (int i = 0; i < N_SELFTEST; i++) st_skipped += !st_done[i];
+    if (st_fail || st_skipped || crc_bad || tok_bad)
+        printf("\n!!! SELF-TEST FAILED: %d vectors wrong, %d tests not run, %d CRC and %d tokeniser mismatches. "
+               "Don't use this board's results. !!!\n\n", st_fail, st_skipped, crc_bad, tok_bad);
+    else if (st_new)
+        printf("\n!!! SELF-TEST NOT VERIFIED: %d vectors have no recorded CRC (selftest.h; host/selftest_crcs.py). !!!\n\n", st_new);
+    else printf("self-test PASSED: %d vectors bit-exact\n", st_pass);
     printf("== done (%d CRC mismatches, %d tokeniser mismatches) ==\n", crc_bad, tok_bad);
 }
