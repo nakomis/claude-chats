@@ -8,7 +8,7 @@
 #include "nvs_flash.h"
 
 #define PARTITION "prov"
-#define NAMESPACE "embedder"       // as infra/scripts/provision.sh writes it
+#define NAMESPACE "kata"       // as infra/scripts/provision.sh writes it
 
 static bool get_fixed(nvs_handle_t h, const char *key, char *out, size_t size)
 {

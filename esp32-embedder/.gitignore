@@ -13,7 +13,7 @@ host/corpus_ids.json
 tok/libtok.so
 host/tail.npz
 host/recal.npz
-# Per-board provisioning (host/provision.sh): prov.bin holds the Wi-Fi password
+# Per-board provisioning (infra/scripts/provision.sh): prov.bin holds the Wi-Fi password
 firmware/full/certs/
 # Old builds read Wi-Fi from a generated header; nothing does now, but one may linger
 firmware/*/main/wifi_secrets.h
