@@ -481,21 +481,19 @@ void app_main(void)
         net_heap("after long pass");
     }
 
-    // CHATS-4: Wi-Fi and TLS next to the model, then test 0 again with the radio up and with it paused.
-    // Open problem: with Wi-Fi up, core 0's matmul rows are intermittently corrupted (see CHATS-4);
-    // every pass above runs before Wi-Fi starts.
+    // CHATS-4: Wi-Fi and TLS next to the model, then test 0 three times with the radio up and an HTTPS
+    // request between passes (with Wi-Fi up, core 0's rows used to come out corrupted: see mm_rows).
     net_heap("before wifi");
     if (net_up(20000) == 0) {
         net_heap("wifi up");
         net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         net_heap("after https");
-        for (int paused = 0; paused < 2; paused++) {
+        for (int r = 0; r < 3; r++) {             // with Wi-Fi up, a corrupted pass shows as cos well below 0.999
             n_tok = tok_encode(&vocab, TEXTS[0], strlen(TEXTS[0]), ids, MAXTOK, NULL);
             embed_in((const uint32_t *)ids);
-            if (paused) net_pause();
             pass_fwd();
-            if (paused) net_resume(20000);
-            printf("wifi %s: test 0 cos vs Ollama %.6f\n", paused ? "paused during the pass" : "up", cosv(x, ref0, D));
+            printf("wifi up, pass %d: test 0 cos vs Ollama %.6f\n", r, cosv(x, ref0, D));
+            net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         }
         net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         net_heap("end");
