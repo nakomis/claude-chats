@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CHATS-10: sign the app image in place (RSA-3072, secure boot v2 scheme) and check the signature.
-# tinycrypt's sign.sh. Every image is signed, dev builds flashed over USB included: once Fleet OTA
-# lands, a board only accepts an update signed by the key that signed the image it's running.
+# tinycrypt's sign.sh. Every image is signed, dev builds flashed over USB included: a board only
+# accepts an update from Fleet signed by the key that signed the image it's running.
 #
 #   firmware/full/sign.sh [build/kata.bin]
 #

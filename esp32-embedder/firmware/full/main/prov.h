@@ -9,7 +9,7 @@ typedef struct {
     char wifi_ssid[33];
     char wifi_password[65];
     // Device identity: the board's IoT Thing and its certificate (none on a board provisioned before
-    // CHATS-10 part 2, which still gets Wi-Fi)
+    // device identity existed, which still gets Wi-Fi)
     bool has_identity;
     char iot_endpoint[96];
     char thing_name[48];
