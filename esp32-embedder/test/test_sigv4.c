@@ -22,13 +22,21 @@ static const char *const VECTORS[] = {
 #define MAXH 16
 
 typedef struct {
-    char method[8], path[256], query[256];
+    char method[8], path[512], query[512];
     sv4_hdr_t h[MAXH];
     int nh;
     char *body;
     size_t body_len;
     char *store;                              // owns the strings
+    char *owned[MAXH * 2];                    // and the values
+    int n_owned;
 } req_t;
+
+static void req_free(req_t *r)
+{
+    for (int i = 0; i < r->n_owned; i++) free(r->owned[i]);
+    free(r->store);
+}
 
 // "GET /path?query HTTP/1.1", then "Name:value" lines (a line starting with whitespace continues
 // the previous value), then a blank line and the body.
@@ -53,7 +61,8 @@ static int parse_req(char *text, req_t *r)
             const char *prev = r->h[r->nh - 1].value;
             char *v = malloc(strlen(prev) + n + 2);
             snprintf(v, strlen(prev) + n + 2, "%s\n%.*s", prev, (int)n, line);
-            r->h[r->nh - 1].value = v;        // leaks a little per vector: a test
+            r->h[r->nh - 1].value = v;
+            r->owned[r->n_owned++] = v;
         } else {
             char *colon = memchr(line, ':', n);
             if (!colon || r->nh == MAXH) return -1;
@@ -63,6 +72,7 @@ static int parse_req(char *text, req_t *r)
             memcpy(v, colon + 1, n - (size_t)(colon + 1 - line));
             v[n - (size_t)(colon + 1 - line)] = 0;
             r->h[r->nh++].value = v;
+            r->owned[r->n_owned++] = v;
         }
         if (!nl) { line += n; break; }
         line = nl + 1;
@@ -110,7 +120,8 @@ int main(void)
         CHECK(!strcmp(authz, want_authz), "%s: authorization\n  got  %s\n  want %s", name, authz, want_authz);
         jb_free(&creq);
         jb_free(&sts);
-        free(want_creq); free(want_sts); free(want_authz); free(r.store);
+        free(want_creq); free(want_sts); free(want_authz);
+        req_free(&r);
     }
     printf("%d vectors\n", n);
 

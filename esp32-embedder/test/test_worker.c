@@ -357,8 +357,8 @@ static void bad_passes(void)
     worker_t w;
     board_init(&b, &w, NULL);
     char *bodies[8];
-    char uuid[8][8];
-    for (int i = 0; i < 3; i++) { snprintf(uuid[i], 8, "u-%d", i); bodies[i] = make_job_text(&b, uuid[i], "some words here"); }
+    char uuid[8][16];
+    for (int i = 0; i < 3; i++) { snprintf(uuid[i], 16, "u-%d", i); bodies[i] = make_job_text(&b, uuid[i], "some words here"); }
     b.bad_passes = 1;
     worker_step(&w);                          // a bad pass: no vectors
     worker_step(&w);
@@ -367,7 +367,7 @@ static void bad_passes(void)
     // two more bad passes in a row: sick
     b.bad_passes = 2;
     for (int i = 3; i < 5; i++) {
-        snprintf(uuid[i], 8, "u-%d", i);
+        snprintf(uuid[i], 16, "u-%d", i);
         bodies[i] = make_job_text(&b, uuid[i], "more words");
         worker_step(&w);
         worker_step(&w);
@@ -376,7 +376,7 @@ static void bad_passes(void)
     // sick: new jobs go straight to Cal, no pass
     int passes = b.passes;
     b.health_ok = 0;
-    snprintf(uuid[5], 8, "u-5");
+    snprintf(uuid[5], 16, "u-5");
     bodies[5] = make_job_text(&b, uuid[5], "while sick");
     worker_step(&w);
     CHECK(b.passes == passes && !strcmp(reason_of(&b, "u-5"), "kata-unhealthy"), "sick: straight to Cal (%s)", reason_of(&b, "u-5"));
@@ -393,7 +393,7 @@ static void bad_passes(void)
     b.f.now += WORKER_HEALTH_EVERY_S;
     worker_step(&w);
     CHECK(b.health_calls == 2 && !w.sick, "health check passed: well");
-    snprintf(uuid[6], 8, "u-6");
+    snprintf(uuid[6], 16, "u-6");
     bodies[6] = make_job_text(&b, uuid[6], "after recovery");
     worker_step(&w);
     worker_step(&w);

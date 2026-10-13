@@ -19,7 +19,7 @@ LDLIBS := -lm
 TESTS := test_kw test_sigv4 test_age test_prep test_result test_sqs test_creds test_worker test_tag test_batch test_att
 
 all: $(addprefix $(B)/,$(TESTS)) $(B)/testkit
-	cd $(B) && for t in $(TESTS); do echo "== $$t"; ./$$t || exit 1; done
+	cd $(B) && for t in $(TESTS); do echo "== $$t"; UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$$t || exit 1; done
 
 $(B):
 	mkdir -p $@

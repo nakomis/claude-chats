@@ -237,7 +237,10 @@ void kw_amz_date(int64_t t, char out[17])
     unsigned m, d;
     int64_t days = t >= 0 ? t / 86400 : (t - 86399) / 86400, s = t - days * 86400;
     civil_from_days(days, &y, &m, &d);
-    snprintf(out, 17, "%04d%02u%02uT%02d%02d%02dZ", y, m, d, (int)(s / 3600), (int)(s / 60 % 60), (int)(s % 60));
+    char tmp[48];                             // roomy: GCC can't see that y has four digits
+    snprintf(tmp, sizeof tmp, "%04d%02u%02uT%02d%02d%02dZ", y, m, d, (int)(s / 3600), (int)(s / 60 % 60), (int)(s % 60));
+    memcpy(out, tmp, 16);
+    out[16] = 0;
 }
 
 void kw_ymd(int64_t t, char out[11])
@@ -245,5 +248,8 @@ void kw_ymd(int64_t t, char out[11])
     int y;
     unsigned m, d;
     civil_from_days(t >= 0 ? t / 86400 : (t - 86399) / 86400, &y, &m, &d);
-    snprintf(out, 11, "%04d-%02u-%02u", y, m, d);
+    char tmp[40];
+    snprintf(tmp, sizeof tmp, "%04d-%02u-%02u", y, m, d);
+    memcpy(out, tmp, 10);
+    out[10] = 0;
 }

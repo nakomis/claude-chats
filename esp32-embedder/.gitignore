@@ -22,7 +22,7 @@ firmware/full/certs/
 firmware/*/main/wifi_secrets.h
 firmware/*/.cache/
 # host tests of the firmware's portable C (test/Makefile)
-test/build/
+test/build*/
 # CDK
 infra/node_modules/
 infra/cdk.out/

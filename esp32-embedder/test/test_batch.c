@@ -17,7 +17,7 @@ static int fails;
 static void expect(const char *what, const int *len, int n, int cap, int target, const int *want, int nw)
 {
     int pick[64], np = batch_plan(len, n, cap, target, pick);
-    int ok = np == nw && !memcmp(pick, want, nw * sizeof *want);
+    int ok = np == nw && (!nw || !memcmp(pick, want, nw * sizeof *want));
     fails += !ok;
     printf("%-44s ->", what);
     for (int i = 0; i < np; i++) printf(" %d", pick[i]);

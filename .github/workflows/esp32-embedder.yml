@@ -72,6 +72,24 @@ jobs:
             $(pkg-config --cflags --libs libcjson)
           python -m pytest -q test_ota_cmd.py
 
+  # CHATS-5: Kata's worker (worker/: SigV4, SQS, the credentials provider, age, the canonical text,
+  # the results message, the worker's state machine) and #21's segmented attention, on the host.
+  # In the IDF image, so mbedTLS and cJSON are the very sources the firmware is built from.
+  worker:
+    name: Worker (host)
+    needs: changes
+    if: needs.changes.outputs.embedder == 'true'
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.4.4
+    defaults:
+      run:
+        shell: bash
+        working-directory: esp32-embedder/test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the host tests (ASan, UBSan, LeakSanitizer)
+        run: make -j"$(nproc)" CC=gcc
+
   # ── Firmware publishing ───────────────────────────────────────────────────────────────────
   # Until the CI roles exist (AWS_SANDBOX_ROLE_ARN / AWS_PROD_ROLE_ARN repo variables), the build
   # still runs, labelled with version.txt, and nothing is published.
@@ -277,7 +295,7 @@ jobs:
   ci-status:
     name: CI Status
     if: always()
-    needs: [changes, tokeniser, otacmd, infra, firmware-version, firmware-build, firmware-sandbox, firmware-prod]
+    needs: [changes, tokeniser, otacmd, worker, infra, firmware-version, firmware-build, firmware-sandbox, firmware-prod]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed
