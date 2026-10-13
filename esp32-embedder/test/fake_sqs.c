@@ -138,6 +138,7 @@ int fq_post(void *ctx, const http_req_t *r, jbuf_t *resp)
     if (f->http_500_next > 0) { f->http_500_next--; return error(resp, 500, "InternalError", "injected"); }
     if (!signature_ok(f, r)) { f->bad_signatures++; return error(resp, 403, "SignatureDoesNotMatch", "bad signature"); }
     const char *target = header(r, "X-Amz-Target");
+    if (f->fail_target && target && !strcmp(target, f->fail_target) && f->fail_target_next > 0) { f->fail_target_next--; return -1; }
     cJSON *in = cJSON_ParseWithLength(r->body, r->body_len);
     const char *url = cJSON_GetStringValue(cJSON_GetObjectItem(in, "QueueUrl"));
     fq_queue_t *q = url ? fq_queue(f, url) : NULL;

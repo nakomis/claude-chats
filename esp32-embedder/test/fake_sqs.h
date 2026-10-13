@@ -36,6 +36,8 @@ typedef struct {
     // faults
     int fail_next;                      // the next n calls get no response
     int http_500_next;                  // the next n calls get HTTP 500
+    const char *fail_target;            // the next fail_target_next calls of this action get no response
+    int fail_target_next;
     const char *refuse_body_containing; // SendMessageBatch entries with this in their body fail
     bool corrupt_md5;                   // ReceiveMessage reports a wrong MD5OfBody
     int64_t max_batch_seen;             // the largest SendMessageBatch total, in bytes
