@@ -24,6 +24,17 @@ void *kw_alloc(size_t n);
 void *kw_realloc(void *p, size_t n);
 void kw_free(void *p);
 char *kw_strndup(const char *s, size_t n);
+// How many kw_alloc / kw_realloc calls have failed since boot. The firmware routes cJSON's allocations
+// through kw too (cJSON_InitHooks), so a parse that fails while this moved ran out of memory: the
+// input may be fine.
+unsigned kw_alloc_failures(void);
+// Zeroes n bytes in a way the compiler won't drop (secrets, plaintext), then frees p.
+void kw_wipe_free(void *p, size_t n);
+
+// Does the JSON text s[0 .. n) nest at most max_depth arrays and objects deep? Counts brackets outside
+// strings, without parsing. cJSON recurses once per level, and the worker's stack is 16 KB: anything
+// deeper than any real message is refused before it's parsed.
+bool kw_json_depth_ok(const char *s, size_t n, int max_depth);
 
 // ---- jbuf -------------------------------------------------------------------------------
 // Always NUL-terminated (p[n] == 0) once anything has been put. An allocation failure sets oom and

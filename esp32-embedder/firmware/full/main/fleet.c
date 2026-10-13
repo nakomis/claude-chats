@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mqtt_client.h"
 
@@ -33,6 +34,7 @@ static const char *volatile selftest = "not run";
 static esp_timer_handle_t status_timer;
 static bool heap_logged;
 static volatile bool paused;
+static SemaphoreHandle_t status_mx;      // the heartbeat runs from the esp_timer task and the worker's
 static void (*status_extra)(jbuf_t *);
 
 void fleet_set_selftest(const char *verdict) { selftest = verdict; }
@@ -44,7 +46,7 @@ void fleet_set_status_extra(void (*extra)(jbuf_t *out)) { status_extra = extra; 
 static void send_status(void *arg)
 {
     (void)arg;
-    if (!connected || paused) return;
+    if (!connected || paused || !status_mx || xSemaphoreTake(status_mx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
     jbuf_t b;                                 // PSRAM (kw.h)
     jb_init(&b);
     jb_printf(&b, "{\"type\":\"status\",\"version\":\"%s\",\"state\":\"%s\",\"selftest\":\"%s\",\"uptime_s\":%lld,"
@@ -61,6 +63,7 @@ static void send_status(void *arg)
     // QoS 0, retained: the next one is a minute away, and the latest is what's kept
     else esp_mqtt_client_enqueue(mqtt, status_topic, b.p, (int)b.n, 0, 1, true);
     jb_free(&b);
+    xSemaphoreGive(status_mx);
 }
 
 void fleet_status_now(void) { send_status(NULL); }
@@ -141,6 +144,7 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 bool fleet_start(const prov_t *p)
 {
     prov = p;
+    status_mx = xSemaphoreCreateMutex();
     if (!prov->has_identity) {
         printf("fleet: no IoT identity in prov: not connecting (run infra/scripts/provision.sh)\n");
         return false;

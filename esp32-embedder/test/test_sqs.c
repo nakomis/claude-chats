@@ -91,6 +91,17 @@ int main(void)
     f.corrupt_md5 = true;
     CHECK(sqs_receive(&s, INGEST, 1, 0, 900, &m, &n) == 0 && n == 0, "a body failing its MD5 is dropped");
     f.corrupt_md5 = false;
+    // an SQS that sends more than asked: the client keeps only what it asked for
+    for (int i = 0; i < 4; i++) fq_send(&f, INGEST, "extra");
+    f.over_deliver = 3;
+    CHECK(sqs_receive(&s, INGEST, 2, 0, 900, &m, &n) == 0 && n == 2, "over-delivery capped at max: %d", n);
+    for (int i = 0; i < n; i++) sqs_msg_free(&m[i]);
+    kw_free(m);
+    f.over_deliver = 0;
+    f.now += 1000;                            // the extras come back
+    CHECK(sqs_receive(&s, INGEST, 10, 0, 900, &m, &n) == 0 && n == 5, "the rest come back: %d", n);
+    for (int i = 0; i < n; i++) sqs_msg_free(&m[i]);
+    kw_free(m);
     // wrong credentials: SQS (the fake) refuses the signature
     aws_creds_t wrong = creds;
     wrong.secret_key[0] ^= 1;

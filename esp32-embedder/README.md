@@ -251,11 +251,20 @@ The state machine is portable C in `worker/` (`worker.c`), tested on the Mac aga
 | won't decrypt with this board's key, the uuids disagree, or it isn't a job | `decrypt-failed`: Cal decides. This includes jobs encrypted before the forwarder knew this board |
 | delivered for the second time | pooled, but embedded in a pass of its own |
 | anything else | decrypted (age, `worker/age.c`), made canonical, tokenised, pooled |
-| not an envelope at all | left alone: no result could carry it, so it reaches the ingest DLQ |
+| not an envelope Cal could read | left alone: no result could carry it, so it reaches the ingest DLQ |
 
 7. Kata extends the visibility of any pooled job that could come back before the next phase, closes the session, and brings MQTT back.
 
-When the queue is empty, a cycle is a 20 s long poll followed by 40 s of MQTT.
+When the queue is empty, a cycle is a 20 s long poll followed by 40 s of MQTT. However busy the queue, MQTT gets at least 15 s between phases, so commands and updates get through even while a sick board forwards a backlog with no passes.
+
+**Strict JSON.** Kata reads an envelope, and the job inside it, at least as strictly as Cal's serde will:
+- nothing but whitespace after the value, and no duplicate keys
+- the fields Cal requires, with the types it requires (`v` an integer, `message_uuid` a string, and so on)
+- at most 32 levels of nesting, checked before parsing (cJSON recurses once per level, on a 16 KB stack; the firmware also builds cJSON with `CJSON_NESTING_LIMIT=32`)
+
+Otherwise a result would land in the results DLQ after its ingest job was deleted. A body that fails these checks isn't an envelope (it's left for the ingest DLQ), and a job that fails them goes to Cal unembedded (`decrypt-failed`). Unknown fields, such as the forwarder's signature, are fine, and pass through untouched.
+
+**Memory for JSON.** On the board, `malloc` is internal RAM only (`CONFIG_SPIRAM_USE_CAPS_ALLOC`), and the network needs that. So cJSON allocates through `kw.h`, which means PSRAM, and the worker allocates only through `kw.h` (`make lint` checks). A parse that fails for want of memory is told apart from a bad body (`kw_alloc_failures`): that job is dropped from the pool and comes back later, rather than being judged. Decrypted plaintext is zeroed before it's freed, as is the age identity's text once parsed.
 
 **The canonical text** (`worker/prep.c`) is what Cal embeds, exactly:
 1. Each NUL becomes the two characters `\0` (`sanitise_nuls`; Kata rewrites the `\u0000` escape in the job's JSON before parsing it).
@@ -267,9 +276,11 @@ When the queue is empty, a cycle is a 20 s long poll followed by 40 s of MQTT.
 - A non-finite vector, or a raw norm outside Cal's 10–30 band (real `[CLS]` rows measure 15–19), makes it bad too.
 - Vectors go **raw**, never normalised: Cal normalises them, and raw bits can be compared between boards.
 
-**Sick.** Three bad passes in a row make Kata sick. So does a failed boot self-test: a board whose self-test failed outside probation still works the queue, sick. A sick Kata hands every job to Cal straight away (Martin, 13 Oct), so nothing waits for the 36 h overflow. Every 30 minutes it runs a health check: the five short self-test texts in one batched pass, bit for bit against `selftest.h`. When that passes, it's well again.
+**Sick.** Three bad passes in a row make Kata sick. So does a failed boot self-test: a board whose self-test failed outside probation still works the queue, sick. A sick Kata hands every job to Cal straight away (Martin, 13 Oct), so nothing waits for the 36 h overflow. Every 30 minutes it runs a health check: the five short self-test texts, each in a pass of its own as at boot, bit for bit against `selftest.h` (about 6 minutes). When that passes, it's well again. One batched pass would take 75 s, and PR #21's test shows a segment gets the same bits as a pass of its own. But that's proven on the Mac, not yet on the chip, and if it weren't true a sick board would never recover.
 
-**Updates.** An `ota_update` parks the worker first. The worker hands off what it has finished and gives the rest back to the queue (visibility 0), so no job is held through an update (CHATS-10's criterion 4). If the update fails, the worker carries on.
+**Updates.** An `ota_update` parks the worker first. The worker hands off what it has finished, keeping undelivered results hidden while it retries, and gives the rest back to the queue (visibility 0), so no job is held through an update (CHATS-10's criterion 4). If the update fails, the worker carries on. A job given back comes round again with one more receive, so a second update straight after the first can push a job to its third delivery, which sends it to Cal unembedded.
+
+**Visibility.** If extending a pooled job's visibility fails, no pass starts until it goes through, so a job can't come back to someone else mid-pass. A job whose extension is refused (its handle went stale) leaves the pool.
 
 **A watchdog** restarts a worker that hasn't stepped for 15 minutes. Nothing is lost: a job is only deleted once its result is on the results queue.
 
@@ -290,14 +301,15 @@ When the queue is empty, a cycle is a 20 s long poll followed by 40 s of MQTT.
 - Static internal RAM is DIRAM 105.8 KB, up 1.2 KB on the Fleet build.
 - During an SQS phase MQTT is down, which frees its task stack (6 KB) and its TLS session. The phase adds the HTTP client's 2 KB receive and 3 KB transmit buffers and a socket; mbedTLS is in PSRAM.
 - So the low point should sit near the Fleet build's figure with MQTT up (~34 KB), and no lower than the spike's 32.7 KB. That's 8 KB or more above the 24 KB floor the worker checks.
-- Bodies, results, ids, responses and parsed JSON all live in PSRAM. The pool's budget is a third of the PSRAM free after loading less 384 KB, capped at 1 MB. A receive asks for at most budget ÷ 256 KiB messages.
+- Bodies, results, ids, responses and parsed JSON all live in PSRAM. A receive's peak is about five times its bodies (the response, cJSON's tree, the copies, the results built from them). So the pool's budget is a fifth of the PSRAM free after loading less 384 KB, capped at 1 MB. A receive asks for at most budget ÷ 256 KiB messages and keeps no more than it asked for. The SQS client gives its buffers back after any call over 64 KB.
 
 **Bring-up** on a sandbox board, in order:
 1. Deploy home-infra #356 (the results queue and its SSM parameters) to sandbox, then this repo's `ClaudeChatsKataDeviceStack` (`pnpm run deploy-sandbox`). The board policy's new `iot:RetainPublish` **must be live before the firmware**, or IoT Core drops a board that publishes a retained status.
 2. `infra/scripts/age-identity.sh blue`, then `infra/scripts/provision.sh blue`. Check it doesn't warn about missing queues.
 3. `firmware/full/build.sh`, then `flash.sh` with the board's prov.
 4. Watch the boot log: the self-test, then `worker: starting as kata-sandbox-blue, tag esp32s3-mxbai-int8-v1; pool budget …`, the first phase's `heap worker: after an SQS phase` line, and `fleet: connected` after each phase.
-5. Send a test job, encrypted to the board's key and Cal's, to the sandbox ingest queue. Check its result on the results queue: `kind: embedded`, and a vector within cos 0.999 of Ollama's for the same text. Then soak it, and compare bit for bit with a spare board.
+5. Send a ~200 KB inline job (the largest the forwarder sends) and read that phase's `worker: phase moved up to …` and `heap …` lines. The internal free and its lowest-ever point show what the biggest body costs; nothing of it should come out of internal RAM.
+6. Send a test job, encrypted to the board's key and Cal's, to the sandbox ingest queue. Check its result on the results queue: `kind: embedded`, and a vector within cos 0.999 of Ollama's for the same text. Then soak it, and compare bit for bit with a spare board.
 
 ### Versioning
 

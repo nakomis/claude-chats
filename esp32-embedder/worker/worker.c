@@ -142,25 +142,106 @@ static void unembedded(worker_t *w, job_t *j, const char *reason)
 }
 
 // ---- arrival: what to do with each job --------------------------------------------------------
-typedef enum { KEEP, DROP } verdict_t;
+typedef enum { KEEP, DROP, LATER } verdict_t;
 
-// The plaintext job (JSON): its content, prepared and tokenised into j->ids. -1 if it isn't a job
-// for this envelope.
+// ---- strict JSON, as Cal's serde reads it --------------------------------------------------------
+// Kata hands Cal the envelope verbatim and embeds what's in the job; if Cal's serde_json would refuse
+// either, the result would end up in the results DLQ after the ingest job was deleted. So Kata is at
+// least as strict: nothing but whitespace after the value, no duplicate keys, and the fields Cal
+// requires present with the types it requires. Anything else isn't Kata's to judge: the envelope is
+// left for the ingest DLQ, the job goes to Cal unembedded.
+
+static bool unique_keys(const cJSON *o)
+{
+    int n = 0;
+    for (const cJSON *a = o ? o->child : NULL; a; a = a->next, n++) {
+        if (n > 64 || !a->string) return false;
+        for (const cJSON *b = a->next; b; b = b->next)
+            if (b->string && !strcmp(a->string, b->string)) return false;
+    }
+    return true;
+}
+
+static bool opt_string(const cJSON *o, const char *k)
+{
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return !v || cJSON_IsNull(v) || cJSON_IsString(v);
+}
+
+static bool req_string(const cJSON *o, const char *k)
+{
+    return cJSON_IsString(cJSON_GetObjectItemCaseSensitive(o, k));
+}
+
+static bool integer(const cJSON *v, double lo, double hi)
+{
+    return cJSON_IsNumber(v) && v->valuedouble >= lo && v->valuedouble <= hi && v->valuedouble == (double)(int64_t)v->valuedouble;
+}
+
+// Parses text[0 .. n) (with a NUL at text[n]) strictly. *oom says whether a failure was memory's.
+static cJSON *parse_strict(const char *text, size_t n, bool *oom)
+{
+    *oom = false;
+    if (!kw_json_depth_ok(text, n, WORKER_JSON_DEPTH)) return NULL;
+    unsigned f0 = kw_alloc_failures();
+    // n + 1 takes in the NUL: require_null_terminated then allows only whitespace after the value
+    cJSON *j = cJSON_ParseWithLengthOpts(text, n + 1, NULL, 1);
+    if (!j) *oom = kw_alloc_failures() != f0;
+    if (j && (!cJSON_IsObject(j) || !unique_keys(j))) { cJSON_Delete(j); j = NULL; }
+    return j;
+}
+
+// convmem_wire::Envelope, as serde reads it
+static bool envelope_fields_ok(const cJSON *e)
+{
+    const cJSON *s3 = cJSON_GetObjectItemCaseSensitive(e, "s3");
+    return integer(cJSON_GetObjectItemCaseSensitive(e, "v"), 0, 4294967295.0) && req_string(e, "message_uuid") &&
+           opt_string(e, "ciphertext") && opt_string(e, "sig_key") && opt_string(e, "sig") &&
+           (!s3 || cJSON_IsNull(s3) || (cJSON_IsObject(s3) && unique_keys(s3) && req_string(s3, "bucket") && req_string(s3, "key")));
+}
+
+// convmem_wire::Job, as serde reads it
+static bool job_fields_ok(const cJSON *j)
+{
+    static const char *const OPT[] = { "project_path", "git_branch", "name", "ai_title", "host", "author", "tool_name", "model" };
+    for (size_t i = 0; i < sizeof OPT / sizeof *OPT; i++)
+        if (!opt_string(j, OPT[i])) return false;
+    // project_path, git_branch, host and author default when absent, but serde refuses a null there
+    static const char *const NOT_NULL[] = { "project_path", "git_branch", "host", "author" };
+    for (size_t i = 0; i < sizeof NOT_NULL / sizeof *NOT_NULL; i++)
+        if (cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(j, NOT_NULL[i]))) return false;
+    return req_string(j, "session_id") && req_string(j, "message_uuid") && req_string(j, "role") &&
+           req_string(j, "content") && req_string(j, "created_at") &&
+           integer(cJSON_GetObjectItemCaseSensitive(j, "sequence_num"), -2147483648.0, 2147483647.0);
+}
+
+// Every string in the tree zeroed (the job's plaintext), before cJSON frees it.
+static void wipe_tree(cJSON *j)
+{
+    for (; j; j = j->next) {
+        if (j->valuestring) { volatile char *v = j->valuestring; while (*v) *v++ = 0; }
+        if (j->child) wipe_tree(j->child);      // depth is bounded by WORKER_JSON_DEPTH
+    }
+}
+
+// The plaintext job (JSON): its content, prepared and tokenised into j->ids. 0, -1 if it isn't a job
+// for this envelope, -2 if Kata ran out of memory (not the job's fault).
 static int open_job(worker_t *w, job_t *j, const char *json, size_t len)
 {
     jbuf_t clean;
     jb_init(&clean);
     int nuls = prep_json_nuls(json, len, &clean);
-    cJSON *job = nuls >= 0 ? cJSON_ParseWithLength(clean.p, clean.n) : NULL;
-    if (clean.p) memset(clean.p, 0, clean.n);
-    jb_free(&clean);
-    const char *uuid = cJSON_GetStringValue(cJSON_GetObjectItem(job, "message_uuid"));
-    const char *role = cJSON_GetStringValue(cJSON_GetObjectItem(job, "role"));
-    const char *content = cJSON_GetStringValue(cJSON_GetObjectItem(job, "content"));
+    bool oom = nuls < 0 || clean.oom;
+    cJSON *job = oom ? NULL : parse_strict(clean.p, clean.n, &oom);
+    if (clean.p) { kw_wipe_free(clean.p, clean.n); jb_init(&clean); }
+    if (oom) return -2;
+    const char *uuid = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(job, "message_uuid"));
+    const char *role = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(job, "role"));
+    const char *content = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(job, "content"));
     int rc = -1;
-    if (!uuid || strcmp(uuid, j->uuid)) wlog(w, "worker: %s: the job's uuid disagrees with the envelope's", j->uuid);
-    else if (!role || (strcmp(role, "user") && strcmp(role, "assistant"))) wlog(w, "worker: %s: unexpected role", j->uuid);
-    else if (!content) wlog(w, "worker: %s: no content", j->uuid);
+    if (!job || !job_fields_ok(job)) wlog(w, "worker: %s: the plaintext isn't a job Cal could read", j->uuid);
+    else if (strcmp(uuid, j->uuid)) wlog(w, "worker: %s: the job's uuid disagrees with the envelope's", j->uuid);
+    else if (strcmp(role, "user") && strcmp(role, "assistant")) wlog(w, "worker: %s: unexpected role", j->uuid);
     else {
         if (nuls > 0) wlog(w, "worker: %s: %d NULs written as \\0, as Cal does", j->uuid, nuls);
         size_t n = prep_truncate(content, strlen(content), PREP_MAX_CHARS, &j->truncated);
@@ -169,12 +250,13 @@ static int open_job(worker_t *w, job_t *j, const char *json, size_t len)
         if (nt < 2) {
             kw_free(j->ids);
             j->ids = NULL;
-            rc = -2;                          // the tokeniser failed (out of memory): not the job's fault
+            rc = -2;                          // the tokeniser failed (out of memory)
         } else {
             j->n_ids = nt;
             rc = 0;
         }
     }
+    wipe_tree(job);
     cJSON_Delete(job);
     return rc;
 }
@@ -183,19 +265,26 @@ static verdict_t arrive(worker_t *w, job_t *j)
 {
     j->received_at = now(w);
     j->visible_until = j->received_at + WORKER_VISIBILITY_S;
-    // The envelope is opaque except for these three; it's handed on byte for byte.
-    cJSON *env = cJSON_ParseWithLength(j->m.body, j->m.body_len);
-    const char *uuid = cJSON_GetStringValue(cJSON_GetObjectItem(env, "message_uuid"));
-    if (!cJSON_IsObject(env) || !uuid || !*uuid || strlen(uuid) >= sizeof j->uuid) {
-        // Not an envelope: no result could carry it. It goes to the ingest DLQ after maxReceiveCount.
+    // The envelope is opaque to Kata beyond these fields; it's handed on byte for byte.
+    bool oom;
+    cJSON *env = parse_strict(j->m.body, j->m.body_len, &oom);
+    if (oom) {
+        // Out of memory, not a bad body: drop it from the pool; it comes back after its visibility.
+        wlog(w, "worker: message %s: out of memory reading it: it comes back later", j->m.message_id);
+        return LATER;
+    }
+    const char *uuid = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(env, "message_uuid"));
+    if (!env || !envelope_fields_ok(env) || !*uuid || strlen(uuid) >= sizeof j->uuid) {
+        // Not an envelope Cal could read: no result could carry it. It reaches the ingest DLQ after
+        // maxReceiveCount.
         COUNT(w, invalid, 1);
         wlog(w, "worker: message %s isn't an envelope: left for the dead-letter queue", j->m.message_id);
         cJSON_Delete(env);
         return DROP;
     }
     snprintf(j->uuid, sizeof j->uuid, "%s", uuid);
-    const char *ct = cJSON_GetStringValue(cJSON_GetObjectItem(env, "ciphertext"));
-    bool s3 = cJSON_IsObject(cJSON_GetObjectItem(env, "s3"));
+    const char *ct = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(env, "ciphertext"));
+    bool s3 = cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(env, "s3"));
     const char *reason = NULL;
     if (!ct && s3) reason = REASON_CLAIM_CHECK;
     else if (j->m.receive_count >= WORKER_RETRIES_RECEIVE) reason = REASON_RETRIES;
@@ -206,18 +295,24 @@ static verdict_t arrive(worker_t *w, job_t *j)
         uint8_t *bin = kw_alloc(cl / 4 * 3 + 3), *pt = NULL;
         long bl = bin ? b64_decode(ct, cl, bin, B64_PADDED) : -1;
         size_t pl = 0;
-        age_err_t e = bl < 0 ? AGE_ERR_HEADER : age_decrypt(w->cfg.identity, bin, (size_t)bl, &pt, &pl, NULL);
+        age_err_t e = !bin ? AGE_ERR_NOMEM : bl < 0 ? AGE_ERR_HEADER : age_decrypt(w->cfg.identity, bin, (size_t)bl, &pt, &pl, NULL);
         kw_free(bin);
-        if (!bin) reason = REASON_KATA_UNHEALTHY;   // out of memory: let Cal have it
-        else if (e) {
+        if (e == AGE_ERR_NOMEM) {
+            cJSON_Delete(env);
+            wlog(w, "worker: %s: out of memory decrypting it: it comes back later", j->uuid);
+            return LATER;
+        } else if (e) {
             wlog(w, "worker: %s: %s", j->uuid, bl < 0 ? "ciphertext isn't base64" : age_strerror(e));
-            reason = e == AGE_ERR_NOMEM ? REASON_KATA_UNHEALTHY : REASON_DECRYPT_FAILED;
+            reason = REASON_DECRYPT_FAILED;
         } else {
             int rc = open_job(w, j, (const char *)pt, pl);
-            memset(pt, 0, pl);
-            kw_free(pt);
-            if (rc == -2) reason = REASON_KATA_UNHEALTHY;
-            else if (rc) reason = REASON_DECRYPT_FAILED;
+            kw_wipe_free(pt, pl);
+            if (rc == -2) {
+                cJSON_Delete(env);
+                wlog(w, "worker: %s: out of memory opening it: it comes back later", j->uuid);
+                return LATER;
+            }
+            if (rc) reason = REASON_DECRYPT_FAILED;
         }
     }
     cJSON_Delete(env);
@@ -309,11 +404,11 @@ static void handoff(worker_t *w)
 
 // all_pending: every pending job (to release them, for an update); otherwise every job still held
 // that could be visible again before the next phase.
-static void visibility(worker_t *w, bool all_pending, int seconds)
+static int visibility(worker_t *w, bool all_pending, int seconds)
 {
-    int64_t t = now(w);
+    int64_t t = now(w), rc_all = 0;
     bool *att = kw_alloc((size_t)(w->n ? w->n : 1) * sizeof *att);
-    if (!att) return;
+    if (!att) return -1;
     memset(att, 0, (size_t)(w->n ? w->n : 1) * sizeof *att);
     for (;;) {
         int idx[SQS_MAX_BATCH], k = 0;
@@ -331,11 +426,19 @@ static void visibility(worker_t *w, bool all_pending, int seconds)
             job_t *j = &w->pool[idx[b]];
             att[idx[b]] = true;
             if (!rc && ok[b]) j->visible_until = t + seconds;
-            else if (!rc) wlog(w, "worker: %s: visibility refused (stale handle: it may come back to someone)", j->uuid);
+            else if (!rc) {
+                // A stale handle: the job may already be someone else's. A pending one leaves the
+                // pool rather than be embedded for nothing (its delete couldn't delete it).
+                wlog(w, "worker: %s: visibility refused (stale handle)", j->uuid);
+                if (j->state == JOB_PENDING && !all_pending) j->visible_until = -1;
+            }
         }
-        if (rc) { wlog(w, "worker: visibility failed: %s", w->io.sqs->last_error); break; }
+        if (rc) { rc_all = -1; wlog(w, "worker: visibility failed: %s", w->io.sqs->last_error); break; }
     }
     kw_free(att);
+    for (int i = w->n - 1; i >= 0; i--)
+        if (w->pool[i].state == JOB_PENDING && w->pool[i].visible_until == -1) remove_job(w, i);
+    return (int)rc_all;
 }
 
 // Returns how many messages arrived.
@@ -362,7 +465,7 @@ static int top_up(worker_t *w)
             j->m = msgs[i];
             arrived++;
             // dropped: not an envelope, or out of memory part-way (it's redelivered after its visibility)
-            if (arrive(w, j) == DROP || (j->state == JOB_PENDING && !j->ids)) remove_job(w, w->n - 1);
+            if (arrive(w, j) != KEEP || (j->state == JOB_PENDING && !j->ids)) remove_job(w, w->n - 1);
         }
         kw_free(msgs);
         if (!got) break;
@@ -437,12 +540,20 @@ static void pass(worker_t *w)
     COUNT(w, passes, 1);
     if (!rc) {
         kata_result_t stats = { .has_pass = true, .pass_n_seg = np, .pass_tokens = tokens, .pass_ms = info.ms };
+        int lost = 0;
         for (int k = 0; k < np; k++) {
             job_t *j = &w->pool[pend[pick[k]]];
-            if (finish(w, j, vecs + (size_t)k * RESULT_DIMS, &stats)) wlog(w, "worker: %s: out of memory for its result", j->uuid);
+            if (finish(w, j, vecs + (size_t)k * RESULT_DIMS, &stats)) { lost++; wlog(w, "worker: %s: out of memory for its result", j->uuid); }
             else COUNT(w, messages, 1);
         }
-        w->bad_in_row = 0;
+        // A job whose result couldn't be built stays pending and is embedded again; if memory stays
+        // that short, these count towards sick like any other bad pass.
+        if (lost) {
+            COUNT(w, bad_passes, 1);
+            if (++w->bad_in_row >= WORKER_BAD_PASSES && !w->sick) go_sick(w);
+        } else {
+            w->bad_in_row = 0;
+        }
         wlog(w, "worker: pass: %d messages, %d tokens, %.1f s (%.1f s on the card)", np, tokens, info.ms / 1e3,
              info.card_wait_ms / 1e3);
     } else {
@@ -497,8 +608,15 @@ int worker_step(worker_t *w)
             wlog(w, "worker: parked for an update: nothing held");
             return 0;
         }
+        // Results still undelivered: keep them hidden (the jobs are held), and try again shortly.
+        // Note what a park costs: each released job comes back with one more receive, so an update
+        // right after another can push a job to its third delivery (then it goes to Cal unembedded).
+        if (w->io.net_begin(w->io.ctx, why, sizeof why) == 0) {
+            visibility(w, false, WORKER_VISIBILITY_S);
+            w->io.net_end(w->io.ctx);
+        }
         w->state = "handing-off";
-        return 5;                             // results still undelivered: try again shortly
+        return 5;
     }
     if (count_state(w, JOB_RESULT) || count_state(w, JOB_DELETE)) {
         // Undelivered results: keep everything hidden, and no new pass until they're through.
@@ -509,11 +627,19 @@ int worker_step(worker_t *w)
     }
     w->state = "receiving";
     int arrived = top_up(w);
+    if (w->sick)                              // whatever's still pending (memory ran short when it went sick)
+        for (int i = 0; i < w->n; i++)
+            if (w->pool[i].state == JOB_PENDING) unembedded(w, &w->pool[i], REASON_KATA_UNHEALTHY);
     if (count_state(w, JOB_RESULT)) handoff(w);
-    visibility(w, false, WORKER_VISIBILITY_S);
+    int extended = visibility(w, false, WORKER_VISIBILITY_S);
     w->io.net_end(w->io.ctx);
+    if (extended) {
+        // A job might come back to someone else mid-pass: no pass until the extension goes through.
+        w->state = w->sick ? "sick" : "idle";
+        return backoff(w);
+    }
     w->retry_s = 0;
-    if (count_state(w, JOB_PENDING)) {
+    if (count_state(w, JOB_PENDING) && !w->sick) {
         w->state = "embedding";
         pass(w);
         w->state = w->sick ? "sick" : "idle";
@@ -579,7 +705,8 @@ void worker_status_json(worker_t *w, jbuf_t *b)
     if (w->sick) jb_printf(b, ",\"sick_since\":%lld", (long long)w->sick_since);
     if (w->last_error[0]) {
         jb_puts(b, ",\"last_error\":");
-        jb_json_str(b, w->last_error, strnlen(w->last_error, sizeof w->last_error - 1));   // racy reads stay bounded
+        // bounded (racy reads, and the heartbeat's MQTT buffer); escaping can at most double it
+        jb_json_str(b, w->last_error, strnlen(w->last_error, WORKER_STATUS_ERROR_MAX));
     }
     jb_putc(b, '}');
 }

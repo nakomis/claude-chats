@@ -32,6 +32,9 @@ extern const char root_ca_start[] asm("_binary_AmazonRootCA1_pem_start");
 #define POOL_MAX 40
 #define POOL_BUDGET_MAX (1024 * 1024)
 #define PSRAM_RESERVE (384 * 1024)    // left for mbedTLS (in PSRAM), JSON parsing and the heartbeat
+#define POOL_PEAK 5                   // a receive's peak is about this many times its bodies: the
+                                      // response, cJSON's tree, our copies, the results built from them
+#define MQTT_MIN_S 15                 // MQTT's turn between SQS phases, at least: commands and updates
 #define MIN_INTERNAL (24 * 1024)      // free internal RAM a phase needs, MQTT paused, before TLS
 #define HTTP_TIMEOUT_MS 30000         // longer than SQS's 20 s long poll
 #define HTTP_RX_BUF 2048              // internal RAM, only while a phase runs
@@ -49,6 +52,8 @@ static volatile int64_t last_tick_us;
 static temperature_sensor_handle_t tsens;
 static int vcore;
 static const char *why_not = "starting";
+static int64_t mqtt_back_us;            // when MQTT last came back (net_end)
+static size_t phase_big;                // the largest request or response of this phase
 
 // ---- the heartbeat's fields (fleet.h; the esp_timer task) ----------------------------------------
 static void status_extra(jbuf_t *b)
@@ -118,6 +123,7 @@ static int sqs_post(void *ctx, const http_req_t *r, jbuf_t *resp)
         if (!sqs_http) { printf("worker: SQS client init failed\n"); return -1; }
     }
     esp_http_client_set_user_data(sqs_http, resp);
+    if (r->body_len > phase_big) phase_big = r->body_len;
     for (int i = 0; i < r->n_hdrs; i++)
         if (strcasecmp(r->hdrs[i].name, "Host")) esp_http_client_set_header(sqs_http, r->hdrs[i].name, r->hdrs[i].value);
     esp_http_client_set_post_field(sqs_http, r->body, (int)r->body_len);
@@ -129,6 +135,7 @@ static int sqs_post(void *ctx, const http_req_t *r, jbuf_t *resp)
         esp_http_client_close(sqs_http);    // the next request reconnects
         return -1;
     }
+    if (resp->n > phase_big) phase_big = resp->n;
     return esp_http_client_get_status_code(sqs_http);
 }
 
@@ -161,6 +168,7 @@ static int creds_get(void *ctx, const char *host, const char *path, const sv4_hd
 static int net_begin(void *ctx, char *why, size_t n)
 {
     (void)ctx;
+    phase_big = 0;
     if (!net_time_ok(5000)) { snprintf(why, n, "no time from SNTP yet (SigV4 needs it)"); return -1; }
     fleet_pause();
     unsigned free_int = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -182,9 +190,15 @@ static void net_end(void *ctx)
         esp_http_client_cleanup(sqs_http);
         sqs_http = NULL;
     }
+    // The first few phases, any that moved a big body (the bring-up check: a ~200 KB inline job), then
+    // about hourly. The low point is the one to watch.
     static int phases;
-    if (phases++ < 3 || phases % 60 == 0) net_heap("worker: after an SQS phase");   // the first few, then hourly-ish
+    if (phases++ < 3 || phase_big > 64 * 1024 || phases % 60 == 0) {
+        printf("worker: phase moved up to %u bytes in one request or response\n", (unsigned)phase_big);
+        net_heap("worker: after an SQS phase");
+    }
     fleet_resume();
+    mqtt_back_us = esp_timer_get_time();
 }
 
 static int tokenise(void *ctx, const char *text, size_t len, int32_t *ids, int max)
@@ -237,15 +251,19 @@ void kata_worker_run(const prov_t *p, bool online, bool healthy)
     const age_identity_t *id = NULL;
     if (p->age_id && age_identity_parse(p->age_id, &identity) == 0) id = &identity;
     else printf("worker: no usable age identity: every job goes to Cal as decrypt-failed (age-identity.sh, provision.sh)\n");
+    if (p->age_id) {                          // parsed: the text form isn't needed again
+        kw_wipe_free(p->age_id, strlen(p->age_id));
+        ((prov_t *)p)->age_id = NULL;
+    }
     if (sqs_init(&sqs, p->queue_url, &creds, now, sqs_post, NULL)) {
         why_not = "the queue URL isn't SQS's";
         printf("worker: not starting: %s: %s\n", why_not, p->queue_url);
         return;
     }
     // The pool's budget: what PSRAM can spare, as a receive's worst case (several bodies at once,
-    // the response, cJSON's copy and ours) is about three times the bodies.
+    // the response, cJSON's copy, ours, and the results built from them) is about POOL_PEAK times.
     size_t free_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    size_t budget = free_ps > PSRAM_RESERVE ? (free_ps - PSRAM_RESERVE) / 3 : 0;
+    size_t budget = free_ps > PSRAM_RESERVE ? (free_ps - PSRAM_RESERVE) / POOL_PEAK : 0;
     if (budget > POOL_BUDGET_MAX) budget = POOL_BUDGET_MAX;
     if (budget < WORKER_WORST_BODY) {
         why_not = "not enough PSRAM for one job";
@@ -265,9 +283,15 @@ void kata_worker_run(const prov_t *p, bool online, bool healthy)
     const esp_timer_create_args_t wa = { .callback = watchdog, .name = "worker_wd" };
     if (esp_timer_create(&wa, &wd) == ESP_OK) esp_timer_start_periodic(wd, 60ULL * 1000000);
     for (;;) {
+        // MQTT gets at least MQTT_MIN_S between SQS phases, however busy the queue (a sick board
+        // forwarding a backlog has no passes to give it time), so commands and updates get through.
+        while (esp_timer_get_time() - mqtt_back_us < (int64_t)MQTT_MIN_S * 1000000) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            last_tick_us = esp_timer_get_time();
+        }
         last_tick_us = esp_timer_get_time();
         int wait = worker_step(&w);
-        fleet_status_now();
+        fleet_status_now();                   // after a pass (the heartbeat also goes on every reconnect)
         // MQTT's turn; an update asking the worker to park cuts it short
         for (int s = 0; s < wait && !(w.park_requested && !w.parked); s++) {
             vTaskDelay(pdMS_TO_TICKS(1000));

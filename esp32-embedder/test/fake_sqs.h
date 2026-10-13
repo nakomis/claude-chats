@@ -40,6 +40,7 @@ typedef struct {
     int fail_target_next;
     const char *refuse_body_containing; // SendMessageBatch entries with this in their body fail
     bool corrupt_md5;                   // ReceiveMessage reports a wrong MD5OfBody
+    int over_deliver;                   // ReceiveMessage returns up to this many more than asked
     int64_t max_batch_seen;             // the largest SendMessageBatch total, in bytes
     int seq;
 } fake_sqs_t;

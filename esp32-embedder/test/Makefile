@@ -18,7 +18,7 @@ LDLIBS := -lm
 
 TESTS := test_kw test_sigv4 test_age test_prep test_result test_sqs test_creds test_worker test_tag test_batch test_att
 
-all: $(addprefix $(B)/,$(TESTS)) $(B)/testkit
+all: lint $(addprefix $(B)/,$(TESTS)) $(B)/testkit
 	cd $(B) && for t in $(TESTS); do echo "== $$t"; UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$$t || exit 1; done
 
 $(B):
@@ -32,8 +32,9 @@ $(B)/mbedtls/%.o: $(MBEDTLS)/library/%.c | $(B)
 	@$(CC) -O2 -std=gnu11 -I$(MBEDTLS)/include -I$(MBEDTLS)/library -c $< -o $@
 $(B)/libmbedcrypto.a: $(MBED_OBJS)
 	@ar rcs $@ $^
+# with the firmware's nesting limit (main/CMakeLists.txt)
 $(B)/cjson.o: $(CJSON)/cJSON.c | $(B)
-	$(CC) -O2 -std=gnu11 -c $< -o $@
+	$(CC) -O2 -std=gnu11 -DCJSON_NESTING_LIMIT=32 -c $< -o $@
 
 WORKER := $(wildcard $(W)/*.c)
 HDRS := $(wildcard $(W)/*.h) testutil.h
@@ -56,7 +57,13 @@ $(B)/test_att: test_att.c att_old.inc stub/esp_host.h $(FW)/kernels.inc $(FW)/f1
 $(B)/testkit: age-testkit/* testkit.py | $(B)
 	rm -rf $@ && python3 -I testkit.py age-testkit $@
 
+# The worker allocates only through kw.h (PSRAM on the board, where malloc means internal RAM, which
+# the network needs): no malloc, calloc, realloc, strdup or free outside kw.c.
+lint:
+	@if grep -nE '(^|[^_a-zA-Z0-9.>])(malloc|calloc|realloc|strdup|strndup|free)\(' $(filter-out $(W)/kw.c,$(WORKER)); then \
+		echo "worker/: allocate through kw.h (kw_alloc, kw_free), not the C library"; exit 1; fi
+
 clean:
 	rm -rf $(B)
 
-.PHONY: all clean
+.PHONY: all clean lint

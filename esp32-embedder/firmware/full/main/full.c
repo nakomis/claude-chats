@@ -36,6 +36,7 @@
 #include "vcore.h"
 #include "kata_worker.h"
 #include "kw.h"
+#include "cJSON.h"
 #include "selftest.h"
 #include "longtest.h"
 
@@ -676,30 +677,28 @@ static void selftest_run(void)
     checking = false;
 }
 
-// CHATS-5: a sick worker's health check (worker.h): the five short self-test texts in one batched
-// pass, each bit for bit what selftest.h records. A message gets the same arithmetic in a batch as on
-// its own (PR #21; test/test_att.c), so the single-pass CRCs apply. About 75 s.
+// CHATS-5: a sick worker's health check (worker.h): the five short self-test texts, each in a pass of
+// its own as at boot, bit for bit what selftest.h records. About 6 minutes. (One batched pass would
+// take 75 s, and PR #21's test_att shows a segment gets the same bits as a pass of its own; but that's
+// proven on the host, not yet on the chip, and if it weren't so a sick board would never recover.)
 int model_health(void)
 {
     if (!model_ready) return -1;
     int32_t *q = ps(MAXTOK * sizeof *q);
-    float *v = ps((size_t)N_TEXTS * D * sizeof *v);
-    int lens[N_TEXTS], t = 0, bad = 0, rc = -1;
-    if (q && v) {
-        rc = 0;
-        for (int i = 0; i < N_TEXTS && !rc; i++) {
-            lens[i] = tok_encode(&vocab, TEXTS[i], strlen(TEXTS[i]), q + t, MAXTOK - t, NULL);
-            if (lens[i] < 2 || t + lens[i] > MAXTOK) rc = -1;
-            else t += lens[i];
-        }
+    float *v = ps(D * sizeof *v);
+    int bad = 0, rc = q && v ? 0 : -1;
+    for (int i = 0; i < N_TEXTS && !rc; i++) {
+        int len = tok_encode(&vocab, TEXTS[i], strlen(TEXTS[i]), q, MAXTOK, NULL);
         worker_pass_info_t info = { 0 };
-        if (!rc) rc = model_embed(q, lens, N_TEXTS, v, &info);
-        for (int i = 0; !rc && i < N_TEXTS; i++) {
-            uint32_t c = esp_rom_crc32_le(0, (const uint8_t *)(v + (size_t)i * D), D * 4);
-            if (c != SELFTEST_CRC[i]) { bad++; printf("health: test %d: vector crc %08lx, want %08lx\n", i, (unsigned long)c, (unsigned long)SELFTEST_CRC[i]); }
+        if (len < 2 || model_embed(q, &len, 1, v, &info)) {
+            printf("health: test %d: %s\n", i, info.why ? info.why : "the tokeniser failed");
+            rc = -1;
+            break;
         }
-        printf("health: %d texts in one pass: %s\n", N_TEXTS, rc ? (info.why ? info.why : "the pass failed") : bad ? "WRONG" : "bit-exact");
+        uint32_t c = esp_rom_crc32_le(0, (const uint8_t *)v, D * 4);
+        if (c != SELFTEST_CRC[i]) { bad++; printf("health: test %d: vector crc %08lx, want %08lx\n", i, (unsigned long)c, (unsigned long)SELFTEST_CRC[i]); }
     }
+    printf("health: %d texts: %s\n", N_TEXTS, rc ? "a pass failed" : bad ? "WRONG" : "bit-exact");
     heap_caps_free(q);
     heap_caps_free(v);
     return rc || bad ? -1 : 0;
@@ -714,6 +713,11 @@ void app_main(void)
     int vcore_mv = vcore_boost(1250);        // 240 MHz needs >= 1.25 V on some chips: see vcore.c
     static const kw_mem_t psram = { ps_alloc, ps_realloc, heap_caps_free };
     kw_set_mem(&psram);
+    // CHATS-5: cJSON too (the worker's parses, Fleet's commands): malloc here is internal RAM only
+    // (CONFIG_SPIRAM_USE_CAPS_ALLOC), which the network needs. Through kw, so a parse that fails for
+    // want of memory is told apart from a bad body (kw_alloc_failures).
+    static cJSON_Hooks hooks = { kw_alloc, kw_free };
+    cJSON_InitHooks(&hooks);
     vTaskDelay(pdMS_TO_TICKS(1500));
     printf("\n== Kata: mxbai-embed-large on the S3, weights from SD ==\n");
     const esp_app_desc_t *app = esp_app_get_description();   // version.txt, or CI's x.y.z (CHATS-10)

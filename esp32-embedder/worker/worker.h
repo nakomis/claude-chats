@@ -61,6 +61,8 @@
 #define WORKER_CARD_HISTORY 15           // passes in the card-wait median
 #define WORKER_NORM_MIN 10.0             // a raw [CLS] vector's norm, as Cal checks it (results.rs)
 #define WORKER_NORM_MAX 30.0
+#define WORKER_JSON_DEPTH 32             // envelopes and jobs nest 3 deep; cJSON recurses per level
+#define WORKER_STATUS_ERROR_MAX 96       // last_error's share of the heartbeat
 
 typedef struct {
     void *ctx;

@@ -7,11 +7,54 @@
 
 // ---- allocation ----------------------------------------------------------------------------
 static kw_mem_t mem = { malloc, realloc, free };
+static volatile unsigned failures;
 
 void kw_set_mem(const kw_mem_t *m) { mem = *m; }
-void *kw_alloc(size_t n) { return mem.alloc(n ? n : 1); }
-void *kw_realloc(void *p, size_t n) { return mem.realloc(p, n ? n : 1); }
+unsigned kw_alloc_failures(void) { return failures; }
+
+void *kw_alloc(size_t n)
+{
+    void *p = mem.alloc(n ? n : 1);
+    if (!p) failures++;
+    return p;
+}
+
+void *kw_realloc(void *p, size_t n)
+{
+    void *q = mem.realloc(p, n ? n : 1);
+    if (!q) failures++;
+    return q;
+}
+
 void kw_free(void *p) { if (p) mem.free(p); }
+
+void kw_wipe_free(void *p, size_t n)
+{
+    if (!p) return;
+    volatile unsigned char *v = p;
+    while (n--) *v++ = 0;
+    mem.free(p);
+}
+
+bool kw_json_depth_ok(const char *s, size_t n, int max_depth)
+{
+    int depth = 0;
+    bool in_str = false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (in_str) {
+            if (c == '\\') i++;
+            else if (c == '"') in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '[' || c == '{') {
+            if (++depth > max_depth) return false;
+        } else if (c == ']' || c == '}') {
+            depth--;
+        }
+    }
+    return true;
+}
 
 char *kw_strndup(const char *s, size_t n)
 {
@@ -57,7 +100,7 @@ bool jb_reserve(jbuf_t *b, size_t extra)
 void jb_put(jbuf_t *b, const void *data, size_t n)
 {
     if (!jb_reserve(b, n)) return;
-    memcpy(b->p + b->n, data, n);
+    if (n) memcpy(b->p + b->n, data, n);      // data may be NULL when n is 0
     b->n += n;
     b->p[b->n] = 0;
 }

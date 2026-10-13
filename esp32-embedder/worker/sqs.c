@@ -48,6 +48,15 @@ static void md5_hex(const void *data, size_t n, char out[33])
     for (int i = 0; i < 16; i++) snprintf(out + 2 * i, 3, "%02x", h[i]);
 }
 
+// After a big call (a receive of large bodies, a batch of results), the buffers go back to PSRAM
+// rather than sitting there at their high-water mark.
+#define SQS_KEEP_BUF (64 * 1024)
+static void shrink(sqs_t *s)
+{
+    if (s->req.cap > SQS_KEEP_BUF) jb_free(&s->req);
+    if (s->resp.cap > SQS_KEEP_BUF) jb_free(&s->resp);
+}
+
 // One call: s->req holds the JSON body. The parsed response, or NULL (last_error says why).
 static cJSON *call(sqs_t *s, const char *action)
 {
@@ -73,6 +82,7 @@ static cJSON *call(sqs_t *s, const char *action)
     const http_req_t req = { s->host, "/", h, 6, s->req.p, s->req.n };
     jb_reset(&s->resp);
     int status = s->post(s->ctx, &req, &s->resp);
+    if (s->resp.oom) { s->last_status = status; snprintf(s->last_error, sizeof s->last_error, "%s: out of memory for the response", action); shrink(s); return NULL; }
     s->last_status = status;
     if (status < 0) { snprintf(s->last_error, sizeof s->last_error, "%s: no response", action); return NULL; }
     cJSON *j = s->resp.p && !s->resp.oom ? cJSON_ParseWithLength(s->resp.p, s->resp.n) : NULL;
@@ -85,9 +95,11 @@ static cJSON *call(sqs_t *s, const char *action)
         snprintf(s->last_error, sizeof s->last_error, "%s: HTTP %d %s%s%s", action, status, type ? type : "",
                  msg ? ": " : "", msg ? msg : "");
         cJSON_Delete(j);
+        shrink(s);
         return NULL;
     }
     if (!j) snprintf(s->last_error, sizeof s->last_error, "%s: unparseable response (%zu bytes)", action, s->resp.n);
+    shrink(s);                                // the tree holds what it needs
     return j;
 }
 
@@ -102,10 +114,11 @@ int sqs_receive(sqs_t *s, const char *queue_url, int max, int wait_s, int visibi
 {
     *msgs = NULL;
     *n = 0;
+    max = max < 1 ? 1 : max > 10 ? 10 : max;
     begin(s, queue_url);
     jb_printf(&s->req, ",\"MaxNumberOfMessages\":%d,\"WaitTimeSeconds\":%d,\"VisibilityTimeout\":%d,"
                        "\"MessageSystemAttributeNames\":[\"ApproximateReceiveCount\"]}",
-              max < 1 ? 1 : max > 10 ? 10 : max, wait_s, visibility_s);
+              max, wait_s, visibility_s);
     cJSON *j = call(s, "ReceiveMessage");
     if (!j) return -1;
     const cJSON *arr = cJSON_GetObjectItem(j, "Messages"), *m;
@@ -134,7 +147,9 @@ int sqs_receive(sqs_t *s, const char *queue_url, int max, int wait_s, int visibi
         o->body_len = bl;
         o->receive_count = rc ? atoi(rc) : 1;
         if (!o->message_id || !o->receipt || !o->body) { sqs_msg_free(o); continue; }   // comes back later
-        k++;
+        // SQS never sends more than asked; if it did, the caller's pool has no room for the rest: they
+        // stay in flight and come back after visibility_s.
+        if (++k == max) break;
     }
     cJSON_Delete(j);
     if (!k) { kw_free(out); out = NULL; }

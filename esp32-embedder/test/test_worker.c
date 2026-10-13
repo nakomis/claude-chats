@@ -417,6 +417,185 @@ static void bad_passes(void)
     board_free(&b, &w);
 }
 
+static void strict(void)
+{
+    printf("-- envelopes and jobs Cal's serde would refuse, and deep nesting\n");
+    board_t b;
+    worker_t w;
+    board_init(&b, &w, NULL);
+    // envelopes: none of these is one Cal could read; all stay on the queue for its DLQ
+    static const char *const BAD_ENV[] = {
+        "{\"v\":1,\"message_uuid\":\"u-x1\",\"s3\":{\"bucket\":\"b\",\"key\":\"k\"}} trailing",
+        "{\"v\":1,\"message_uuid\":\"u-x2\",\"message_uuid\":\"u-x3\",\"s3\":{\"bucket\":\"b\",\"key\":\"k\"}}",
+        "{\"v\":\"1\",\"message_uuid\":\"u-x4\",\"s3\":{\"bucket\":\"b\",\"key\":\"k\"}}",
+        "{\"v\":1.5,\"message_uuid\":\"u-x5\",\"s3\":{\"bucket\":\"b\",\"key\":\"k\"}}",
+        "{\"v\":1,\"message_uuid\":\"u-x6\",\"s3\":{\"bucket\":\"b\"}}",
+        "{\"v\":1,\"message_uuid\":\"u-x7\",\"ciphertext\":5}",
+        "{\"v\":1,\"message_uuid\":\"u-x8\",\"sig\":[\"x\"],\"s3\":{\"bucket\":\"b\",\"key\":\"k\"}}",
+        "[\"v\",1]",
+    };
+    int nbad = (int)(sizeof BAD_ENV / sizeof *BAD_ENV);
+    for (int i = 0; i < nbad; i++) fq_send(&b.f, INGEST, BAD_ENV[i]);
+    // 200 deep: refused before it's parsed (cJSON would recurse 200 times on a 16 KB stack)
+    jbuf_t deep;
+    jb_init(&deep);
+    jb_puts(&deep, "{\"v\":1,\"message_uuid\":\"u-deep\",\"x\":");
+    for (int i = 0; i < 200; i++) jb_putc(&deep, '[');
+    for (int i = 0; i < 200; i++) jb_putc(&deep, ']');
+    jb_puts(&deep, ",\"s3\":{\"bucket\":\"b\",\"key\":\"k\"}}");
+    fq_send(&b.f, INGEST, deep.p);
+    jb_free(&deep);
+    // and the good ones: trailing whitespace, unknown fields and nulls in optional ones are fine
+    fq_send(&b.f, INGEST, "{\"v\":1,\"message_uuid\":\"u-ok1\",\"s3\":{\"bucket\":\"b\",\"key\":\"k\"},\"sig\":null,\"future\":{}} \n");
+    worker_step(&w);
+    worker_step(&w);
+    CHECK(w.boot.invalid == nbad + 1, "%d invalid, want %d", w.boot.invalid, nbad + 1);
+    CHECK(results(&b) == 1 && !strcmp(reason_of(&b, "u-ok1"), "claim-check"), "only the good one handed on (%d)", results(&b));
+    CHECK(fq_live(fq_queue(&b.f, INGEST)) == nbad + 1, "the bad ones stay for the DLQ");
+    board_free(&b, &w);
+
+    // jobs: a plaintext Cal's serde would refuse goes to Cal unembedded (Cal decides), not embedded
+    board_init(&b, &w, NULL);
+    static const char *const BAD_JOB[] = {
+        "{\"session_id\":\"s\",\"message_uuid\":\"u-j%d\",\"role\":\"user\",\"content\":\"x\",\"sequence_num\":1,\"created_at\":\"t\"} junk",
+        "{\"session_id\":\"s\",\"message_uuid\":\"u-j%d\",\"role\":\"user\",\"content\":\"x\",\"content\":\"y\",\"sequence_num\":1,\"created_at\":\"t\"}",
+        "{\"session_id\":\"s\",\"message_uuid\":\"u-j%d\",\"role\":\"user\",\"content\":\"x\",\"sequence_num\":1.5,\"created_at\":\"t\"}",
+        "{\"session_id\":\"s\",\"message_uuid\":\"u-j%d\",\"role\":\"user\",\"content\":\"x\",\"created_at\":\"t\"}",
+        "{\"session_id\":\"s\",\"message_uuid\":\"u-j%d\",\"role\":\"user\",\"content\":\"x\",\"sequence_num\":1,\"created_at\":\"t\",\"host\":null}",
+        "{\"session_id\":\"s\",\"message_uuid\":\"u-j%d\",\"role\":\"user\",\"content\":\"x\",\"sequence_num\":1,\"created_at\":\"t\",\"x\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    };
+    int njob = (int)(sizeof BAD_JOB / sizeof *BAD_JOB);
+    for (int i = 0; i < njob; i++) {
+        char job[512], uuid[16], env_uuid[16];
+        snprintf(job, sizeof job, BAD_JOB[i], i);
+        snprintf(uuid, sizeof uuid, "u-j%d", i);
+        snprintf(env_uuid, sizeof env_uuid, "%s", uuid);
+        jbuf_t ct, env;
+        jb_init(&ct); jb_init(&env);
+        uint8_t to[1][32];
+        memcpy(to[0], kata_pub, 32);
+        age_encrypt(to, 1, (const uint8_t *)job, strlen(job), &ct);
+        jb_printf(&env, "{\"v\":1,\"message_uuid\":\"%s\",\"ciphertext\":\"", env_uuid);
+        jb_b64(&env, (const uint8_t *)ct.p, ct.n);
+        jb_puts(&env, "\"}");
+        fq_send(&b.f, INGEST, env.p);
+        jb_free(&ct); jb_free(&env);
+    }
+    worker_step(&w);
+    worker_step(&w);
+    CHECK(b.passes == 0, "nothing embedded");
+    for (int i = 0; i < njob; i++) {
+        char uuid[16];
+        snprintf(uuid, sizeof uuid, "u-j%d", i);
+        CHECK(!strcmp(reason_of(&b, uuid), "decrypt-failed"), "job %d: %s", i, reason_of(&b, uuid));
+    }
+    board_free(&b, &w);
+}
+
+static void extension(void)
+{
+    printf("-- a visibility extension that fails stops the pass\n");
+    board_t b;
+    worker_t w;
+    board_init(&b, &w, NULL);
+    char *q0 = make_job_text(&b, "u-e0", "redelivered");
+    char *q1 = make_job_text(&b, "u-e1", "one");
+    char *q2 = make_job_text(&b, "u-e2", "two");
+    fq_queue(&b.f, INGEST)->msgs[0].receive_count = 1;
+    worker_step(&w);                          // q0 alone; q1, q2 pending
+    CHECK(b.passes == 1 && b.last_n_seg == 1, "solo");
+    b.f.now += 400;                           // q1 and q2 need extending before the next pass
+    b.f.fail_target = "AmazonSQS.ChangeMessageVisibilityBatch";
+    b.f.fail_target_next = 1;
+    int wait = worker_step(&w);
+    CHECK(b.passes == 1 && wait > 0, "no pass after a failed extension (wait %d)", wait);
+    worker_step(&w);
+    CHECK(b.passes == 2 && b.last_n_seg == 2, "then the pass: %d segments", b.last_n_seg);
+    worker_step(&w);
+    CHECK(fq_live(fq_queue(&b.f, INGEST)) == 0 && results(&b) == 3, "all through");
+    kw_free(q0); kw_free(q1); kw_free(q2);
+    board_free(&b, &w);
+
+    // jobs whose visibility lapsed (their handles are stale): refused, so they leave the pool
+    board_init(&b, &w, NULL);
+    q0 = make_job_text(&b, "u-s0", "redelivered");
+    q1 = make_job_text(&b, "u-s1", "one");
+    fq_queue(&b.f, INGEST)->msgs[0].receive_count = 1;
+    worker_step(&w);                          // q0 alone; q1 pending
+    b.f.now += 2000;                          // q1's visibility has lapsed
+    // The top-up receives q1 again (its second delivery: a pass of its own); the stale copy's
+    // extension is refused and it leaves the pool, so q1 is embedded once, not twice.
+    worker_step(&w);
+    CHECK(b.passes == 2 && b.last_n_seg == 1 && w.n == 1, "the fresh copy alone, the stale one gone: %d passes, %d held",
+          b.passes, w.n);
+    for (int i = 0; i < 3; i++) worker_step(&w);
+    CHECK(fq_live(fq_queue(&b.f, INGEST)) == 0 && results(&b) == 2 && !strcmp(reason_of(&b, "u-s1"), "(embedded)"),
+          "through once: %d results", results(&b));
+    kw_free(q0); kw_free(q1);
+    board_free(&b, &w);
+}
+
+// ---- out of memory: every Nth allocation fails, in the worker's code (not the fake SQS's) ------------
+static int oom_every, oom_count;
+static bool oom_on;
+static void *oom_alloc(size_t n) { return oom_on && oom_every && ++oom_count % oom_every == 0 ? NULL : malloc(n); }
+static void *oom_realloc(void *p, size_t n) { return oom_on && oom_every && ++oom_count % oom_every == 0 ? NULL : realloc(p, n); }
+static int oom_post(void *ctx, const http_req_t *r, jbuf_t *resp)
+{
+    bool was = oom_on;
+    oom_on = false;                           // the fake's own allocations (and the response buffer) don't fail...
+    int st = fq_post(ctx, r, resp);
+    oom_on = was;
+    return st;
+}
+
+static void out_of_memory(void)
+{
+    printf("-- out of memory everywhere: nothing lost, nothing leaked\n");
+    static const kw_mem_t failing = { oom_alloc, oom_realloc, free };
+    static const kw_mem_t plain = { malloc, realloc, free };
+    for (int every = 3; every <= 41; every += 2) {
+        board_t b;
+        worker_t w;
+        board_init(&b, &w, NULL);
+        b.sqs.post = oom_post;
+        static char uuid_store[20][16];
+        const char *uuids[20];
+        char *bodies[20];
+        for (int i = 0; i < 20; i++) {
+            snprintf(uuid_store[i], 16, "u-%02d", i);
+            uuids[i] = uuid_store[i];
+            char words[48];
+            snprintf(words, sizeof words, "job %d with words", i);
+            bodies[i] = make_job_text(&b, uuids[i], words);
+        }
+        kw_set_mem(&failing);
+        oom_every = every;
+        oom_count = 0;
+        oom_on = true;
+        for (int s = 0; s < 120; s++) {
+            b.f.now += worker_step(&w);
+            oom_on = false;
+            invariant(&b, uuids, 20, "out of memory");
+            oom_on = true;
+            if (s == 80) oom_every = 0;       // then memory comes back
+        }
+        oom_on = false;
+        kw_set_mem(&plain);
+        int have = 0;
+        for (int i = 0; i < 20; i++) {
+            cJSON *r = result_for(&b, uuids[i]);
+            have += r != NULL;
+            cJSON_Delete(r);
+        }
+        CHECK(have == 20 && fq_live(fq_queue(&b.f, INGEST)) == 0, "every %d: %d of 20 through, %d left", every, have,
+              fq_live(fq_queue(&b.f, INGEST)));
+        if (every == 3 || every == 41) printf("    every %d allocations failing: %u failures so far, all 20 jobs through\n", every, kw_alloc_failures());
+        for (int i = 0; i < 20; i++) kw_free(bodies[i]);
+        board_free(&b, &w);
+    }
+}
+
 static void sick_from_boot(void)
 {
     printf("-- a board whose boot self-test failed starts sick\n");
@@ -621,12 +800,18 @@ int main(void)
     free(text);
     (void)stranger_pub;
 
+    // as the firmware does it: cJSON allocates through kw (PSRAM on the board)
+    static cJSON_Hooks hooks = { kw_alloc, kw_free };
+    cJSON_InitHooks(&hooks);
     happy_path();
     sorting();
+    strict();
+    extension();
     bad_passes();
     sick_from_boot();
     faults();
     big_results();
     soak();
+    out_of_memory();
     return report("worker");
 }

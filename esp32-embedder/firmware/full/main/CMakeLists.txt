@@ -11,3 +11,9 @@ idf_component_register(
     # board's own certificate, key and settings are not in the image: they're in the prov partition
     # (prov.h, provision.sh).
     EMBED_TXTFILES "../AmazonRootCA1.pem")
+
+# CHATS-5: cJSON recurses once per nesting level, and the worker's stack is app_main's 16 KB. Real
+# envelopes and jobs nest three deep; the worker refuses anything over 32 before parsing it
+# (kw_json_depth_ok), and cJSON itself stops there too.
+idf_component_get_property(json_lib json COMPONENT_LIB)
+target_compile_definitions(${json_lib} PRIVATE CJSON_NESTING_LIMIT=32)

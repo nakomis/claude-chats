@@ -153,6 +153,7 @@ int fq_post(void *ctx, const http_req_t *r, jbuf_t *resp)
         int vis = (int)cJSON_GetNumberValue(cJSON_GetObjectItem(in, "VisibilityTimeout"));
         if (max < 1 || max > 10) { cJSON_Delete(in); cJSON_Delete(out); return error(resp, 400, "InvalidParameterValue", "max"); }
         if (!fq_visible(f, q)) f->now += wait;   // a long poll that finds nothing
+        max += f->over_deliver;                  // a misbehaving SQS
         cJSON *arr = cJSON_AddArrayToObject(out, "Messages");
         int got = 0;
         for (int i = 0; i < q->n && got < max; i++) {
