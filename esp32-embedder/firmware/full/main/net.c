@@ -13,6 +13,8 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "net.h"
 #include "wifi_secrets.h"
@@ -42,7 +44,7 @@ void net_heap(const char *when)
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-int net_up(int timeout_ms)
+static int net_up_here(int timeout_ms)
 {
     int64_t t = esp_timer_get_time();
     esp_err_t e;
@@ -66,6 +68,26 @@ int net_up(int timeout_ms)
     }
     printf("wifi: up in %.1f s\n", (esp_timer_get_time() - t) / 1e6);
     return 0;
+}
+
+// esp_wifi_init allocates the Wi-Fi interrupt on the core it runs on, whatever core the Wi-Fi
+// task is pinned to: run it on core 1, away from the core that also serves the SD card.
+typedef struct { int timeout_ms, ret; SemaphoreHandle_t done; } up_t;
+static void up_task(void *p)
+{
+    up_t *u = p;
+    u->ret = net_up_here(u->timeout_ms);
+    xSemaphoreGive(u->done);
+    vTaskDelete(NULL);
+}
+
+int net_up(int timeout_ms)
+{
+    up_t u = { timeout_ms, -1, xSemaphoreCreateBinary() };
+    if (xTaskCreatePinnedToCore(up_task, "net_up", 4096, &u, 5, NULL, 1) != pdPASS) { printf("wifi: no task\n"); return -1; }
+    xSemaphoreTake(u.done, portMAX_DELAY);
+    vSemaphoreDelete(u.done);
+    return u.ret;
 }
 
 int net_https_check(const char *url)

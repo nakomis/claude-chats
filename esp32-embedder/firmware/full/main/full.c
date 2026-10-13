@@ -1,3 +1,4 @@
+#define EXPT // TEMP
 // HOME-432 step 3: the whole of mxbai-embed-large on the ESP32-S3. Weights streamed off the
 // SD card (mxbai.bin from prep_full.py) one matrix at a time; checked against mxtest.bin
 // (numpy emulation of the int8 scheme, and fp32 = Ollama). Throwaway spike code.
@@ -23,6 +24,7 @@
 #include "mxcrc.h"
 #include "tok.h"
 #include "net.h"
+#include "driver/temperature_sensor.h"
 #include "longtest.h"
 
 extern int32_t esp_nn_dot_s8_aligned_esp32s3(const int8_t *a, const int8_t *b, int32_t len);
@@ -210,6 +212,123 @@ static uint8_t *arena;                       // [MAXTOK][6 KB]: q, k, v fp16, or
 static int8_t *xq1;                          // [MAXTOK][D] int8 input of the D-wide matmuls
 static uint16_t (*allo)[6][8];               // every matrix's outlier channels, read at start-up
 static int8_t *stage[2];
+
+#ifdef EXPT
+// ---- EXPT: where does a dual-core pass first diverge? ------------------------------------
+// Pass A (one core) records a CRC of what every phase wrote. Pass B (both cores) compares; at the
+// first mismatch it keeps a CRC per 64 bytes of that phase's output, and a copy of the first
+// CK_COPY bytes, and stops. Pass C (one core) stops at the same phase and prints the lines that
+// differ, both ways.
+typedef struct { const uint8_t *base; int n; size_t stride, off, len; int el; } ckreg_t;   // el: 1 int8, 2 fp16, 4 fp32
+enum { CK_OFF, CK_REC, CK_CMP, CK_DUMP };
+#define CK_MAX 8192
+#define CK_LINES 32768
+#define CK_COPY (96 * 1024)
+static int ck_mode, ck_i, ck_bad = -1;
+static uint32_t *ck_ref, *ck_lines;
+static uint8_t *ck_copy;
+static int cur_li, cur_mi, cur_j;
+
+static void ck_print_el(const uint8_t *p, int el, size_t e)
+{
+    if (el == 1) printf("%d", ((const int8_t *)p)[e]);
+    else if (el == 2) printf("%.5g", h2f(((const uint16_t *)p)[e]));
+    else printf("%.6g", ((const float *)p)[e]);
+}
+
+static void ck_phase(const char *what, const ckreg_t *r, int nr)
+{
+    if (ck_mode == CK_OFF || ck_stop) return;
+    int i = ck_i++;
+    if (i >= CK_MAX) return;
+    if (ck_mode == CK_REC || ck_mode == CK_CMP) {
+        uint32_t c = 0;
+        for (int k = 0; k < nr; k++)
+            for (int t = 0; t < r[k].n; t++) c = esp_rom_crc32_le(c, r[k].base + t * r[k].stride + r[k].off, r[k].len);
+        if (ck_mode == CK_REC) { ck_ref[i] = c; return; }
+        if (c == ck_ref[i]) return;
+        printf("CK first mismatch at phase %d: %s, layer %d matrix %d unit %d\n", i, what, cur_li, cur_mi, cur_j);
+    } else if (i != ck_bad) {
+        return;
+    } else {
+        printf("CK reference at phase %d: %s, layer %d matrix %d unit %d\n", i, what, cur_li, cur_mi, cur_j);
+    }
+    int li = 0, ndiff = 0, shown = 0;
+    size_t cp = 0;
+    for (int k = 0; k < nr; k++)
+        for (int t = 0; t < r[k].n; t++)
+            for (size_t o = 0; o < r[k].len; o += 64) {
+                const uint8_t *p = r[k].base + t * r[k].stride + r[k].off + o;
+                size_t n = r[k].len - o < 64 ? r[k].len - o : 64;
+                int have = cp + n <= CK_COPY;
+                if (ck_mode == CK_CMP) {
+                    if (li < CK_LINES) ck_lines[li] = esp_rom_crc32_le(0, p, n);
+                    if (have) memcpy(ck_copy + cp, p, n);
+                } else if (li < CK_LINES && esp_rom_crc32_le(0, p, n) != ck_lines[li]) {
+                    ndiff++;
+                    if (shown++ < 40) {
+                        printf("CK diff reg %d token %d bytes %u..%u (addr %p):", k, t, (unsigned)o, (unsigned)(o + n), p);
+                        int nshow = 0;
+                        if (have)
+                            for (size_t e = 0; e < n / r[k].el && nshow < 12; e++)
+                                if (memcmp(p + e * r[k].el, ck_copy + cp + e * r[k].el, r[k].el)) {
+                                    printf(" [%u] ", (unsigned)(o / r[k].el + e));
+                                    ck_print_el(p, r[k].el, e);
+                                    printf(" vs ");
+                                    ck_print_el(ck_copy + cp, r[k].el, e);
+                                    nshow++;
+                                }
+                        printf("%s\n", have ? "" : " (no copy)");
+                    }
+                }
+                li++; cp += n;
+            }
+    if (ck_mode == CK_CMP) ck_bad = i;
+    else printf("CK %d of %d lines differ (reference vs dual-core)\n", ndiff, li);
+    ck_stop = 1;
+}
+
+static void ck_mm(const mat_t *m, int t0, int tc, int r0, int r1, int rm)
+{
+    if (ck_mode == CK_OFF || ck_stop) return;
+    char w[128];
+    snprintf(w, sizeof w, "matmul mode %d, tokens %d..%d, rows %d..%d split at %d", m->mode, t0, t0 + tc, r0, r1, rm);
+    int el = m->mode == OUT_F16 ? 2 : m->mode == OUT_ADD ? 4 : 1, nr = 1;
+    ckreg_t r[4] = { { (const uint8_t *)m->y + (size_t)t0 * m->out * el, tc, (size_t)m->out * el, (size_t)r0 * el,
+                       (size_t)(r1 - r0) * el, el } };
+    if (m->mode == OUT_HBLK) {
+        r[nr++] = (ckreg_t){ (const uint8_t *)(m->hs + (size_t)t0 * (m->out / HB)), tc, (size_t)(m->out / HB) * 4,
+                             (size_t)(r0 / HB) * 4, (size_t)((r1 - r0) / HB) * 4, 4 };
+        for (int c = 0; c < 2; c++)
+            r[nr++] = (ckreg_t){ (const uint8_t *)(hout + (size_t)c * MAXTOK * K + (size_t)t0 * K), tc, K * 4, 0, K * 4, 4 };
+    }
+    ck_phase(w, r, nr);
+}
+
+static void ck_q(const mat_t *m, int kind, const int8_t *dst, int tm)
+{
+    if (ck_mode == CK_OFF || ck_stop) return;
+    char w[64];
+    snprintf(w, sizeof w, "quantise kind %d, split at token %d", kind, tm);
+    ckreg_t r[3] = { { (const uint8_t *)dst, n_tok, (size_t)m->in, 0, (size_t)m->in, 1 },
+                     { (const uint8_t *)xs, 1, 0, 0, (size_t)n_tok * 4, 4 },
+                     { (const uint8_t *)xo, 1, 0, 0, (size_t)n_tok * K * 4, 4 } };
+    ck_phase(w, r, 3);
+}
+
+static void ck_att(const uint16_t *q)
+{
+    ckreg_t r = { (const uint8_t *)q, n_tok, D * 2, 0, D * 2, 2 };
+    ck_phase("attention, heads 0-7 on core 0 (bytes 0..1023)", &r, 1);
+}
+
+static void ck_x(const char *what)
+{
+    ckreg_t r = { (const uint8_t *)x, n_tok, D * 4, 0, D * 4, 4 };
+    ck_phase(what, &r, 1);
+}
+#endif
+
 #define HALF (512 * 1024)                    // weights are read in 512 KB blocks, double-buffered
 #define ARENA_TOK (6 * 1024)
 #define MAXUNITS (24 * 6 * 6)
@@ -260,6 +379,7 @@ static void issue(int u)
 }
 
 static int64_t t_att;
+static int serial_sd;                         // EXPT: no SD reads in flight during compute
 static void pass_fwd(void)
 {
     size_t nd = (size_t)n_tok * D;
@@ -268,11 +388,19 @@ static void pass_fwd(void)
     float *hs = (float *)(arena + (size_t)n_tok * FF);               // ... and its scales [n][FF / HB]
     void *yout[6] = { q, k, v, x, h, x };
     static const int mode[6] = { OUT_F16, OUT_F16, OUT_F16, OUT_ADD, OUT_HBLK, OUT_ADD };
-    issue(0);
+    if (!serial_sd) issue(0);
     for (int u = 0; u < n_units; u++) {
         unit_t *t = &units[u];
         int p = u & 1, mp = (t->li * 6 + t->mi) & 1, mi = t->mi;
-        if (u + 1 < n_units) issue(u + 1);       // u - 1 is finished, so its buffers take u + 1's reads
+#ifdef EXPT
+        if (ck_stop) {                                // drain what is in flight, then give up
+            if (!serial_sd) for (int i = 0; i < n_ureq[p]; i++) wait_rd(ureq[p][i]);
+            return;
+        }
+        cur_li = t->li; cur_mi = mi; cur_j = t->j;
+#endif
+        if (serial_sd) issue(u);
+        else if (u + 1 < n_units) issue(u + 1);       // u - 1 is finished, so its buffers take u + 1's reads
         for (int i = 0; i < n_ureq[p]; i++) wait_rd(ureq[p][i]);
         mat_t m = { stage[p] - (size_t)t->r0 * MIN[mi], mws[mp], mb[mp], allo[t->li][mi], mwo[mp], MIN[mi], MOUT[mi],
                     mode[mi], yout[mi], hs, allo[t->li][5] };
@@ -280,6 +408,7 @@ static void pass_fwd(void)
             if (mi == 3) quantise(&m, IN_F16, q, NULL, xq1);
             else if (mi == 5) quantise(&m, IN_HBLK, h, hs, h);            // in place
             else quantise(&m, IN_F32, x, NULL, xq1);
+            if (mi == 4) memset(hout, 0, 2 * MAXTOK * K * sizeof(float));   // each core fills its own
         }
         matmul_r(&m, mi == 5 ? h : xq1, t->r0, t->r1);
         if (t->j < t->nb - 1) continue;
@@ -290,8 +419,14 @@ static void pass_fwd(void)
             t_att += esp_timer_get_time() - ta;
         } else if (mi == 3) {
             layernorm(x, nw, nw + D);
+#ifdef EXPT
+            ck_x("layernorm after attention");
+#endif
         } else if (mi == 5) {
             layernorm(x, nw + 2 * D, nw + 3 * D);
+#ifdef EXPT
+            ck_x("layernorm after the FFN");
+#endif
         }
     }
 }
@@ -392,7 +527,7 @@ void app_main(void)
         stage[i] = ps(HALF); mws[i] = ps(FF * 4); mb[i] = ps(FF * 4); mwo[i] = ps(FF * 8 * 4); nrm[i] = ps(4 * D * 4);
         if (!stage[i] || !mws[i] || !mb[i] || !mwo[i] || !nrm[i]) { printf("PSRAM alloc failed (pair %d)\n", i); return; }
     }
-    xs = ps(MAXTOK * sizeof(float)); xo = ps(MAXTOK * K * sizeof(float)); hout = ps(MAXTOK * K * sizeof(float));
+    xs = ps(MAXTOK * sizeof(float)); xo = ps(MAXTOK * K * sizeof(float)); hout = ps(2 * MAXTOK * K * sizeof(float));
     tok_s = ps(n_vocab * 4); type0 = ps(D * 4); en_w = ps(D * 4); en_b = ps(D * 4); allo = ps(24 * sizeof *allo);
     if (!xq || !xs || !xo || !hout || !wbuf[0] || !wbuf[1] || !abounce[0] || !abounce[1] || !x || !arena || !xq1 ||
         !tok_s || !type0 || !en_w || !en_b || !allo || K > 8 || 2 * ATT_SCR > XQ_MAX) {
@@ -424,7 +559,11 @@ void app_main(void)
     if (memcmp(th, "MXT1", 4)) { printf("bad test magic\n"); return; }
     int tok_bad = 0;
     float *ref0 = ps(D * 4);                  // test 0's Ollama vector, for the Wi-Fi check at the end
+#ifdef EXPT
+    for (int ti = 0; ti < 1; ti++) {
+#else
     for (int ti = 0; ti < (int)th[1]; ti++) {
+#endif
         uint32_t n;
         fread(&n, 4, 1, ft);
         fread(want, 4, n, ft);
@@ -467,7 +606,28 @@ void app_main(void)
         heap_caps_free(emu); heap_caps_free(ref);
     }
     // CHATS-4: whole long messages in one pass (references from host/gen_long.py)
+#ifdef EXPT
+    temperature_sensor_handle_t tsens;
+    temperature_sensor_config_t tcfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
+    temperature_sensor_install(&tcfg, &tsens);
+    temperature_sensor_enable(tsens);
+    ck_ref = ps(CK_MAX * 4); ck_lines = ps(CK_LINES * 4); ck_copy = ps(CK_COPY);
+    if (!ck_ref || !ck_lines || !ck_copy) printf("CK alloc failed\n");
+    // A: one core, record; B: both cores, compare (up to 3 tries); C: one core, print the difference
+    for (int rep = 0; rep < 5; rep++) {
+        int li = 0;
+        if (rep == 0) { one_core = K_MM | K_Q | K_ATT; ck_mode = CK_REC; }
+        else if (ck_bad < 0 && rep < 4) { one_core = 0; ck_mode = CK_CMP; }
+        else if (ck_bad >= 0) { one_core = K_MM | K_Q | K_ATT; ck_mode = CK_DUMP; }
+        else break;
+        ck_i = 0; ck_stop = 0;
+        float tc = 0;
+        temperature_sensor_get_celsius(tsens, &tc);
+        printf("EXPT rep %d: %s, %s, chip %.1f C\n", rep, one_core ? "one core" : "both cores",
+               ck_mode == CK_REC ? "recording" : ck_mode == CK_CMP ? "comparing" : "printing the difference", tc);
+#else
     for (int li = 0; li < N_LONG; li++) {
+#endif
         int nt = tok_encode(&vocab, LONG[li].text, strlen(LONG[li].text), ids, MAXTOK, NULL);
         if (nt != LONG[li].n_tok) { printf("long %d: %d tokens, host says %d\n", li, nt, LONG[li].n_tok); tok_bad++; continue; }
         n_tok = nt;
@@ -479,12 +639,20 @@ void app_main(void)
                "(attention %.1f, quantise %.1f)%s\n", li, n_tok, cosv(x, LONG[li].emu, D), cosv(x, LONG[li].ref, D),
                (esp_timer_get_time() - t0) / 1e6, t_stall / 1e6, t_att / 1e6, t_quant / 1e6, crc_bad ? "  CRC ERRORS" : "");
         net_heap("after long pass");
+#ifdef EXPT
+        printf("CK %d phases checked%s\n", ck_i, ck_stop ? " (stopped early)" : "");
+        if (ck_mode == CK_DUMP) break;
+#endif
     }
 
     // CHATS-4: Wi-Fi and TLS next to the model, then test 0 three times with the radio up and an HTTPS
     // request between passes (with Wi-Fi up, core 0's rows used to come out corrupted: see mm_rows).
     net_heap("before wifi");
+#ifdef EXPT
+    if (0) {
+#else
     if (net_up(20000) == 0) {
+#endif
         net_heap("wifi up");
         net_https_check("https://sqs.eu-west-2.amazonaws.com/");
         net_heap("after https");
