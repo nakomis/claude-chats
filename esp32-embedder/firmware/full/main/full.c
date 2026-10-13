@@ -1,3 +1,4 @@
+#define SOAK // TEMP
 #define EXPT // TEMP
 // HOME-432 step 3: the whole of mxbai-embed-large on the ESP32-S3. Weights streamed off the
 // SD card (mxbai.bin from prep_full.py) one matrix at a time; checked against mxtest.bin
@@ -24,6 +25,7 @@
 #include "mxcrc.h"
 #include "tok.h"
 #include "net.h"
+#include "vcore.h"
 #include "driver/temperature_sensor.h"
 #include "longtest.h"
 
@@ -299,8 +301,7 @@ static void ck_mm(const mat_t *m, int t0, int tc, int r0, int r1, int rm)
     if (m->mode == OUT_HBLK) {
         r[nr++] = (ckreg_t){ (const uint8_t *)(m->hs + (size_t)t0 * (m->out / HB)), tc, (size_t)(m->out / HB) * 4,
                              (size_t)(r0 / HB) * 4, (size_t)((r1 - r0) / HB) * 4, 4 };
-        for (int c = 0; c < 2; c++)
-            r[nr++] = (ckreg_t){ (const uint8_t *)(hout + (size_t)c * MAXTOK * K + (size_t)t0 * K), tc, K * 4, 0, K * 4, 4 };
+        // hout is per core (which array holds an outlier depends on the split): checked via xo, its sum
     }
     ck_phase(w, r, nr);
 }
@@ -326,6 +327,90 @@ static void ck_x(const char *what)
 {
     ckreg_t r = { (const uint8_t *)x, n_tok, D * 4, 0, D * 4, 4 };
     ck_phase(what, &r, 1);
+}
+#endif
+
+#ifdef STRESS
+// ---- STRESS: ffn_down's access pattern with known answers, no model, no SD --------------
+// 25 tokens x 4096 int8 in the shared internal xq; 128 weight rows in PSRAM (stage[0]), copied
+// 4 rows at a time into each core's internal wbuf; PIE dots checked against a scalar reference;
+// a float epilogue adding into PSRAM. Core 0 takes rows 0..63, core 1 rows 64..127.
+#define S_T 25
+#define S_ROWS 128
+static int32_t *s_ref;                        // [S_T][S_ROWS]
+static float *s_out;                          // [S_T][S_ROWS]
+static int64_t s_deadline;
+static int s_rev;                             // core 1 walks the tokens backwards
+static volatile uint32_t s_dots[2], s_bad[2];
+typedef struct { int core, t, row; int32_t got, want; } sbad_t;
+static sbad_t s_log[16];
+static volatile int s_nlog;
+typedef struct { int r0, r1; } sjob_t;
+
+static void stress_rows(void *arg)
+{
+    sjob_t *j = arg;
+    int core = xPortGetCoreID(), rb = WBUF / FF;
+    int8_t *wb = wbuf[core];
+    while (esp_timer_get_time() < s_deadline) {
+        for (int rb0 = j->r0; rb0 < j->r1; rb0 += rb) {
+            memcpy(wb, stage[0] + (size_t)rb0 * FF, (size_t)rb * FF);
+            for (int i = 0; i < S_T; i++) {
+                int t = core && s_rev ? S_T - 1 - i : i;
+                for (int r = 0; r < rb; r++) {
+                    int32_t acc = esp_nn_dot_s8_aligned_esp32s3(xq + (size_t)t * FF, wb + (size_t)r * FF, FF);
+                    int32_t want = s_ref[t * S_ROWS + rb0 + r];
+                    s_dots[core]++;
+                    if (acc != want) {
+                        s_bad[core]++;
+                        int k = s_nlog;
+                        if (k < 16) { s_log[k] = (sbad_t){ core, t, rb0 + r, acc, want }; s_nlog = k + 1; }
+                    }
+                    s_out[t * S_ROWS + rb0 + r] += acc * 1e-6f;
+                }
+            }
+        }
+    }
+}
+
+static void stress_run(const char *what, int mask, int rev, int secs)
+{
+    sjob_t a = { 0, 64 }, b = { 64, 128 };
+    s_dots[0] = s_dots[1] = s_bad[0] = s_bad[1] = 0; s_nlog = 0; s_rev = rev;
+    s_deadline = esp_timer_get_time() + (int64_t)secs * 1000000;
+    for (int c = 0; c < 2; c++) { workers[c].fn = stress_rows; workers[c].arg = c ? &b : &a; }
+    for (int c = 1; c >= 0; c--) if (mask & (1 << c)) xSemaphoreGive(workers[c].go);   // core 1 first: w0 takes over core 0
+    for (int c = 0; c < 2; c++) if (mask & (1 << c)) xSemaphoreTake(workers[c].done, portMAX_DELAY);
+    printf("STRESS %-34s core 0: %8lu dots, %lu bad | core 1: %8lu dots, %lu bad\n", what,
+           (unsigned long)s_dots[0], (unsigned long)s_bad[0], (unsigned long)s_dots[1], (unsigned long)s_bad[1]);
+    for (int k = 0; k < s_nlog; k++)
+        printf("  bad dot: core %d token %d row %d got %ld want %ld (diff %ld)\n", s_log[k].core, s_log[k].t,
+               s_log[k].row, (long)s_log[k].got, (long)s_log[k].want, (long)(s_log[k].got - s_log[k].want));
+}
+
+static void stress(void)
+{
+    uint32_t seed = 12345;
+    #define LCG() (seed = seed * 1664525u + 1013904223u, (int8_t)((seed >> 24) % 255 - 127))
+    for (size_t i = 0; i < (size_t)S_T * FF; i++) xq[i] = LCG();
+    for (size_t i = 0; i < (size_t)S_ROWS * FF; i++) stage[0][i] = LCG();
+    s_ref = ps(S_T * S_ROWS * 4); s_out = ps(S_T * S_ROWS * 4);
+    memset(s_out, 0, S_T * S_ROWS * 4);
+    for (int t = 0; t < S_T; t++)
+        for (int r = 0; r < S_ROWS; r++) {
+            int32_t c = 0;
+            const int8_t *a = xq + (size_t)t * FF, *w = stage[0] + (size_t)r * FF;
+            for (int i = 0; i < FF; i++) c += a[i] * w[i];
+            s_ref[t * S_ROWS + r] = c;
+        }
+    printf("STRESS: reference ready (xq %p, wbuf %p %p, stage %p)\n", xq, wbuf[0], wbuf[1], stage[0]);
+    for (int round = 0; round < 3; round++) {
+        stress_run("both cores", 3, 0, 20);
+        stress_run("core 1 only", 2, 0, 20);
+        stress_run("core 0 only", 1, 0, 20);
+        stress_run("both cores, core 1 tokens reversed", 3, 1, 20);
+    }
+    printf("== STRESS done ==\n");
 }
 #endif
 
@@ -486,6 +571,7 @@ static int vocab_load(void)
 
 void app_main(void)
 {
+    vcore_boost(1250);                       // 240 MHz needs >= 1.25 V on some chips: see vcore.c
     vTaskDelay(pdMS_TO_TICKS(1500));
     printf("\n== HOME-432 step 3: whole mxbai on the S3, weights from SD ==\n");
     printf("ROM crc32 check: %08lx (want cbf43926)\n", (unsigned long)esp_rom_crc32_le(0, (const uint8_t *)"123456789", 9));
@@ -552,6 +638,10 @@ void app_main(void)
     plan();
     workers_start();
     reader_start();
+#ifdef STRESS
+    stress();
+    return;
+#endif
     printf("%d units per pass\n", n_units);
 
     uint32_t th[3];
@@ -613,6 +703,18 @@ void app_main(void)
     temperature_sensor_enable(tsens);
     ck_ref = ps(CK_MAX * 4); ck_lines = ps(CK_LINES * 4); ck_copy = ps(CK_COPY);
     if (!ck_ref || !ck_lines || !ck_copy) printf("CK alloc failed\n");
+#ifdef SOAK
+    // reps 0 and 1: one core, the reference vector of each long text; then both cores, alternating
+    uint32_t soak_ref[2] = { 0, 0 };
+    int soak_n[2] = { 0, 0 }, soak_bad[2] = { 0, 0 };
+    for (int rep = 0; rep < 1000; rep++) {
+        int li = rep < 2 ? 1 - rep : rep & 1;
+        one_core = rep < 2 ? (K_MM | K_Q | K_ATT) : 0;
+        ck_mode = CK_OFF;
+        float tc = 0;
+        temperature_sensor_get_celsius(tsens, &tc);
+        printf("SOAK rep %d: long %d on %s, chip %.1f C\n", rep, li, one_core ? "one core (reference)" : "both cores", tc);
+#else
     // A: one core, record; B: both cores, compare (up to 3 tries); C: one core, print the difference
     for (int rep = 0; rep < 5; rep++) {
         int li = 0;
@@ -625,6 +727,7 @@ void app_main(void)
         temperature_sensor_get_celsius(tsens, &tc);
         printf("EXPT rep %d: %s, %s, chip %.1f C\n", rep, one_core ? "one core" : "both cores",
                ck_mode == CK_REC ? "recording" : ck_mode == CK_CMP ? "comparing" : "printing the difference", tc);
+#endif
 #else
     for (int li = 0; li < N_LONG; li++) {
 #endif
@@ -639,6 +742,18 @@ void app_main(void)
                "(attention %.1f, quantise %.1f)%s\n", li, n_tok, cosv(x, LONG[li].emu, D), cosv(x, LONG[li].ref, D),
                (esp_timer_get_time() - t0) / 1e6, t_stall / 1e6, t_att / 1e6, t_quant / 1e6, crc_bad ? "  CRC ERRORS" : "");
         net_heap("after long pass");
+#ifdef SOAK
+        {
+            uint32_t c = esp_rom_crc32_le(0, (const uint8_t *)x, D * 4);
+            if (rep < 2) soak_ref[li] = c;
+            else {
+                soak_n[li]++;
+                soak_bad[li] += c != soak_ref[li];
+                printf("SOAK long %d: %s the one-core vector; so far long 0 %d/%d different, long 1 %d/%d different\n", li,
+                       c == soak_ref[li] ? "SAME AS" : "DIFFERENT FROM", soak_bad[0], soak_n[0], soak_bad[1], soak_n[1]);
+            }
+        }
+#endif
 #ifdef EXPT
         printf("CK %d phases checked%s\n", ck_i, ck_stop ? " (stopped early)" : "");
         if (ck_mode == CK_DUMP) break;
