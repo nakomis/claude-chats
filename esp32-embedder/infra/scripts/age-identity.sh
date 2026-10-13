@@ -23,8 +23,9 @@
 # INSECURE, deliberately (accepted 13 Oct): the key sits in the board's prov partition unencrypted,
 # so anyone holding the board can read it. That's why each board has its own, and why --revoke exists.
 #
-# Needs age-keygen (brew install age), NPM_ENVIRONMENT (default sandbox) and AWS_PROFILE (default
-# nakom.is-{env}).
+# Needs age-keygen (brew install age) and NPM_ENVIRONMENT (default sandbox). The profile is
+# nakom.is-{env} (KATA_AWS_PROFILE overrides it; a pre-set AWS_PROFILE is ignored), and the script
+# stops unless it's that environment's account.
 set -euo pipefail
 umask 077
 
@@ -41,28 +42,59 @@ done
 [ -n "$board" ] || { echo "usage: age-identity.sh <board> [--new | --revoke]" >&2; exit 2; }
 [[ "$board" =~ ^[a-z0-9]+$ ]] || { echo "board must be a lower-case word, like blue" >&2; exit 2; }
 env=${NPM_ENVIRONMENT:-sandbox}
-case "$env" in sandbox | prod) ;; *) echo "NPM_ENVIRONMENT must be sandbox or prod" >&2; exit 2 ;; esac
-export AWS_PROFILE=${AWS_PROFILE:-nakom.is-$env}
-export AWS_REGION=${AWS_REGION:-eu-west-2}
+# shellcheck source-path=SCRIPTDIR source=aws-env.sh
+. "$(dirname "$0")/aws-env.sh"
+kata_aws_env
+kata_check_account
 
 thing="kata-${env}-${board}"
 identity_param="/kata/${env}/boards/${board}/age-identity"
 recipient_param="/conversation-memory/${env}/age-recipients/${thing}"
 
+# Deletes an SSM parameter. Absent is fine; any other failure (expired credentials…) stops the script.
+delete_param() {
+    local err
+    if err=$(aws ssm delete-parameter --name "$1" 2>&1); then
+        echo "deleted $1"
+    elif [[ "$err" == *ParameterNotFound* ]]; then
+        echo "no $1"
+    else
+        echo "$err" >&2
+        echo "could not delete $1: stopping" >&2
+        exit 1
+    fi
+}
+
 if [ "$mode" = revoke ]; then
-    # The recipient first, so no forwarder encrypts to a key that's about to vanish.
-    aws ssm delete-parameter --name "$recipient_param" 2> /dev/null && echo "deleted ${recipient_param}" ||
-        echo "no ${recipient_param}"
-    aws ssm delete-parameter --name "$identity_param" 2> /dev/null && echo "deleted ${identity_param}" ||
-        echo "no ${identity_param}"
-    echo "revoked ${thing}'s age key. Reinstall the forwarder on every Mac so it stops encrypting to it;"
-    echo "to cut the board off from AWS too, remove it from infra/boards.json and redeploy."
+    # 1. Cut the board off from AWS: its certificate is what buys IoT Core and SQS credentials. A
+    #    certificate is deactivated (kept for the audit trail, not deleted), then detached.
+    if out=$(aws iot list-thing-principals --thing-name "$thing" --query principals --output text 2>&1); then
+        for arn in $out; do
+            [ "$arn" = None ] && continue
+            aws iot update-certificate --certificate-id "${arn##*/}" --new-status INACTIVE
+            aws iot detach-policy --policy-name "kata-board-${env}" --target "$arn" 2> /dev/null || true
+            aws iot detach-thing-principal --thing-name "$thing" --principal "$arn"
+            echo "deactivated and detached certificate ${arn##*/}"
+        done
+    elif [[ "$out" == *ResourceNotFound* ]]; then
+        echo "no Thing ${thing}: no certificate to deactivate"
+    else
+        echo "$out" >&2
+        echo "could not list ${thing}'s certificates: stopping, nothing revoked" >&2
+        exit 1
+    fi
+    # 2. The recipient, so forwarders stop encrypting to the key; then the key itself.
+    delete_param "$recipient_param"
+    delete_param "$identity_param"
+    echo "revoked ${thing}. Still to do:"
+    echo "  - reinstall the forwarder on every Mac, so it stops encrypting to the board's key"
+    echo "  - credentials the board already holds last up to an hour"
+    echo "  - to retire the board for good, remove it from infra/boards.json and redeploy"
     exit 0
 fi
 
 command -v age-keygen > /dev/null || { echo "needs age-keygen: brew install age" >&2; exit 1; }
-# Fails here if infra/boards.json (and so ClaudeChatsKataDeviceStack) lacks this board, or the
-# profile is for the wrong account.
+# Fails here if infra/boards.json (and so ClaudeChatsKataDeviceStack) lacks this board.
 aws iot describe-thing --thing-name "$thing" > /dev/null
 
 dir=$(mktemp -d)

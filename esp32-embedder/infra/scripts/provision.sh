@@ -22,7 +22,8 @@
 # INSECURE: the private key is made here and flashed in plain text, and the Wi-Fi password and the
 # age identity sit in prov.bin and the board's flash. Anyone holding the board can read all three.
 #
-# Needs AWS_PROFILE (default nakom.is-{env}) and NPM_ENVIRONMENT (default sandbox). The house Wi-Fi
+# Needs NPM_ENVIRONMENT (default sandbox). The profile is nakom.is-{env} (KATA_AWS_PROFILE overrides
+# it; a pre-set AWS_PROFILE is ignored), and the script stops unless it's that environment's account. The house Wi-Fi
 # credentials are read from SSM /Nakomis/Wifi/* via WIFI_PROFILE (default nakom.is-sandbox: they
 # live only in the sandbox account, so a prod board reads them from there too).
 set -euo pipefail
@@ -40,9 +41,10 @@ done
 [ -n "$board" ] || { echo "usage: provision.sh <board> [--new]   (blue, green or red)" >&2; exit 2; }
 [[ "$board" =~ ^[a-z0-9]+$ ]] || { echo "board must be a lower-case word, like blue" >&2; exit 2; }
 env=${NPM_ENVIRONMENT:-sandbox}
-case "$env" in sandbox | prod) ;; *) echo "NPM_ENVIRONMENT must be sandbox or prod" >&2; exit 2 ;; esac
-export AWS_PROFILE=${AWS_PROFILE:-nakom.is-$env}
-export AWS_REGION=${AWS_REGION:-eu-west-2}
+# shellcheck source-path=SCRIPTDIR source=aws-env.sh
+. "$(dirname "$0")/aws-env.sh"
+kata_aws_env
+kata_check_account
 wifi_profile=${WIFI_PROFILE:-nakom.is-sandbox}
 
 here=$(cd "$(dirname "$0")" && pwd)

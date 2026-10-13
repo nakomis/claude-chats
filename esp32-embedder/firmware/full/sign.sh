@@ -34,8 +34,13 @@ fi
 
 if ! key_b64=$(security find-generic-password -s "$service" -a "$env" -w 2> /dev/null); then
     echo "signing key not in the Keychain: fetching it from SSM" >&2
-    pem=$(AWS_PROFILE=${AWS_PROFILE:-nakom.is-$env} AWS_REGION=${AWS_REGION:-eu-west-2} \
-        aws ssm get-parameter --name "/kata/${env}/ota/signing-key" --with-decryption \
+    # The environment's own account only (a pre-set AWS_PROFILE is ignored; KATA_AWS_PROFILE
+    # overrides), so the Keychain is never filled with another environment's key.
+    # shellcheck source-path=SCRIPTDIR source=../../infra/scripts/aws-env.sh
+    . "$here/../../infra/scripts/aws-env.sh"
+    kata_aws_env
+    kata_check_account
+    pem=$(aws ssm get-parameter --name "/kata/${env}/ota/signing-key" --with-decryption \
         --query Parameter.Value --output text)
     key_b64=$(printf '%s\n' "$pem" | base64 | tr -d '\n')
     # Through security's stdin, not its argv (where ps would show it). Base64 needs no quoting.

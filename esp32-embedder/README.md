@@ -157,6 +157,13 @@ infra/scripts/age-identity.sh blue       # --new to replace it, --revoke for a l
 
 The private key goes to SSM `/kata/{env}/boards/{board}/age-identity` (SecureString), and from there only into the board's `prov.bin`. The public key goes to `/conversation-memory/{env}/age-recipients/kata-{env}-{board}`. The forwarder encrypts each job to Cal's key (`/conversation-memory/{env}/age-recipient`) and to every parameter under `…/age-recipients/`, so adding a board needs no forwarder config, only a reinstall on each Mac. Jobs that were encrypted before then (or for a replaced key) still reach Cal: Kata hands them off as `unembedded/decrypt-failed`. The script is safe to re-run, and it never replaces a key unless you pass `--new`.
 
+`--revoke` is for a lost board. It deactivates the board's IoT certificate and detaches it, which cuts off IoT Core and SQS; credentials already issued last up to an hour. It then deletes the recipient and the key. After that, reinstall the forwarder on every Mac.
+
+**Which AWS account.** `NPM_ENVIRONMENT` alone decides it for every script here (`provision.sh`, `age-identity.sh`, `ota-signing-key.sh` and `sign.sh`): the profile is `nakom.is-{env}`.
+- A pre-set `AWS_PROFILE` is ignored. Inheriting one once wrote the prod signing key into the sandbox account.
+- To use another profile, set `KATA_AWS_PROFILE`.
+- Before touching AWS, each script checks `sts get-caller-identity` against that environment's account (`infra/scripts/aws-env.sh`), says which account it's using, and stops on a mismatch.
+
 ```bash
 infra/scripts/provision.sh blue          # NPM_ENVIRONMENT=prod for a prod board; --new for a fresh certificate
 ```
