@@ -38,6 +38,11 @@ So **batching is nearly free.** A pass carrying 140 tokens of queued messages co
 - An `sd` task on core 0 keeps the card busy, alternating two 16 KB DMA buffers in internal RAM.
 - A `cp` task on core 1 copies each chunk to PSRAM and checks its CRC32 against `mxcrc.h`.
 
+**Batching** (CHATS-5):
+- A pass carries several messages packed one after another, each its own `[CLS]` … `[SEP]`, up to 512 tokens in all. Each message's vector is its `[CLS]` row.
+- Positions restart at each message, and attention runs message by message without ever loading another message's keys. Everything else works per token. So a message comes out bit for bit as it would in a pass of its own, and attention costs the sum of the messages' n², not the square of the total.
+- `batch.c` fills the next pass: the oldest message always, then the rest of the queue in order, each one that still fits under 512 tokens, until a soft token target is reached (by default, the cap). A message never waits more passes than there are messages ahead of it.
+
 **Tokenising** (`tok/`): the device tokenises raw UTF-8 itself, giving the same ids as Ollama. Ollama runs mxbai through llama.cpp's `llama-server`, so `tok.c` is a port of llama.cpp's WordPiece (`llm_tokenizer_wpm_session`, tag b11351, the one Ollama 0.40.3 pins), not HuggingFace's. The differences that matter:
 - literal `[CLS]`, `[SEP]` and the other specials in the text become special tokens
 - llama.cpp's own Unicode tables: single-codepoint NFD, combining marks dropped, symbols split only below 0x7F
@@ -80,11 +85,14 @@ Recalibrating the outliers on 300 real messages (`host/recal.py`) made the tail 
 | `host/ollama_ids.py` | Ground-truth ids for the corpus from a private `llama-server` (the binary Ollama ships) |
 | `host/test_tok.py` | `tok.c` against `llama-server`, id for id: the corpus plus random and hand-picked stress strings |
 | `host/emu_bin.py` | The device's arithmetic on the Mac, reading the weights back from `mxbai.bin` |
+| `host/lean.py` | The device's arithmetic with its fp16/int8 activation layout (CHATS-4), several messages per pass; real weights or small synthetic ones |
+| `host/test_seg.py` | A batch of messages in one pass against each message alone: the same bits. Synthetic weights by default, `--real` for the model |
 | `host/tail.py` | Device-vs-Ollama cosine over the corpus: mean, minimum, low percentiles |
 | `host/recal.py` | Tries choosing the outlier channels on real messages, for several K |
 | `host/serial_log.py` | Logs the board's serial output to a file without resetting it |
 | `host/corpus.py` | Samples real messages from local Claude Code transcripts for tokeniser testing (stays local) |
-| `firmware/full/` | The whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin` |
+| `firmware/full/` | The whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin`, then again several to a pass |
+| `test/` | Host tests of the firmware's portable C (`make`): the batch planner, and the segmented attention compiled from `kernels.inc` with ESP-IDF stubbed out |
 | `firmware/layer0/` | One layer from a flash partition, plus the self-tests that found the PIE bug, an SD speed test and a GPIO pull-up probe |
 | `firmware/bench/` | int8 matmul benchmark for the S3 (esp-nn) |
 | `firmware/wroom-bench/` | int8 dot-product benchmark for the original ESP32 |
@@ -108,6 +116,15 @@ idf.py set-target esp32s3 && idf.py build
 idf.py -p /dev/cu.usbmodem1101 flash
 ```
 
+The partition table (`partitions.csv`, CHATS-10) has NVS, otadata and two 4 MB OTA slots, and the app goes in `ota_0` at 0x20000. A board flashed before that had a single app at 0x10000, which overlaps where NVS and otadata are now: run `idf.py erase-flash` once, then `idf.py flash` writes the bootloader, partition table, otadata and app.
+
+The host tests need no board and no model files:
+
+```bash
+cd test && make                                # the batch planner and the segmented attention, in C
+cd ../host && .venv/bin/python test_seg.py     # a batch against each message alone, synthetic weights
+```
+
 To test the tokeniser on the Mac, start a private `llama-server` on Ollama's GGUF (the command is in `host/ollama_ids.py`), then:
 
 ```bash
@@ -117,7 +134,7 @@ To test the tokeniser on the Mac, start a private `llama-server` on Ollama's GGU
 On the ESP32-S3 CAM board, flash over the native USB port. `idf.py flash` ends with a USB reset, which leaves the chip in download mode, so either tap **RST** afterwards or flash with esptool and a watchdog reset, which needs no hands:
 
 ```bash
-python -m esptool --chip esp32s3 -p /dev/cu.usbmodem1101 -b 460800 --after watchdog_reset write_flash 0x10000 build/s3full.bin
+python -m esptool --chip esp32s3 -p /dev/cu.usbmodem1101 -b 460800 --after watchdog_reset write_flash 0x20000 build/s3full.bin
 ```
  If it's crash-looping and won't take a flash, hold **BOOT**, tap **RST**, then release **BOOT**. Watch the output with any serial monitor; if yours asserts RTS, the chip stays held in reset.
 
