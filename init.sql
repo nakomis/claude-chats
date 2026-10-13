@@ -2,6 +2,14 @@
 -- home-infra at luke/deployment/claude-chats/init.sql, which is what runs on
 -- Luke. tests/test_pg_schema.py and that repo's check pin the same DDL checksum
 -- so the copy cannot silently drift — change one and both go red (HOME-194).
+-- Every statement here is re-run on each Luke playbook run, and several take
+-- ACCESS EXCLUSIVE on `messages` even when they turn out to be no-ops (ADD
+-- COLUMN IF NOT EXISTS does). Waiting for that lock queues every later query
+-- on the table behind it, so a long reader (a backup's pg_dump) would stall
+-- search for minutes. Give up after 5 s instead: the play fails loudly and
+-- can be re-run (HOME-440 review).
+SET lock_timeout = '5s';
+
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -88,9 +96,24 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS model TEXT;
 -- alone identifies those). All three follow the vector on a re-embed, so the
 -- consumer overwrites them on conflict. Nullable with no default, so adding
 -- them is a catalogue-only change, not a rewrite of the table.
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS embedder TEXT;
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS embedder_board TEXT;
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS embedder_fw TEXT;
+-- Added in one statement, and only when missing (HOME-440 review): ALTER
+-- TABLE takes ACCESS EXCLUSIVE even when every IF NOT EXISTS turns out to be
+-- a no-op, and that queues behind any open reader and blocks every query
+-- behind it. This file is reapplied on every Luke playbook run, so re-runs
+-- check the catalogue first and take no lock at all; the first run is bound
+-- by the lock_timeout at the top.
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'messages'
+          AND column_name IN ('embedder', 'embedder_board', 'embedder_fw')) < 3 THEN
+        ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS embedder TEXT,
+            ADD COLUMN IF NOT EXISTS embedder_board TEXT,
+            ADD COLUMN IF NOT EXISTS embedder_fw TEXT;
+    END IF;
+END
+$$;
 
 -- Every projection and most search paths filter on author, and the values are
 -- few and skewed, so this earns its keep immediately.
