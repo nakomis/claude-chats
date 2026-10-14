@@ -298,6 +298,9 @@ static void publish_outbox(void)
         if (first) {
             first = false;
             ota_on_connected();               // reached IoT Core: half of what keeps a new image
+            jb_free(&resp);
+            publish_outbox();                 // and its version response goes now, not a phase later
+            return;
         }
     }
     jb_free(&resp);
