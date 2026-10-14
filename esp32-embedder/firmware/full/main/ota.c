@@ -3,6 +3,7 @@
 #include "fleet.h"
 #include "kata_worker.h"
 #include "model.h"
+#include "kw.h"
 #include "net.h"
 
 #include <inttypes.h>
@@ -40,7 +41,8 @@ static portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile phase_t phase = IDLE;
 static volatile bool cancel;
 
-// The update being worked on (written by the MQTT task while IDLE, then owned by the OTA task).
+// The update being worked on (written by the task that took the command while IDLE, then owned by
+// the OTA task). CHATS-13: commands come from the worker's SQS phases, not an MQTT task.
 static char *job_url;
 static char job_version[OTA_VERSION_MAX];
 static uint8_t job_sha256[OTA_SHA256_LEN];
@@ -343,13 +345,13 @@ out:
     return err_text;
 }
 
-// The job is cleared before the phase goes back to IDLE: from then on the MQTT task may start the
+// The job is cleared before the phase goes back to IDLE: from then on a command may start the
 // next one (start_update), which sets job_url itself.
 static void finish(void)
 {
     char *url = job_url;
     job_url = NULL;
-    free(url);
+    kw_free(url);
     taskENTER_CRITICAL(&lock);
     phase = IDLE;
     cancel = false;
@@ -384,6 +386,7 @@ static void ota_task(void *arg)
         taskEXIT_CRITICAL(&lock);
         net_heap("ota: model lent");
         respond_progress("downloading", 0, job_version);
+        kata_worker_publish();                // CHATS-13: so Fleet sees it start (no MQTT to carry it)
         failed = download(slot, why, sizeof why);
     }
 
@@ -428,11 +431,13 @@ static void ota_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// ---- commands (MQTT task) -------------------------------------------------------------
+// ---- commands (from the worker's SQS phases: kata_worker.c, CHATS-13) -----------------------
 
 static void start_update(const ota_cmd *cmd)
 {
-    char *url = strdup(cmd->url);
+    // CHATS-13: in PSRAM. In internal RAM this copy (~4 KB) could split the block the update
+    // task's 8 KB stack then needed ("out of memory", 14 Oct 2026).
+    char *url = kw_strndup(cmd->url, strlen(cmd->url));
     if (!url) { respond_error("ota_error", "out of memory", cmd->version); return; }
     // IoT Core redelivers a command whose PUBACK was slow, during the update or after it has failed:
     // the same URL again is that, not a new request. No reply, on purpose: an ota_error carrying that
@@ -441,12 +446,12 @@ static void start_update(const ota_cmd *cmd)
     mbedtls_sha256((const unsigned char *)url, strlen(url), url_hash, 0);
     if (memcmp(url_hash, last_url_hash, sizeof url_hash) == 0) {
         printf("ota: update to %s with the same URL as the last: a redelivery, ignored\n", cmd->version);
-        free(url);
+        kw_free(url);
         return;
     }
     // Refused before touching the model when the answer can only be no.
     if (ota_version_valid(running_version()) && ota_version_cmp(cmd->version, running_version()) <= 0) {
-        free(url);
+        kw_free(url);
         respond_error("ota_error", ota_version_cmp(cmd->version, running_version()) == 0 ? "already running" : "downgrade refused",
                       cmd->version);
         return;
@@ -462,7 +467,7 @@ static void start_update(const ota_cmd *cmd)
         if (busy) snprintf(why, sizeof why, "busy");
         else if (probation) snprintf(why, sizeof why, "busy: checking this image first");
         else snprintf(why, sizeof why, "busy: retry in %u s", seconds_until(backoff_until));
-        free(url);
+        kw_free(url);
         respond_error("ota_error", why, cmd->version);
         return;
     }
@@ -490,7 +495,7 @@ static void cancel_update(void)
 void ota_handle_command(const char *data, size_t len)
 {
     static ota_chunks chunks;
-    static ota_cmd *cmd;                      // 8 KB: in PSRAM, not internal RAM or the MQTT task's stack
+    static ota_cmd *cmd;                      // 8 KB: in PSRAM, not internal RAM or the caller's stack
     if (!cmd && !(cmd = heap_caps_malloc(sizeof *cmd, MALLOC_CAP_SPIRAM))) {
         respond_error("error", "out of memory", NULL);
         return;

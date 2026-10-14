@@ -48,8 +48,8 @@ bool ota_boot(void);
 // what keeps the image (the other half is ota_on_connected).
 void ota_health(bool healthy);
 
-// From fleet.c (MQTT task), once subscribed to commands: reports the version, and the outcome of
+// From kata_worker.c, once a publish has reached IoT Core (CHATS-13): reports the version, and the outcome of
 // the last update once it's known.
 void ota_on_connected(void);
-// From fleet.c (MQTT task): one command from Fleet.
+// From kata_worker.c (a phase, CHATS-13): one command from Fleet, off the board's SQS queue.
 void ota_handle_command(const char *data, size_t len);

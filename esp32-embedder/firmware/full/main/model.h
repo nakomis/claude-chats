@@ -1,7 +1,7 @@
 // CHATS-10: the model and an update take turns with internal SRAM (CHATS-4).
 //
 // The model holds ~164 KB of internal RAM between passes: the int8 input tile (100 KB), the two
-// per-core weight-row buffers and the two SD bounce buffers (16 KB each). Wi-Fi and MQTT's TLS
+// per-core weight-row buffers and the two SD bounce buffers (16 KB each). Wi-Fi and TLS
 // session fit beside it; a second TLS session for the download, and the flash writes, would not
 // leave enough to be safe. So an update borrows those buffers: it waits for the pass in progress to
 // end, frees them, downloads, and either restarts into the new image or allocates them again.

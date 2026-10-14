@@ -741,7 +741,7 @@ void app_main(void)
     if (!model_ready || !ids) printf("model not loaded: no self-test, no embedding (Fleet can still update this board)\n");
 
     // CHATS-10: then the network and Fleet, so the board shows up (and can be updated) while the
-    // self-test runs. CHATS-4: what Wi-Fi and MQTT's TLS cost in internal RAM next to the model.
+    // self-test runs. CHATS-4: what Wi-Fi and TLS cost in internal RAM next to the model.
     static prov_t prov;                      // static: fleet.c and the Wi-Fi driver keep pointers into it
     net_heap("before wifi");
     bool online = prov_load(&prov) && net_up(&prov, 20000) == 0;
@@ -749,8 +749,9 @@ void app_main(void)
     heapwatch_init();                        // CHATS-5: where internal RAM runs lowest, from here on
     if (online) {
         net_heap("wifi up");
-        fleet_start(&prov);                   // connects in the background; net_heap("mqtt connected")
+        fleet_start(&prov);                   // the heartbeat; commands and publishes ride the phases
     }
+    kata_worker_hello(&prov, online);         // Fleet sees this board now, not after the self-test
 
     // The self-test, and on probation the health check: a bad new image rolls back here.
     if (model_ready && ids) selftest_run();
@@ -763,5 +764,6 @@ void app_main(void)
     // whose self-test failed still works the queue, sick: everything goes to Cal until it's well.
     if (model_ready) kata_worker_run(&prov, online, ok);
     printf("== no worker: idle; Fleet can update this board ==\n");
-    // Returning ends the main task and frees its 16 KB stack; MQTT, the heartbeat and updates carry on.
+    kata_worker_control_loop();
+    // kata_worker_control_loop returns only if the board can't reach AWS at all.
 }

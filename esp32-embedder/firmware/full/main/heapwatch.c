@@ -7,10 +7,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-static const char *const names[HW_N] = { "creds", "sqs", "mqtt_tls", "pass", "idle" };
+static const char *const names[HW_N] = { "creds", "sqs", "iotpub", "pass", "idle" };
 
 static SemaphoreHandle_t mx;             // the worker's task, MQTT's, and the heartbeat's
-static int paused, connected, creds, pass;
+static int paused, creds, iotpub, pass;
 static hw_stage_t stage;
 static size_t low[HW_N];                 // 0: the stage hasn't been seen
 static size_t boot_low;                  // IDF's lowest ever before the watch started (the model's load)
@@ -29,7 +29,7 @@ static void restage(void)
         overall = l;
         printf("heapwatch: new internal low %u in %s\n", (unsigned)l, names[stage]);
     }
-    stage = paused ? (creds ? HW_CREDS : HW_SQS) : !connected ? HW_MQTT_TLS : pass ? HW_PASS : HW_IDLE;
+    stage = paused ? (creds ? HW_CREDS : iotpub ? HW_IOTPUB : HW_SQS) : pass ? HW_PASS : HW_IDLE;
     heap_caps_monitor_local_minimum_free_size_start();
 }
 
@@ -54,9 +54,9 @@ void heapwatch_init(void)
 }
 
 void heapwatch_paused(int v) { set(&paused, v); }
-void heapwatch_connected(int v) { set(&connected, v); }
 void heapwatch_creds(int v) { set(&creds, v); }
 void heapwatch_pass(int v) { set(&pass, v); }
+void heapwatch_iotpub(int v) { set(&iotpub, v); }
 
 size_t heapwatch_lowest(void)
 {
