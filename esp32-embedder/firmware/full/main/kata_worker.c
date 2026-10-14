@@ -227,17 +227,19 @@ static int net_begin(void *ctx, char *why, size_t n)
 // (run_commands). An update starts a task with an 8 KB internal stack, and a TLS session beside a
 // new one took internal RAM down to 5.4 KB (14 Oct). A command is acted on once.
 #define MAX_COMMANDS 10
+#define COMMANDS_WAIT_S 1             // a long poll: every SQS server, not a sample (see take_commands)
 static char *pending[MAX_COMMANDS];
 static size_t pending_len[MAX_COMMANDS];
 static int n_pending;
 
-static void take_commands(void)
+// One receive: how many came, if they filled the request (so there may be more), else 0.
+static int take_some(void)
 {
     sqs_msg_t *msgs = NULL;
-    int n = 0;
-    if (sqs_receive(&sqs, commands_url, MAX_COMMANDS - n_pending, 0, 60, &msgs, &n)) {
+    int n = 0, want = MAX_COMMANDS - n_pending;
+    if (sqs_receive(&sqs, commands_url, want, COMMANDS_WAIT_S, 60, &msgs, &n)) {
         printf("fleet: commands: %s\n", sqs.last_error);
-        return;
+        return 0;
     }
     const char *receipts[MAX_COMMANDS];
     for (int i = 0; i < n; i++) {
@@ -250,6 +252,18 @@ static void take_commands(void)
     if (n && sqs_delete_batch(&sqs, commands_url, receipts, n, ok)) printf("fleet: commands: %s\n", sqs.last_error);
     for (int i = 0; i < n; i++) sqs_msg_free(&msgs[i]);
     kw_free(msgs);
+    return n == want ? n : 0;
+}
+
+static void take_commands(void)
+{
+    // A long poll, however short: a short one (wait 0) asks only a sample of SQS's servers, so the
+    // five chunks of an update's URL, published together, trickled in over many phases and never
+    // completed inside ota_cmd's 60 s (14 Oct). A long poll asks them all. Then again while a
+    // receive comes back full.
+    for (int got = 1; got && n_pending < MAX_COMMANDS;) {
+        got = take_some();
+    }
 }
 
 // No session open: hand each command to ota.c. True if any came.
