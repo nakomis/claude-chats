@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "full.c" "net.c" "vcore.c" "prov.c" "fleet.c" "ota.c" "kata_worker.c" "../../../tok/tok.c" "../../../otacmd/ota_cmd.c"
+    SRCS "full.c" "net.c" "heapwatch.c" "vcore.c" "prov.c" "fleet.c" "ota.c" "kata_worker.c" "../../../tok/tok.c" "../../../otacmd/ota_cmd.c"
          # CHATS-5: the worker's portable modules (host-tested in ../../../test)
          "../../../worker/kw.c" "../../../worker/sigv4.c" "../../../worker/age.c" "../../../worker/prep.c"
          "../../../worker/result.c" "../../../worker/sqs.c" "../../../worker/creds.c" "../../../worker/worker.c"

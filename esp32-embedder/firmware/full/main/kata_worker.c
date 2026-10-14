@@ -19,6 +19,7 @@
 #include "age.h"
 #include "creds.h"
 #include "fleet.h"
+#include "heapwatch.h"
 #include "kw.h"
 #include "model.h"
 #include "net.h"
@@ -70,6 +71,7 @@ static void status_extra(jbuf_t *b)
     if (running) {
         jb_puts(b, ",\"worker\":");
         worker_status_json(&w, b);
+        heapwatch_json(b);
         if (creds.expires) jb_printf(b, ",\"creds_expire_at\":%lld", (long long)creds.expires);
     } else {
         jb_printf(b, ",\"worker\":{\"state\":\"off\",\"why\":\"%s\",\"embedder\":\"%s\"}", why_not, EMBEDDER_TAG);
@@ -177,7 +179,9 @@ static int net_begin(void *ctx, char *why, size_t n)
         snprintf(why, n, "internal RAM low: %u bytes free with MQTT paused", free_int);
         return -1;
     }
+    heapwatch_creds(1);
     int rc = creds_refresh(&creds, now(NULL), prov->cred_endpoint, prov->role_alias, prov->thing_name, creds_get, NULL, why, n);
+    heapwatch_creds(0);
     if (rc < 0) { fleet_resume(); return -1; }
     if (rc == 1) printf("worker: new credentials, good until %lld\n", (long long)creds.expires);
     return 0;
@@ -210,7 +214,10 @@ static int tokenise(void *ctx, const char *text, size_t len, int32_t *ids, int m
 static int embed(void *ctx, const int32_t *ids, const int *lens, int n, float *vecs, worker_pass_info_t *info)
 {
     (void)ctx;
-    return model_embed(ids, lens, n, vecs, info);
+    heapwatch_pass(1);
+    int rc = model_embed(ids, lens, n, vecs, info);
+    heapwatch_pass(0);
+    return rc;
 }
 
 static int health(void *ctx)
@@ -277,6 +284,7 @@ void kata_worker_run(const prov_t *p, bool online, bool healthy)
     if (!healthy) worker_set_sick(&w, "the boot self-test failed");
     printf("worker: %s as %s, tag %s; pool budget %u KB (PSRAM free %u KB), target %d tokens\n", w.sick ? "starting SICK" : "starting",
            p->thing_name, EMBEDDER_TAG, (unsigned)(budget / 1024), (unsigned)(free_ps / 1024), TARGET_TOKENS);
+    heapwatch_connected(fleet_connected());
     last_tick_us = esp_timer_get_time();
     running = true;
     esp_timer_handle_t wd;

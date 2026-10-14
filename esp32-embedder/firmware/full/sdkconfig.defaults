@@ -20,6 +20,11 @@ CONFIG_FATFS_USE_FASTSEEK=y
 # didn't change the core-0 corruption, and internal ends up with more free this way); mbedTLS in PSRAM.
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# CHATS-5: software AES. With mbedTLS's buffers in PSRAM, hardware AES bounces every record through
+# two 1600-byte internal DMA buffers, and internal RAM, low and fragmented next to the model, didn't
+# always have them: "esp-aes: Failed to allocate memory", a SendMessageBatch lost mid-write. The
+# software tables are in flash (MBEDTLS_AES_ROM_TABLES), and TLS here is a few KB a minute.
+CONFIG_MBEDTLS_HARDWARE_AES=n
 # Wi-Fi/lwIP hot paths live in flash, not IRAM (on the S3, IRAM comes out of the same SRAM)
 CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=n
