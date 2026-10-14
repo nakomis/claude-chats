@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
+#include "heapwatch.h"
 #include "net.h"
 #include "prov.h"
 
@@ -39,7 +40,7 @@ void net_heap(const char *when)
     printf("heap %s: internal free %u (largest %u, lowest ever %u), PSRAM free %u\n", when,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heapwatch_lowest(),
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 

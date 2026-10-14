@@ -1,6 +1,7 @@
 // Kata on Fleet: MQTT to IoT Core (CHATS-10). See fleet.h. tinycrypt's notifier.c, less the presence
 // push; Wi-Fi is net.c's.
 #include "fleet.h"
+#include "heapwatch.h"
 #include "model.h"
 #include "net.h"
 #include "ota.h"
@@ -54,7 +55,7 @@ static void send_status(void *arg)
               esp_app_get_description()->version, model_state(), selftest, (long long)(esp_timer_get_time() / 1000000),
               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+              (unsigned)heapwatch_lowest(),
               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     if (status_extra) status_extra(&b);
     jb_putc(&b, '}');
@@ -75,15 +76,18 @@ void fleet_pause(void)
 {
     if (!mqtt || paused) return;
     paused = true;
+    heapwatch_paused(1);
     if (connected) esp_mqtt_client_disconnect(mqtt);
     esp_mqtt_client_stop(mqtt);
     connected = false;
+    heapwatch_connected(0);
 }
 
 void fleet_resume(void)
 {
     if (!mqtt || !paused) return;
     paused = false;
+    heapwatch_paused(0);
     if (esp_mqtt_client_start(mqtt) != ESP_OK) printf("fleet: MQTT didn't restart\n");
 }
 
@@ -95,6 +99,7 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     switch ((esp_mqtt_event_id_t)id) {
     case MQTT_EVENT_CONNECTED:
         connected = true;
+        heapwatch_connected(1);
         printf("fleet: connected to IoT Core as %s\n", prov->thing_name);
         if (!heap_logged) { net_heap("mqtt connected"); heap_logged = true; }
         // Subscribe on every connect: a persistent session usually has it already, but not always
@@ -103,6 +108,7 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         break;
     case MQTT_EVENT_DISCONNECTED:
         connected = false;
+        heapwatch_connected(0);
         printf("fleet: disconnected\n");
         break;
     case MQTT_EVENT_SUBSCRIBED:

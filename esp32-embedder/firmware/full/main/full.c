@@ -30,6 +30,7 @@
 #include "mxcrc.h"
 #include "tok.h"
 #include "fleet.h"
+#include "heapwatch.h"
 #include "model.h"
 #include "net.h"
 #include "ota.h"
@@ -745,6 +746,7 @@ void app_main(void)
     net_heap("before wifi");
     bool online = prov_load(&prov) && net_up(&prov, 20000) == 0;
     kata_worker_status_init(vcore_mv);       // the heartbeat's card, temperature and worker fields
+    heapwatch_init();                        // CHATS-5: where internal RAM runs lowest, from here on
     if (online) {
         net_heap("wifi up");
         fleet_start(&prov);                   // connects in the background; net_heap("mqtt connected")
