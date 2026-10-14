@@ -14,7 +14,7 @@
 //   mqtt_tls  MQTT resumed and not yet connected (its TLS handshake), perhaps alongside a pass
 //   pass      MQTT connected, a pass running
 //   idle      MQTT connected, nothing else
-typedef enum { HW_CREDS, HW_SQS, HW_MQTT_TLS, HW_PASS, HW_IDLE, HW_N } hw_stage_t;
+typedef enum { HW_CREDS, HW_SQS, HW_MQTT_TLS, HW_PASS, HW_IDLE, HW_IOTPUB, HW_N } hw_stage_t;
 
 void heapwatch_init(void);
 // What changed: each recomputes the stage, closing the last one's window
@@ -22,6 +22,10 @@ void heapwatch_paused(int paused);       // fleet_pause / fleet_resume
 void heapwatch_connected(int connected); // MQTT's CONNECTED / DISCONNECTED
 void heapwatch_creds(int in_creds);      // around creds_refresh
 void heapwatch_pass(int in_pass);        // around a pass
+void heapwatch_iotpub(int in_pub);       // CHATS-13 spike: around the HTTPS publish
+// CHATS-13 spike: print the internal heap's block map now (also printed by itself whenever the
+// largest free block reaches a new low, at most every 5 minutes)
+void heapwatch_map(const char *why);
 // The lowest internal free since boot, IDF's from before the watch started included
 size_t heapwatch_lowest(void);
 // ,"heap_low":{"creds":N,...} for the heartbeat

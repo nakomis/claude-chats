@@ -10,6 +10,8 @@
 
 #include <stdbool.h>
 
+#include "sdkconfig.h"
+
 #include "kw.h"
 #include "prov.h"
 
@@ -32,3 +34,11 @@ void fleet_status_now(void);
 void fleet_pause(void);
 void fleet_resume(void);
 bool fleet_connected(void);
+
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+// CHATS-13 spike: take what's waiting to be published (the caller kw_frees each): the latest status
+// (or NULL) and up to max responses, oldest first. Returns how many responses.
+int fleet_spike_take(char **status, char **out, int max);
+// "status" or "responses": this board's topic.
+const char *fleet_topic(const char *which);
+#endif

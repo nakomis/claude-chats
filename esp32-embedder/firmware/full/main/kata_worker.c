@@ -23,6 +23,7 @@
 #include "kw.h"
 #include "model.h"
 #include "net.h"
+#include "ota.h"
 #include "selftest.h"
 #include "sqs.h"
 #include "worker.h"
@@ -187,13 +188,124 @@ static int net_begin(void *ctx, char *why, size_t n)
     return 0;
 }
 
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+// ---- CHATS-13 spike: commands from SQS, publishes over HTTPS -------------------------------------
+static char cmd_url[200];                 // <ingest queue's base>/<thing>-commands-spike
+
+// Fleet's commands, forwarded by the IoT rule into this board's queue: on the phase's session.
+static void spike_commands(void)
+{
+    if (!cmd_url[0]) {
+        const char *slash = strrchr(prov->queue_url, '/');
+        if (!slash) return;
+        snprintf(cmd_url, sizeof cmd_url, "%.*s/%s-commands-spike", (int)(slash - prov->queue_url), prov->queue_url,
+                 prov->thing_name);
+    }
+    sqs_msg_t *msgs = NULL;
+    int n = 0;
+    if (sqs_receive(&sqs, cmd_url, 10, 0, 60, &msgs, &n)) {
+        printf("spike: commands receive failed: %s\n", sqs.last_error);
+        return;
+    }
+    const char *receipts[10];
+    for (int i = 0; i < n; i++) {
+        printf("spike: command from SQS (%u bytes): %.200s\n", (unsigned)msgs[i].body_len, msgs[i].body);
+        ota_handle_command(msgs[i].body, msgs[i].body_len);
+        receipts[i] = msgs[i].receipt;
+    }
+    bool ok[10];
+    if (n && sqs_delete_batch(&sqs, cmd_url, receipts, n, ok)) printf("spike: commands delete failed: %s\n", sqs.last_error);
+    for (int i = 0; i < n; i++) sqs_msg_free(&msgs[i]);
+    kw_free(msgs);
+}
+
+// One HTTPS publish (SigV4, service iotdata) on the keep-alive session hc. The HTTP status, or -1.
+static int iot_post(esp_http_client_handle_t *hc, const char *topic, bool retain, const char *body, jbuf_t *resp)
+{
+    char path[128], date[17], authz[320], url[256];
+    const char *query = retain ? "qos=1&retain=true" : "qos=1";
+    snprintf(path, sizeof path, "/topics/%s", topic);     // plain slashes: no double-encoding to get wrong
+    kw_amz_date(now(NULL), date);
+    sv4_hdr_t h[5] = { { "Content-Type", "application/json" },
+                       { "Host", prov->iot_endpoint },
+                       { "X-Amz-Date", date },
+                       { "X-Amz-Security-Token", creds.token } };
+    const sv4_key_t key = { creds.access_key, creds.secret_key, sqs.region, "iotdata" };
+    const sv4_req_t sr = { "POST", path, query, h, 4, (const uint8_t *)body, strlen(body) };
+    if (sv4_sign(&sr, &key, date, authz, sizeof authz, NULL, NULL)) return -1;
+    snprintf(url, sizeof url, "https://%s%s?%s", prov->iot_endpoint, path, query);
+    if (!*hc) {
+        esp_http_client_config_t c = {
+            .url = url,
+            .method = HTTP_METHOD_POST,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 15000,
+            .buffer_size = HTTP_RX_BUF,
+            .buffer_size_tx = HTTP_TX_BUF,
+            .event_handler = on_http,
+        };
+        if (!(*hc = esp_http_client_init(&c))) return -1;
+    } else {
+        esp_http_client_set_url(*hc, url);
+    }
+    esp_http_client_set_user_data(*hc, resp);
+    jb_reset(resp);
+    for (int i = 0; i < 4; i++)
+        if (i != 1) esp_http_client_set_header(*hc, h[i].name, h[i].value);
+    esp_http_client_set_header(*hc, "Authorization", authz);
+    esp_http_client_set_post_field(*hc, body, (int)strlen(body));
+    esp_err_t e = esp_http_client_perform(*hc);
+    esp_http_client_set_post_field(*hc, NULL, 0);
+    if (e != ESP_OK) { esp_http_client_close(*hc); return -1; }
+    return esp_http_client_get_status_code(*hc);
+}
+
+// After the SQS session closes (never two at once): the outbox's responses, then the latest status.
+static void spike_publish(void)
+{
+    char *status = NULL, *out[16];
+    int n = fleet_spike_take(&status, out, 16);
+    if (!status && !n) return;
+    heapwatch_iotpub(1);
+    int64_t t0 = esp_timer_get_time();
+    esp_http_client_handle_t hc = NULL;
+    jbuf_t resp;
+    jb_init(&resp);
+    int ok = 0, total = n + (status != NULL);
+    for (int i = 0; i < n; i++) {
+        int st = iot_post(&hc, fleet_topic("responses"), false, out[i], &resp);
+        if (st == 200) ok++;
+        else printf("spike: publish response: HTTP %d %.*s\n", st, (int)resp.n, resp.p ? resp.p : "");
+        kw_free(out[i]);
+    }
+    if (status) {
+        int st = iot_post(&hc, fleet_topic("status"), true, status, &resp);
+        if (st == 200) ok++;
+        else printf("spike: publish status: HTTP %d %.*s\n", st, (int)resp.n, resp.p ? resp.p : "");
+        kw_free(status);
+    }
+    if (hc) esp_http_client_cleanup(hc);
+    jb_free(&resp);
+    heapwatch_iotpub(0);
+    printf("spike: published %d/%d over HTTPS in %lld ms\n", ok, total, (long long)((esp_timer_get_time() - t0) / 1000));
+    static bool first = true;
+    if (ok && first) { first = false; ota_on_connected(); }
+}
+#endif
+
 static void net_end(void *ctx)
 {
     (void)ctx;
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+    spike_commands();
+#endif
     if (sqs_http) {
         esp_http_client_cleanup(sqs_http);
         sqs_http = NULL;
     }
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+    spike_publish();
+#endif
     // The first few phases, any that moved a big body (the bring-up check: a ~40 KB inline job), then
     // about hourly. The low point is the one to watch.
     static int phases;
@@ -285,6 +397,7 @@ void kata_worker_run(const prov_t *p, bool online, bool healthy)
     printf("worker: %s as %s, tag %s; pool budget %u KB (PSRAM free %u KB), target %d tokens\n", w.sick ? "starting SICK" : "starting",
            p->thing_name, EMBEDDER_TAG, (unsigned)(budget / 1024), (unsigned)(free_ps / 1024), TARGET_TOKENS);
     heapwatch_connected(fleet_connected());
+    heapwatch_map("worker starting");
     last_tick_us = esp_timer_get_time();
     running = true;
     esp_timer_handle_t wd;

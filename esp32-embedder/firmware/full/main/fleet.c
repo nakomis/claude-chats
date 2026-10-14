@@ -38,6 +38,24 @@ static volatile bool paused;
 static SemaphoreHandle_t status_mx;      // the heartbeat runs from the esp_timer task and the worker's
 static void (*status_extra)(jbuf_t *);
 
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+// CHATS-13 spike: no MQTT. What would have been published waits here for the worker's HTTPS
+// publish after its next SQS phase: the latest status (retained), and the responses in order.
+#define SPIKE_OUTBOX 16
+static char *spike_status;
+static char *spike_out[SPIKE_OUTBOX];
+static int spike_n;
+static portMUX_TYPE spike_lock = portMUX_INITIALIZER_UNLOCKED;
+static void spike_put(char **slot, char *s)
+{
+    taskENTER_CRITICAL(&spike_lock);
+    char *old = *slot;
+    *slot = s;
+    taskEXIT_CRITICAL(&spike_lock);
+    kw_free(old);
+}
+#endif
+
 void fleet_set_selftest(const char *verdict) { selftest = verdict; }
 void fleet_set_status_extra(void (*extra)(jbuf_t *out)) { status_extra = extra; }
 
@@ -47,7 +65,11 @@ void fleet_set_status_extra(void (*extra)(jbuf_t *out)) { status_extra = extra; 
 static void send_status(void *arg)
 {
     (void)arg;
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+    if (!status_mx || xSemaphoreTake(status_mx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+#else
     if (!connected || paused || !status_mx || xSemaphoreTake(status_mx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+#endif
     jbuf_t b;                                 // PSRAM (kw.h)
     jb_init(&b);
     jb_printf(&b, "{\"type\":\"status\",\"version\":\"%s\",\"state\":\"%s\",\"selftest\":\"%s\",\"uptime_s\":%lld,"
@@ -61,8 +83,12 @@ static void send_status(void *arg)
     jb_putc(&b, '}');
     if (b.oom) printf("fleet: out of memory for the status\n");
     else if (b.n > MQTT_OUT_BUFFER_SIZE - 64) printf("fleet: status of %u bytes is too big for the buffer: not sent\n", (unsigned)b.n);
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+    else spike_put(&spike_status, kw_strndup(b.p, b.n));
+#else
     // QoS 0, retained: the next one is a minute away, and the latest is what's kept
     else esp_mqtt_client_enqueue(mqtt, status_topic, b.p, (int)b.n, 0, 1, true);
+#endif
     jb_free(&b);
     xSemaphoreGive(status_mx);
 }
@@ -74,6 +100,10 @@ void fleet_status_now(void) { send_status(NULL); }
 // IoT Core keeps the subscription and queues QoS 1 commands until it's back.
 void fleet_pause(void)
 {
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+    heapwatch_paused(1);                      // no MQTT to pause: just the stage
+    return;
+#endif
     if (!mqtt || paused) return;
     paused = true;
     heapwatch_paused(1);
@@ -85,6 +115,10 @@ void fleet_pause(void)
 
 void fleet_resume(void)
 {
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+    heapwatch_paused(0);
+    return;
+#endif
     if (!mqtt || !paused) return;
     paused = false;
     heapwatch_paused(0);
@@ -158,6 +192,15 @@ bool fleet_start(const prov_t *p)
     snprintf(commands_topic, sizeof commands_topic, "kata/%s/commands", prov->thing_name);
     snprintf(responses_topic, sizeof responses_topic, "kata/%s/responses", prov->thing_name);
     snprintf(status_topic, sizeof status_topic, "kata/%s/status", prov->thing_name);
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+    const esp_timer_create_args_t st = { .callback = send_status, .name = "fleet_status" };
+    if (esp_timer_create(&st, &status_timer) != ESP_OK ||
+        esp_timer_start_periodic(status_timer, (uint64_t)FLEET_STATUS_S * 1000000) != ESP_OK)
+        printf("fleet: status timer didn't start\n");
+    heapwatch_connected(1);                   // no MQTT handshake stage in the spike
+    printf("fleet: CHATS-13 spike: no MQTT; commands from SQS, publishes over HTTPS after each phase\n");
+    return true;
+#endif
 
     static char uri[sizeof prov->iot_endpoint + 16];
     snprintf(uri, sizeof uri, "mqtts://%s:8883", prov->iot_endpoint);
@@ -191,6 +234,22 @@ bool fleet_start(const prov_t *p)
 
 bool fleet_respond(const char *json)
 {
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+    char *copy = kw_strndup(json, strlen(json));
+    if (!copy) return false;
+    char *dropped = NULL;
+    taskENTER_CRITICAL(&spike_lock);
+    if (spike_n == SPIKE_OUTBOX) {            // full: the oldest goes
+        dropped = spike_out[0];
+        memmove(spike_out, spike_out + 1, (SPIKE_OUTBOX - 1) * sizeof *spike_out);
+        spike_n--;
+    }
+    spike_out[spike_n++] = copy;
+    taskEXIT_CRITICAL(&spike_lock);
+    kw_free(dropped);
+    printf("fleet: response for the outbox: %s\n", json);
+    return true;
+#endif
     if (!mqtt || !connected) {
         printf("fleet: not connected: response dropped: %s\n", json);
         return false;
@@ -199,3 +258,22 @@ bool fleet_respond(const char *json)
     printf("fleet: response queued (msg %d): %s\n", msg_id, json);
     return msg_id >= 0;
 }
+
+#if CONFIG_KATA_SPIKE_SQS_ONLY
+int fleet_spike_take(char **status, char **out, int max)
+{
+    taskENTER_CRITICAL(&spike_lock);
+    *status = spike_status;
+    spike_status = NULL;
+    int n = spike_n < max ? spike_n : max;
+    memcpy(out, spike_out, n * sizeof *out);
+    memmove(spike_out, spike_out + n, (spike_n - n) * sizeof *spike_out);
+    spike_n -= n;
+    taskEXIT_CRITICAL(&spike_lock);
+    return n;
+}
+const char *fleet_topic(const char *which)
+{
+    return !strcmp(which, "status") ? status_topic : responses_topic;
+}
+#endif

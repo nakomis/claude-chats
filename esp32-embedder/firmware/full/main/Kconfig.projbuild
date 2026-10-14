@@ -9,4 +9,13 @@ config KATA_OTA_FAIL_SELFTEST
         itself still runs, so the log shows the real result too. Never publish one for real use, and
         never promote one to prod. CI never sets it (sdkconfig.defaults).
 
+config KATA_SPIKE_SQS_ONLY
+    bool "SPIKE (CHATS-13): no MQTT; commands from SQS, status and responses by HTTPS publish"
+    default n
+    help
+        CHATS-13's spike. The board never opens MQTT: Fleet's commands reach it through an IoT rule
+        into a per-board SQS queue (<thing>-commands-spike, beside the ingest queue), read in each
+        SQS phase; responses and the status heartbeat go into an outbox, published over HTTPS
+        (SigV4, service iotdata) after the phase. Sandbox only, never published.
+
 endmenu
