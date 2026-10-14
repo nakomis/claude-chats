@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as iot from 'aws-cdk-lib/aws-iot';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 
@@ -31,6 +32,14 @@ const PROJECT = 'kata';
  * Both queues live in home-infra's ConversationMemoryIngestStack, in the same account as the
  * Things (prod boards consume prod; sandbox boards are for testing against sandbox), and are found
  * through the SSM parameters it publishes, so that stack must be deployed first (HOME-439).
+ *
+ * CHATS-13: Kata no longer holds MQTT. With the model's buffers, internal RAM can't hold an MQTT
+ * session beside the SQS one, and stopping and restarting MQTT round every SQS phase fragmented it.
+ * So Fleet's commands reach a board through SQS: an IoT rule forwards whatever is published on
+ * kata/{thing}/commands into that board's queue, {thing}-commands, which the board reads in each SQS
+ * phase. Its responses and status heartbeat go out as HTTPS publishes (SigV4, service iotdata) to its
+ * own topics, with the WorkerRole credentials it already has, so Fleet and BD-1 see the same topics
+ * as before. The MQTT grants in the board policy stay until no board runs firmware that uses them.
  */
 export class DeviceStack extends cdk.Stack {
     constructor(scope: Construct, id: string, props: DeviceStackProps) {
@@ -74,6 +83,26 @@ export class DeviceStack extends cdk.Stack {
             // SendMessage covers SendMessageBatch. Send only: Kata can't read results back.
             actions: ['sqs:SendMessage'],
             resources: [resultsQueueArn],
+        }));
+        // CHATS-13: each board publishes its own responses and status over HTTPS, and reads its own
+        // commands queue. credentials-iot:ThingName is the Thing the credentials provider issued
+        // this session to (the board's certificate's Thing), so a board can't pose as another.
+        const thing = '${credentials-iot:ThingName}';
+        workerRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'PublishOwnTopics',
+            actions: ['iot:Publish'],
+            resources: [arn(`topic/${PROJECT}/${thing}/responses`), arn(`topic/${PROJECT}/${thing}/status`)],
+        }));
+        workerRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'RetainOwnStatus',
+            // The heartbeat is retained, for BD-1's GetRetainedMessage (HOME-441).
+            actions: ['iot:RetainPublish'],
+            resources: [arn(`topic/${PROJECT}/${thing}/status`)],
+        }));
+        workerRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'TakeOwnCommands',
+            actions: ['sqs:ReceiveMessage', 'sqs:DeleteMessage'],
+            resources: [`arn:${this.partition}:sqs:${this.region}:${this.account}:${thing}-commands`],
         }));
         // Deliberately nothing else: no S3 (claim-check jobs are handed to Cal unembedded), no
         // GetQueueAttributes, no DLQs, and no KMS (both queues use SQS-managed encryption).
@@ -123,6 +152,41 @@ export class DeviceStack extends cdk.Stack {
                         Resource: roleAlias.attrRoleAliasArn,
                     },
                 ],
+            },
+        });
+
+        // ---- CHATS-13: Fleet's commands, into each board's SQS queue ----
+        // A command waits for the board's next SQS phase (seconds when idle, up to a pass when
+        // busy), so an hour is plenty; an update's presigned URL lasts ten minutes anyway.
+        const commandQueues: sqs.Queue[] = [];
+        for (const board of boards) {
+            commandQueues.push(new sqs.Queue(this, `Commands-${board}`, {
+                queueName: `${PROJECT}-${deployEnv}-${board}-commands`,
+                retentionPeriod: cdk.Duration.hours(1),
+                encryption: sqs.QueueEncryption.SQS_MANAGED,
+                enforceSSL: true,
+            }));
+        }
+        const ruleRole = new iam.Role(this, 'CommandsRuleRole', {
+            assumedBy: new iam.ServicePrincipal('iot.amazonaws.com'),
+            description: `Lets the ${PROJECT}-${deployEnv} commands rule put Fleet's commands on each board's queue`,
+        });
+        for (const q of commandQueues) q.grantSendMessages(ruleRole);
+        new iot.CfnTopicRule(this, 'CommandsRule', {
+            ruleName: `${PROJECT}_${deployEnv}_commands`,
+            topicRulePayload: {
+                description: `CHATS-13: Fleet's commands for ${PROJECT}-${deployEnv} boards, onto each board's SQS queue`,
+                // Only this environment's boards: a queue exists for each of them.
+                sql: `SELECT * FROM '${PROJECT}/+/commands' WHERE startswith(topic(2), '${PROJECT}-${deployEnv}-')`,
+                awsIotSqlVersion: '2016-03-23',
+                actions: [{
+                    sqs: {
+                        roleArn: ruleRole.roleArn,
+                        // The substitution picks the board's own queue (tested in the CHATS-13 spike).
+                        queueUrl: `https://sqs.${this.region}.amazonaws.com/${this.account}/\${topic(2)}-commands`,
+                        useBase64: false,
+                    },
+                }],
             },
         });
 

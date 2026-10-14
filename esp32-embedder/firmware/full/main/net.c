@@ -1,6 +1,6 @@
 // CHATS-4: Wi-Fi station plus one HTTPS request, to measure what the network stack costs
 // in internal SRAM next to the model. Credentials come from the prov partition (prov.c, CHATS-10),
-// never the build. The station reconnects by itself; MQTT (fleet.c) rides on it.
+// never the build. The station reconnects by itself; the worker's phases ride on it.
 #include <stdio.h>
 #include <string.h>
 #include <time.h>

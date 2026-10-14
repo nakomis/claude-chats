@@ -107,7 +107,7 @@ In numpy (`host/lean.py`) the leaner layout costs nothing measurable against the
 | `host/selftest_crcs.py` | Reads a board's log and writes the known-good vector CRCs into `firmware/full/main/selftest.h` |
 | `host/serial_log.py` | Logs the board's serial output to a file without resetting it |
 | `host/corpus.py` | Samples real messages from local Claude Code transcripts for tokeniser testing (stays local) |
-| `firmware/full/` | Kata's firmware: the whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin`; joins Fleet over MQTT and takes updates from it. `build.sh`, `sign.sh` and `flash.sh` build, sign and flash it; `tools/` is for CI |
+| `firmware/full/` | Kata's firmware: the whole model, streamed off SD; tokenises the test texts on the device and checks ids and vectors against `mxtest.bin`; joins Fleet (commands through SQS, responses and status by HTTPS publish: CHATS-13) and takes updates from it. `build.sh`, `sign.sh` and `flash.sh` build, sign and flash it; `tools/` is for CI |
 | `firmware/layer0/` | One layer from a flash partition, plus the self-tests that found the PIE bug, an SD speed test and a GPIO pull-up probe |
 | `firmware/bench/` | int8 matmul benchmark for the S3 (esp-nn) |
 | `firmware/wroom-bench/` | int8 dot-product benchmark for the original ESP32 |
@@ -195,7 +195,11 @@ The partition table is tinycrypt's, with the room 16 MB allows: `nvs`, `phy_init
 
 Once it's provisioned, Kata is a device in Fleet (`nakomis-fleet`): it shows up there with its version and a status heartbeat, and its firmware is updated from there, not over USB. USB is for the first flash and for provisioning.
 
-**MQTT** (`main/fleet.c`, tinycrypt's `notifier.c`): TLS to IoT Core on port 8883, with Amazon Root CA 1 (`AmazonRootCA1.pem`, public) and the board's own certificate. On every connect, Kata sends `{"type":"version","version":…,"project":"kata"}`. Every minute, and after each step of the worker, it publishes a heartbeat on `kata/{thing}/status`, which keeps it live in Fleet. It's **retained** (CHATS-5), so BD-1 can read a board's last status with IoT Core's `GetRetainedMessage` (HOME-441); the board policy allows `iot:RetainPublish` on that topic alone. The heartbeat carries the state (`checking` during the self-test, `embedding`, `updating` or `idle`), the self-test's verdict, uptime, the free internal RAM, its low-water mark and the free PSRAM, the chip's temperature (`temp_c`), the core voltage `vcore.c` applied (`vcore_mv`), the card's health and the worker's (see [The worker](#the-worker)).
+**No MQTT (CHATS-13).** Kata used to hold an MQTT session to IoT Core. Next to the model, internal RAM can't hold that beside the worker's SQS session, so MQTT stepped aside for every SQS phase and came back after: a stop and restart about once a minute, which fragmented internal RAM (the largest free block fell from 18 KB to 10 KB in a few hours, and Fleet updates could no longer start). Now it rides the worker's phases instead, with the same topics, so Fleet and BD-1 see no difference:
+- **Commands in.** Fleet publishes on `kata/{thing}/commands` as before. An IoT rule (`kata_{env}_commands`, in the device stack) puts each one on the board's own SQS queue, `kata-{env}-{board}-commands`, beside the ingest queue. Kata reads it at the end of each SQS phase, on the same session, and hands each command to `ota.c`.
+- **Responses and the heartbeat out.** These wait in an outbox (`main/fleet.c`). After each phase, once the SQS session has closed, Kata publishes them over HTTPS to its own topics on the IoT data endpoint (`POST /topics/kata/{thing}/responses?qos=1`, and the status with `retain=true`), signed with SigV4 (service `iotdata`) and the worker's role credentials. The role may publish only to the board's own topics (`${credentials-iot:ThingName}`). What can't be published goes back in the outbox for the next phase. At boot, before the self-test, one phase with no jobs sends `{"type":"version",…}` and the first heartbeat, so the board shows up in Fleet within seconds. A board with no worker (no model) still runs such a phase every minute, so it can still be updated.
+
+So a command is answered at the board's next phase: within about 35 s when it's idle, up to a pass (a few minutes) when it's busy. The heartbeat is built every minute and after each step; the latest one is published after the next phase. It's **retained** (CHATS-5), so BD-1 can read a board's last status with IoT Core's `GetRetainedMessage` (HOME-441). The heartbeat carries the state (`checking` during the self-test, `embedding`, `updating` or `idle`), the self-test's verdict, uptime, the free internal RAM, its low-water mark and the free PSRAM, the per-stage low points (`heap_low`), the chip's temperature (`temp_c`), the core voltage `vcore.c` applied (`vcore_mv`), the card's health and the worker's (see [The worker](#the-worker)).
 
 **Commands** are Fleet's ESP32 protocol, which mustn't change. Kata uses tinycrypt's parser (`otacmd/ota_cmd.c`, copied with its host tests) and answers `get_version`, `ping`, `ota_update`, `url_chunk` and `ota_cancel`. Anything else is refused: Kata takes no reboot, wipe or settings from the cloud.
 
@@ -221,9 +225,9 @@ Here's where internal RAM should land. The image itself costs ~6 KB more static 
 
 **Rollback.** A new image starts on probation (`ESP_OTA_IMG_PENDING_VERIFY`). It's kept only when both of these hold, within 30 minutes of boot:
 - **It's healthy.** The self-test is the health check, and it must say PASSED: all seven tests run, every vector bit for bit what `selftest.h` records, and no CRC or tokeniser mismatches. There's one fallback, for a build whose arithmetic changed and whose CRCs were zeroed until they're recorded again. That build's verdict is NOT VERIFIED, and it counts as healthy only if every unrecorded vector is within cos 0.999 of Ollama. A healthy board gives 0.99937–0.99978.
-- **It has subscribed to its commands on IoT Core.** Otherwise it couldn't be updated again.
+- **It has reached IoT Core.** Its first HTTPS publish has gone through (CHATS-13; it was MQTT's subscription to its commands). Otherwise it couldn't be updated again.
 
-A failed self-test rolls back at once. A crash, or the deadline passing, rolls back too. The old image then reports `ota_error {message: "rolled back"}`, and a kept image reports `ota_complete`. The self-test takes about 15 minutes at 240 MHz, but the board is on MQTT within seconds of booting. Fleet sees the new version straight away, and a rollback afterwards still shows as one. Updates sent while an image is on probation are refused.
+A failed self-test rolls back at once. A crash, or the deadline passing, rolls back too. The old image then reports `ota_error {message: "rolled back"}`, and a kept image reports `ota_complete`. The self-test takes about 15 minutes at 240 MHz, but the board publishes its version within seconds of booting (one phase with no jobs, before the self-test). Fleet sees the new version straight away, and a rollback afterwards still shows as one. Updates sent while an image is on probation are refused.
 
 To check rollback, build with `CONFIG_KATA_OTA_FAIL_SELFTEST` (menuconfig, "Kata"): the image passes everything, then reports its self-test as failed. CI's image checks refuse to publish such a build, so it's published by hand to sandbox only, and never promoted.
 
@@ -236,12 +240,11 @@ Kata takes over conversation-memory's embedding from Cal (CHATS-5). The design i
 The state machine is portable C in `worker/` (`worker.c`), tested on the Mac against a fake SQS. The board's side is `firmware/full/main/kata_worker.c`. It runs in `app_main`'s task once the self-test is done. Each step is a network phase, then at most one pass.
 
 **The network phase.** Internal RAM allows one TLS session at a time (CHATS-4; the spike measured 32.7 KB as the lowest free with Wi-Fi and one HTTPS session). So the phase works like this:
-1. MQTT steps aside: a clean DISCONNECT, then the client stops. The session is persistent (`clean_session=false`), so IoT Core keeps the subscription and queues QoS 1 commands until MQTT is back.
-2. A phase won't start with under 24 KB of internal RAM free.
-3. If the credentials expire within ten minutes, Kata fetches new ones from the IoT credentials provider. That's mTLS with the board's certificate and the role alias `kata-{env}`, about once an hour, and the connection is closed straight after.
-4. Kata opens one HTTPS session to `sqs.eu-west-2` and keeps it alive across the phase's requests (`worker/sqs.c`: SQS's JSON protocol, signed with SigV4, `worker/sigv4.c`).
-5. **Hand-off.** Kata sends the finished results with `SendMessageBatch`. A batch holds at most 10 messages and 256 KiB **in total**, so a big result (one carrying a `too-long` body) goes alone. Then it deletes, with `DeleteMessageBatch`, only the ingest jobs SQS accepted. A result SQS refused stays in the pool. Its job stays hidden (visibility extended), and no new pass starts until it's through.
-6. **Top-up.** `ReceiveMessage` (visibility 900 s; a 20 s long poll only when the pool is empty) runs while the pool holds fewer than 150 tokens and fits its PSRAM budget. Each job is sorted as it arrives:
+1. A phase won't start with under 24 KB of internal RAM free.
+2. If the credentials expire within ten minutes, Kata fetches new ones from the IoT credentials provider. That's mTLS with the board's certificate and the role alias `kata-{env}`, about once an hour, and the connection is closed straight after.
+3. Kata opens one HTTPS session to `sqs.eu-west-2` and keeps it alive across the phase's requests (`worker/sqs.c`: SQS's JSON protocol, signed with SigV4, `worker/sigv4.c`).
+4. **Hand-off.** Kata sends the finished results with `SendMessageBatch`. A batch holds at most 10 messages and 256 KiB **in total**, so a big result (one carrying a `too-long` body) goes alone. Then it deletes, with `DeleteMessageBatch`, only the ingest jobs SQS accepted. A result SQS refused stays in the pool. Its job stays hidden (visibility extended), and no new pass starts until it's through.
+5. **Top-up.** `ReceiveMessage` (visibility 900 s; a 20 s long poll only when the pool is empty) runs while the pool holds fewer than 150 tokens and fits its PSRAM budget. Each job is sorted as it arrives:
 
 | The job | What Kata does |
 |---|---|
@@ -254,9 +257,10 @@ The state machine is portable C in `worker/` (`worker.c`), tested on the Mac aga
 | anything else | decrypted (age, `worker/age.c`), made canonical, tokenised, pooled |
 | not an envelope Cal could read | left alone: no result could carry it, so it reaches the ingest DLQ |
 
-7. Kata extends the visibility of any pooled job that could come back before the next phase, closes the session, and brings MQTT back.
+6. Kata extends the visibility of any pooled job that could come back before the next phase, and reads Fleet's commands from its commands queue (CHATS-13). Then it closes the session.
+7. It publishes the outbox (responses, then the latest heartbeat) over HTTPS to IoT Core, on a session of its own, closed straight after. With nothing to publish, there's no session.
 
-When the queue is empty, a cycle is a 20 s long poll followed by 40 s of MQTT. However busy the queue, MQTT gets at least 15 s between phases, so commands and updates get through even while a sick board forwards a backlog with no passes.
+When the queue is empty, a cycle is a 20 s long poll and at least 15 s between phases. However busy the queue, phases are at least 15 s apart: each costs a TLS handshake or two.
 
 **Strict JSON.** Kata reads an envelope, and the job inside it, at least as strictly as Cal's serde will:
 - nothing but whitespace after the value, and no duplicate keys
@@ -298,7 +302,9 @@ Otherwise a result would land in the results DLQ after its ingest job was delete
 | `worker` | `state` (`idle`, `receiving`, `embedding`, `handing-off`, `checking`, `sick`, `parked`), `sick`, `embedder`, `pool`, `passes` and `messages` (`boot`, `today`), `unembedded` (by reason), `bad_passes`, `last_pass` (`n_seg`, `tokens`, `ms`, `card_wait_ms`, `at`), `last_handoff_at`, `last_error` |
 | `internal_lowest`, `temp_c`, `vcore_mv` | internal RAM's low point since boot, the chip's temperature, the core voltage applied |
 
-**Memory, expected** (to be measured on a board; the heartbeat and the phase's `net_heap` lines report it):
+**Memory, measured (CHATS-13, 14 Oct 2026).** `heapwatch.c` keeps a low point per stage (`heap_low` in the heartbeat: `creds`, `sqs`, `iotpub`, `pass`, `idle`). With MQTT (Green, prod, 0.1.10, 2.8 h): lowest 9.4 KB, in the SQS phase and MQTT's handshake, and the largest free block shrinking from 18 KB to 10 KB. Without (Red, sandbox, the CHATS-13 spike): lowest 13.8 KB, in the HTTPS publish, and the largest block 21.5 KB throughout. Every TLS handshake still takes about 20 KB of internal RAM for a moment, although mbedTLS is in PSRAM. Internal RAM is three heaps (`heapwatch_map`, the spike): the main DRAM heap (~288 KB, the model's buffers, Wi-Fi and the rest packed in, ~11 KB free at its end), a ~21.5 KB region the boot stage hands back, and 8 KB of RTC fast memory. So no block is ever bigger than ~21.5 KB.
+
+**Memory, expected before CHATS-5's bring-up** (kept for the reasoning):
 - Static internal RAM is DIRAM 105.8 KB, up 1.2 KB on the Fleet build.
 - During an SQS phase MQTT is down, which frees its task stack (6 KB) and its TLS session. The phase adds the HTTP client's 2 KB receive and 3 KB transmit buffers and a socket; mbedTLS is in PSRAM.
 - So the low point should sit near the Fleet build's figure with MQTT up (~34 KB), and no lower than the spike's 32.7 KB. That's 8 KB or more above the 24 KB floor the worker checks.
