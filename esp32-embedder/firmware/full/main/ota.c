@@ -433,6 +433,29 @@ static void ota_task(void *arg)
 
 // ---- commands (from the worker's SQS phases: kata_worker.c, CHATS-13) -----------------------
 
+// CHATS-13: the update's task (8 KB of internal stack) starts only once the worker has parked, so
+// the worker's last phase (its hand-off, and the publish after it) never runs beside it: together
+// they took internal RAM down to 7.1 KB (14 Oct). Started by kata_worker.c's loop (ota_spawn_due),
+// or at once when there's no worker.
+static volatile bool spawn_pending;
+static int64_t spawn_asked_ms;
+
+static void spawn(void)
+{
+    spawn_pending = false;
+    if (xTaskCreate(ota_task, "ota", TASK_STACK, NULL, 4, NULL) != pdPASS) {
+        finish();
+        kata_worker_resume();
+        respond_error("ota_error", "out of memory", job_version);
+    }
+}
+
+void ota_spawn_due(bool worker_parked)
+{
+    // The task's own wait (kata_worker_park) then fails it as busy if the worker never parked.
+    if (spawn_pending && (worker_parked || now_ms() - spawn_asked_ms > (int64_t)OTA_MODEL_WAIT_S * 1000)) spawn();
+}
+
 static void start_update(const ota_cmd *cmd)
 {
     // CHATS-13: in PSRAM. In internal RAM this copy (~4 KB) could split the block the update
@@ -475,10 +498,9 @@ static void start_update(const ota_cmd *cmd)
     job_url = url;
     snprintf(job_version, sizeof job_version, "%s", cmd->version);
     memcpy(job_sha256, cmd->sha256, sizeof job_sha256);
-    if (xTaskCreate(ota_task, "ota", TASK_STACK, NULL, 4, NULL) != pdPASS) {
-        finish();
-        respond_error("ota_error", "out of memory", cmd->version);
-    }
+    spawn_pending = true;
+    spawn_asked_ms = now_ms();
+    if (!kata_worker_request_park()) spawn();   // no worker to wait for
 }
 
 static void cancel_update(void)

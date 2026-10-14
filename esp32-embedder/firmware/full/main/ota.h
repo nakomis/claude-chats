@@ -53,3 +53,6 @@ void ota_health(bool healthy);
 void ota_on_connected(void);
 // From kata_worker.c (a phase, CHATS-13): one command from Fleet, off the board's SQS queue.
 void ota_handle_command(const char *data, size_t len);
+// CHATS-13: from the worker's loop: starts a requested update's task once the worker has parked (or
+// has taken too long to).
+void ota_spawn_due(bool worker_parked);

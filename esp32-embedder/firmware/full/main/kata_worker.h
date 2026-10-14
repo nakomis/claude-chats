@@ -34,5 +34,7 @@ void kata_worker_run(const prov_t *prov, bool online, bool healthy);
 // For an update (ota.c): hands off what's finished, releases what isn't, and stops taking jobs.
 // True once parked (or if there's no worker), false if that took longer than timeout_ms.
 bool kata_worker_park(int timeout_ms);
+// For an update (ota.c): asks the worker to park without waiting. False if there's no worker.
+bool kata_worker_request_park(void);
 // The update failed: back to work.
 void kata_worker_resume(void);

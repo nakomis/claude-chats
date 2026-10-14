@@ -517,6 +517,7 @@ void kata_worker_run(const prov_t *p, bool online, bool healthy)
         }
         last_tick_us = esp_timer_get_time();
         int wait = worker_step(&w);
+        ota_spawn_due(worker_is_parked(&w));  // an update's task starts once nothing else is on the network
         fleet_status_now();                   // after a pass: published at the end of the next phase
         // An update asking the worker to park cuts the wait short
         for (int s = 0; s < wait && !(w.park_requested && !w.parked); s++) {
@@ -524,6 +525,13 @@ void kata_worker_run(const prov_t *p, bool online, bool healthy)
             last_tick_us = esp_timer_get_time();
         }
     }
+}
+
+bool kata_worker_request_park(void)
+{
+    if (!running) return false;
+    worker_request_park(&w);
+    return true;
 }
 
 bool kata_worker_park(int timeout_ms)
