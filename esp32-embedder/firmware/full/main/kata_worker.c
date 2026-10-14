@@ -62,6 +62,30 @@ static char commands_url[200];          // <thing>-commands, beside the ingest q
 static SemaphoreHandle_t net_mx;        // one TLS session at a time: the worker's phases, ota.c's publish
 static size_t phase_big;                // the largest request or response of this phase
 
+// Why the chip last started (esp_reset_reason), for the heartbeat and the boot log: so a restart
+// nobody saw explains itself (CHATS-13).
+const char *reset_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt-watchdog";
+    case ESP_RST_TASK_WDT: return "task-watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    case ESP_RST_USB: return "usb";
+    case ESP_RST_JTAG: return "jtag";
+    case ESP_RST_EFUSE: return "efuse";
+    case ESP_RST_PWR_GLITCH: return "power-glitch";
+    case ESP_RST_CPU_LOCKUP: return "cpu-lockup";
+    case ESP_RST_EXT: return "external";
+    default: return "unknown";
+    }
+}
+
 // ---- the heartbeat's fields (fleet.h; the esp_timer task) ----------------------------------------
 static void status_extra(jbuf_t *b)
 {
@@ -72,6 +96,7 @@ static void status_extra(jbuf_t *b)
     uint32_t last = 0, med = 0;
     if (running) worker_card_wait(&w, &last, &med);
     if (have_t) jb_printf(b, ",\"temp_c\":%.1f", t);
+    jb_printf(b, ",\"reset\":\"%s\"", reset_name(esp_reset_reason()));
     jb_printf(b, ",\"vcore_mv\":%d,\"card\":{\"wait_last_s\":%.1f,\"wait_median_s\":%.1f,\"crc_mismatches\":%d,\"read_retries\":%d}",
               vcore, last / 1e3, med / 1e3, crc, retries);
     if (running) {
@@ -197,27 +222,47 @@ static int net_begin(void *ctx, char *why, size_t n)
 
 // ---- CHATS-13: Fleet without MQTT -------------------------------------------------------------
 
-// Fleet's commands, which the IoT rule puts on this board's queue: read on the phase's SQS session
-// and handed to ota.c, which answers through the outbox. Deleted once handled: a command is acted on
-// once (an update's own checks catch a repeat anyway).
+// Fleet's commands, which the IoT rule puts on this board's queue: taken (received and deleted) on
+// the phase's SQS session, but acted on only after the session has closed and the outbox has gone
+// (run_commands). An update starts a task with an 8 KB internal stack, and a TLS session beside a
+// new one took internal RAM down to 5.4 KB (14 Oct). A command is acted on once.
+#define MAX_COMMANDS 10
+static char *pending[MAX_COMMANDS];
+static size_t pending_len[MAX_COMMANDS];
+static int n_pending;
+
 static void take_commands(void)
 {
     sqs_msg_t *msgs = NULL;
     int n = 0;
-    if (sqs_receive(&sqs, commands_url, 10, 0, 60, &msgs, &n)) {
+    if (sqs_receive(&sqs, commands_url, MAX_COMMANDS - n_pending, 0, 60, &msgs, &n)) {
         printf("fleet: commands: %s\n", sqs.last_error);
         return;
     }
-    const char *receipts[10];
+    const char *receipts[MAX_COMMANDS];
     for (int i = 0; i < n; i++) {
-        printf("fleet: command (%u bytes)\n", (unsigned)msgs[i].body_len);
-        ota_handle_command(msgs[i].body, msgs[i].body_len);
         receipts[i] = msgs[i].receipt;
+        pending_len[n_pending] = msgs[i].body_len;
+        pending[n_pending++] = msgs[i].body;     // ours now (PSRAM)
+        msgs[i].body = NULL;
     }
-    bool ok[10];
+    bool ok[MAX_COMMANDS];
     if (n && sqs_delete_batch(&sqs, commands_url, receipts, n, ok)) printf("fleet: commands: %s\n", sqs.last_error);
     for (int i = 0; i < n; i++) sqs_msg_free(&msgs[i]);
     kw_free(msgs);
+}
+
+// No session open: hand each command to ota.c. True if any came.
+static bool run_commands(void)
+{
+    if (!n_pending) return false;
+    for (int i = 0; i < n_pending; i++) {
+        printf("fleet: command (%u bytes)\n", (unsigned)pending_len[i]);
+        ota_handle_command(pending[i], pending_len[i]);
+        kw_free(pending[i]);
+    }
+    n_pending = 0;
+    return true;
 }
 
 // One HTTPS publish (SigV4, service iotdata) on the keep-alive session *hc: the HTTP status, or -1.
@@ -315,6 +360,9 @@ static void net_end(void *ctx)
         sqs_http = NULL;
     }
     publish_outbox();
+    // Commands last, with no session open; what they answer goes out now. (An update's task then
+    // waits for the worker to park, in its next step.)
+    if (run_commands()) publish_outbox();
     // The first few phases, any that moved a big body (the bring-up check: a ~40 KB inline job), then
     // about hourly. The low point is the one to watch.
     static int phases;

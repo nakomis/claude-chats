@@ -8,7 +8,11 @@
 
 #include <stdbool.h>
 
+#include "esp_system.h"
 #include "prov.h"
+
+// esp_reset_reason as a word ("power-on", "software", "brownout", "task-watchdog"…).
+const char *reset_name(esp_reset_reason_t r);
 
 // Before Fleet starts: the temperature sensor, and the worker's fields in the heartbeat.
 void kata_worker_status_init(int vcore_mv);

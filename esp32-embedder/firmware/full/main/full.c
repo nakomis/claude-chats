@@ -732,6 +732,7 @@ void app_main(void)
         e = nvs_flash_init();
     }
     if (e != ESP_OK) printf("nvs: %s (an update can't report its outcome)\n", esp_err_to_name(e));
+    printf("reset reason: %s\n", reset_name(esp_reset_reason()));   // CHATS-13: also in the heartbeat
     bool probation = ota_boot();
     model_mx = xSemaphoreCreateMutex();
 
