@@ -128,18 +128,31 @@ jobs:
           project: kata
           environment: sandbox
           version-file: version.json
-      # A version already in the bucket (published by hand, or a run that failed before recording
-      # it) is never reused: step past it.
+      # A new version must be above every one already published, not just unused: a board takes only
+      # a newer version, and Fleet offers the highest. If the tracker can't be read, compute-version
+      # falls back to version.txt, and on 14 Oct that gave 0.1.2 while 0.1.12 was published (prod
+      # got 0.1.2, below the 0.1.10 it replaced). Every prod build is a sandbox build first, so the
+      # sandbox bucket holds the highest. If it can't be listed, at least an unused version.
       - name: Skip versions already published
         id: free
         env:
           VERSION: ${{ steps.compute.outputs.version }}
         run: |
           v=$VERSION
+          if listed=$(aws s3api list-objects-v2 --bucket nakomis-firmware-sandbox --prefix kata/ --delimiter / \
+                         --query 'CommonPrefixes[].Prefix' --output text); then
+            top=$(tr '\t' '\n' <<< "$listed" | sed -n 's#^kata/\([0-9]*\.[0-9]*\.[0-9]*\)/$#\1#p' | sort -V | tail -1)
+            if [ -n "$top" ] && [ "$(printf '%s\n%s\n' "$v" "$top" | sort -V | tail -1)" = "$top" ]; then
+              IFS=. read -r a b c <<< "$top"; v="$a.$b.$((c + 1))"
+              echo "::notice::$VERSION is not above $top, the highest published; using $v"
+            fi
+          else
+            echo "::warning::couldn't list the published versions; only stepping past exact matches"
+          fi
           while aws s3api head-object --bucket nakomis-firmware-sandbox --key "kata/$v/firmware.bin" > /dev/null 2>&1; do
             IFS=. read -r a b c <<< "$v"; v="$a.$b.$((c + 1))"
           done
-          [ "$v" = "$VERSION" ] || echo "::notice::$VERSION is already published; using $v"
+          [ "$v" = "$VERSION" ] || echo "::notice::$VERSION is already published or too low; using $v"
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
   # Every change is built and checked; only a PR's build with a computed version is published.
