@@ -1,0 +1,78 @@
+{
+  "corpus": 71350,
+  "n_probes": 4000,
+  "mxbai-q8 (live)": {
+    "dims": 1024,
+    "recall@10": 0.4271,
+    "intra_sim": 0.5945,
+    "inter_sim": 0.5106,
+    "separation": 1.1645
+  },
+  "titan-v2-256": {
+    "dims": 256,
+    "recall@10": 0.4358,
+    "intra_sim": 0.3474,
+    "inter_sim": 0.225,
+    "separation": 1.544
+  },
+  "titan-v2-1024": {
+    "dims": 1024,
+    "recall@10": 0.4576,
+    "intra_sim": 0.2477,
+    "inter_sim": 0.1108,
+    "separation": 2.236
+  },
+  "paired_diff_95ci": {
+    "titan-v2-1024 - titan-v2-256": [
+      0.0217,
+      0.0033
+    ],
+    "titan-v2-1024 - mxbai-q8 (live)": [
+      0.0305,
+      0.0064
+    ],
+    "titan-v2-256 - mxbai-q8 (live)": [
+      0.0088,
+      0.0063
+    ]
+  },
+  "top10_overlap_256_vs_1024": 0.7032,
+  "by_group": {
+    "author=claude": {
+      "n": 353,
+      "mxbai-q8 (live)": 0.365,
+      "titan-v2-256": 0.415,
+      "titan-v2-1024": 0.442
+    },
+    "author=martin": {
+      "n": 176,
+      "mxbai-q8 (live)": 0.359,
+      "titan-v2-256": 0.378,
+      "titan-v2-1024": 0.406
+    },
+    "author=tool": {
+      "n": 622,
+      "mxbai-q8 (live)": 0.332,
+      "titan-v2-256": 0.343,
+      "titan-v2-1024": 0.361
+    },
+    "author=unknown": {
+      "n": 2849,
+      "mxbai-q8 (live)": 0.46,
+      "titan-v2-256": 0.462,
+      "titan-v2-1024": 0.484
+    },
+    "len<=800": {
+      "n": 3115,
+      "mxbai-q8 (live)": 0.419,
+      "titan-v2-256": 0.419,
+      "titan-v2-1024": 0.443
+    },
+    "len>800": {
+      "n": 885,
+      "mxbai-q8 (live)": 0.454,
+      "titan-v2-256": 0.494,
+      "titan-v2-1024": 0.508
+    }
+  }
+}
