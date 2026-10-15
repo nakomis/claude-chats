@@ -7,8 +7,10 @@ have been recorded by the Stop hook.
 Embedding provider is configured via CLAUDE_CHATS_PROVIDER — see embed.py.
 """
 
+import calendar
 import os
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -19,6 +21,33 @@ from conversation_memory_mcp.embed import get_embedding
 DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
 
 CONTEXT_WINDOW = 2  # messages either side of a search hit
+
+# How far back search_memory looks when the caller says nothing (CHATS-14).
+# The corpus grows without bound and recent conversations are what sessions
+# almost always want; a caller after older material asks for it explicitly.
+DEFAULT_SINCE = "3 months"
+
+# pgvector's iterative index scans (0.8+). Not optional once `since` exists:
+# with ivfflat the ANN scan chooses candidates by distance and the created_at
+# predicate is applied *afterwards*, so a date window silently throws away most
+# of the k results — ask for 10, get 2, or none at all, with no error. An
+# iterative scan keeps pulling candidates until the filter is satisfied.
+# Measured on Luke (118,283 messages, 65,401 inside 3 months), limit=10:
+# unfiltered 10 rows; 3-month filter with iterative_scan=off 0 rows; same
+# filter with relaxed_order 10 rows.
+#
+# "relaxed_order" is the only iterative mode ivfflat offers — strict_order is
+# HNSW-only, and ivfflat rejects it (at query time, with a WARNING, having
+# accepted the SET). Relaxed ordering is right for this search anyway: the
+# results are fused by RRF and re-ranked, so a slightly out-of-order candidate
+# stream costs nothing.
+ITERATIVE_SCAN = "relaxed_order"
+
+# ivfflat.probes is deliberately left at pgvector's default of 1. Raising it
+# looks like it ought to help recall, and measured on Luke it costs far more
+# than it buys: probes=5 took 8.5 s and 23.5 s on two query vectors where
+# probes=1 took 2.4 s and 0.16 s, for the same five rows. The iterative scan is
+# what makes the window correct; probes is not the lever (CHATS-14).
 
 # Postgres stores timestamptz in UTC (correct — leave it). This is purely how
 # the MCP *presents* it: a bare UTC clock time (21:37) invites a reader whose
@@ -83,6 +112,145 @@ def _utc_iso(ts: datetime) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The `since` window (CHATS-14)
+# ---------------------------------------------------------------------------
+
+# "all" and friends mean no lower bound at all — search the whole corpus.
+_UNBOUNDED = {"", "all", "any", "ever", "none", "null", "forever", "unlimited",
+              "no limit", "nolimit", "beginning", "start"}
+
+_UNITS = {
+    "s": "seconds", "sec": "seconds", "secs": "seconds",
+    "second": "seconds", "seconds": "seconds",
+    "min": "minutes", "mins": "minutes", "minute": "minutes", "minutes": "minutes",
+    "h": "hours", "hr": "hours", "hrs": "hours", "hour": "hours", "hours": "hours",
+    "d": "days", "day": "days", "days": "days",
+    "w": "weeks", "wk": "weeks", "wks": "weeks", "week": "weeks", "weeks": "weeks",
+    "mo": "months", "mon": "months", "mons": "months",
+    "month": "months", "months": "months",
+    "y": "years", "yr": "years", "yrs": "years", "year": "years", "years": "years",
+}
+
+# "3 months", "30d", "last 2 weeks", "6 hours ago", "1 year"
+_PERIOD = re.compile(
+    r"^(?:last|past|previous)?\s*(\d+(?:\.\d+)?)\s*([a-z]+)\s*(?:ago)?$"
+)
+
+
+def _minus_months(ts: datetime, months: int) -> datetime:
+    """Calendar-correct month subtraction, clamping the day (31 Mar - 1 month
+    is 28/29 Feb, not an invalid date)."""
+    total = ts.year * 12 + (ts.month - 1) - months
+    year, month = divmod(total, 12)
+    month += 1
+    return ts.replace(year=year, month=month,
+                      day=min(ts.day, calendar.monthrange(year, month)[1]))
+
+
+def parse_since(value: str | None, now: datetime | None = None) -> tuple[datetime | None, str]:
+    """Resolve the `since` argument to (cutoff, label).
+
+    A cutoff of None means no lower bound — the full history.
+
+    Accepts a relative period ("3 months", "30d", "last 2 weeks"), an ISO date
+    or timestamp ("2026-01-15", "2026-01-15T09:30:00Z"), or one of "all" /
+    "none" / "ever" for no limit. None (argument omitted) means the default
+    window, DEFAULT_SINCE.
+
+    A bare "m" is rejected deliberately: it reads as minutes to half the world
+    and months to the other half, and the two differ by a factor of 43,800.
+    Say "min" or "mo".
+
+    Raises ValueError, with the accepted forms in the message, on anything else.
+    """
+    now = now or datetime.now(timezone.utc)
+    raw = DEFAULT_SINCE if value is None else str(value)
+    text = raw.strip().lower()
+
+    if text in _UNBOUNDED:
+        return None, "no limit (full history)"
+
+    m = _PERIOD.match(text)
+    if m:
+        qty_text, unit_text = m.group(1), m.group(2)
+        if unit_text == "m":
+            raise ValueError(
+                "since='...m' is ambiguous — 'min' for minutes, 'mo' for months."
+            )
+        unit = _UNITS.get(unit_text)
+        if unit:
+            qty = float(qty_text)
+            if unit in ("months", "years"):
+                if qty != int(qty):
+                    raise ValueError(
+                        f"since={raw!r}: whole {unit} only — use days or weeks "
+                        "for a finer window."
+                    )
+                months = int(qty) * (12 if unit == "years" else 1)
+                cutoff = _minus_months(now, months)
+            else:
+                cutoff = now - timedelta(**{unit: qty})
+            return cutoff, raw.strip()
+
+    # An absolute date or timestamp. Naive values are read in the operator's
+    # local zone — someone typing "2026-01-15" means their own midnight.
+    try:
+        ts = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            f"since={raw!r} not understood. Use a period (\"3 months\", \"30d\", "
+            "\"last 2 weeks\"), an ISO date (\"2026-01-15\") or timestamp, or "
+            "\"all\" for the full history."
+        ) from None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=LOCAL_TZ)
+    return ts, ts.isoformat()
+
+
+def _enable_iterative_scan(cur) -> str | None:
+    """Turn pgvector's iterative index scans on for this session and return the
+    value genuinely in effect, or None if it could not be enabled.
+
+    The order of these statements is the whole point. Postgres treats a dotted
+    GUC whose module has not yet been loaded as a free-text placeholder, so in a
+    fresh session `SET ivfflat.iterative_scan = banana` *succeeds* and SHOW
+    cheerfully echoes "banana" while the scan runs with the setting ignored —
+    set and forgotten, no symptom. Touching the vector type first loads
+    pgvector's own GUC definitions; after that an invalid value is rejected at
+    SET time and the read-back is authoritative. Both verified against Luke's
+    pgvector 0.8.5 (CHATS-14).
+    """
+    try:
+        # Loads pgvector's GUCs. Dimensions are irrelevant — any vector
+        # operator will do.
+        cur.execute("SELECT '[1,0]'::vector <=> '[0,1]'::vector")
+        # A GUC name cannot be parameterised; the value is a module constant,
+        # never caller input.
+        cur.execute(f"SET ivfflat.iterative_scan = {ITERATIVE_SCAN}")
+        cur.execute("SHOW ivfflat.iterative_scan")
+        return cur.fetchone()[0]
+    except psycopg.Error:
+        # A rejected value or an unknown GUC aborts the transaction; wind it
+        # back so the search itself can still run (unfiltered it is unaffected).
+        cur.connection.rollback()
+        return None
+
+
+def _filters(project_path: str | None, since: datetime | None) -> tuple[str, list]:
+    """The WHERE additions shared by all three search paths, as a SQL fragment
+    plus its parameters in order. One place, so the semantic and full-text
+    halves of a hybrid search cannot drift apart."""
+    frag, params = "", []
+    if project_path:
+        frag += "\n        AND c.project_path = %s"
+        params.append(project_path)
+    if since is not None:
+        frag += "\n        AND m.created_at >= %s"
+        params.append(since)
+    return frag, params
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -92,16 +260,23 @@ def search_memory(
     limit: int = 5,
     project_path: str | None = None,
     mode: str = "hybrid",
+    since: str | None = DEFAULT_SINCE,
 ) -> dict:
     """Search previous Claude Code conversations.
 
     Returns the most relevant messages plus surrounding context.  Useful for
     recovering context lost to compaction, or finding how a problem was solved.
 
+    By default only the last 3 months are searched — see `since`, which is the
+    "from this date onwards" bound.  Widen it with since="all" when the answer
+    may be older, or when a search comes back empty.
+
     Return value shape:
         {
-          "status":   "ok" | "fallback" | "no_results",
+          "status":   "ok" | "fallback" | "no_results" | "error",
           "mode_used": "hybrid" | "semantic" | "fulltext",
+          "since":    "3 months",            # the window actually applied
+          "since_utc": "2026-07-15T…+00:00", # its cutoff, null for no limit
           "warning":  "<string>",   # only present when status != "ok"
           "results":  [...]
         }
@@ -152,6 +327,8 @@ def search_memory(
         from that conversation (e.g. a specific error message, command, or
         sentence).  Hybrid's semantic half fails when the query framing differs
         from the actual wording; fulltext hits exact phrases regardless.
+        If that still misses, the material may simply be older than the default
+        3-month window — retry with since="all".
 
     Args:
         query:        Search string.  For "fulltext"/"hybrid", supports websearch
@@ -160,11 +337,30 @@ def search_memory(
         limit:        Number of results to return (default 5).
         project_path: If supplied, restrict results to that project directory.
         mode:         Search mode: "hybrid" (default), "semantic", or "fulltext".
+        since:        How far back to search — the earliest date to search from.
+                      Default "3 months".  Accepts a relative period
+                      ("3 months", "30d", "6 weeks", "1 year"), an ISO date or
+                      timestamp ("2026-01-15"), or "all" for the full history.
+                      Use "all" when the conversation may be older, or when a
+                      search inside the default window comes back empty.
+                      ("m" is rejected as ambiguous: say "min" or "mo".)
     """
-    project_filter = "AND c.project_path = %s" if project_path else ""
+    try:
+        cutoff, since_label = parse_since(since)
+    except ValueError as exc:
+        return {
+            "status": "error",
+            "mode_used": "none",
+            "since": str(since),
+            "since_utc": None,
+            "warning": str(exc),
+            "results": [],
+        }
+
+    where, where_params = _filters(project_path, cutoff)
     candidates = limit * 10
 
-    warning: str | None = None
+    warnings: list[str] = []
     mode_used = mode
     vec: str | None = None
 
@@ -174,23 +370,35 @@ def search_memory(
         except Exception:
             if mode == "hybrid":
                 mode_used = "fulltext"
-                warning = "Embedding service unavailable; fell back to full-text search."
+                warnings.append("Embedding service unavailable; fell back to full-text search.")
             else:
                 return {
                     "status": "fallback",
                     "mode_used": "none",
+                    "since": since_label,
+                    "since_utc": _utc_iso(cutoff) if cutoff else None,
                     "warning": "Embedding service unavailable and mode='semantic' — no results.",
                     "results": [],
                 }
 
     with _conn() as conn:
         with conn.cursor() as cur:
+            if mode_used in ("semantic", "hybrid"):
+                scan = _enable_iterative_scan(cur)
+                if cutoff is not None and scan != ITERATIVE_SCAN:
+                    warnings.append(
+                        "pgvector iterative index scans are unavailable "
+                        f"(ivfflat.iterative_scan = {scan!r}); with a `since` window the "
+                        "vector half of this search can return fewer results than asked "
+                        "for. Use since='all', or mode='fulltext'."
+                    )
+
             if mode_used == "semantic":
-                rows = _query_semantic(cur, vec, project_path, project_filter, limit)
+                rows = _query_semantic(cur, vec, where, where_params, limit)
             elif mode_used == "fulltext":
-                rows = _query_fulltext(cur, query, project_path, project_filter, limit)
+                rows = _query_fulltext(cur, query, where, where_params, limit)
             else:
-                rows = _query_hybrid(cur, vec, query, project_path, project_filter,
+                rows = _query_hybrid(cur, vec, query, where, where_params,
                                      limit, candidates)
 
             results = []
@@ -229,34 +437,46 @@ def search_memory(
                     "context":      context,
                 })
 
+    status = "ok"
+    if not results:
+        status = "no_results"
+        if cutoff is not None:
+            warnings.append(
+                f"Nothing found in the search window (since={since_label!r}, i.e. "
+                f"{_human_time(cutoff)} onwards). Retry with since='all' to search "
+                "the full history."
+            )
+    elif warnings:
+        status = "fallback"
+
     out: dict = {
-        "status": "ok" if not warning else "fallback",
+        "status": status,
         "mode_used": mode_used,
+        "since": since_label,
+        "since_utc": _utc_iso(cutoff) if cutoff else None,
         "results": results,
     }
-    if warning:
-        out["warning"] = warning
+    if warnings:
+        out["warning"] = " ".join(warnings)
     return out
 
 
-def _query_semantic(cur, vec: str, project_path, project_filter: str, limit: int):
+def _query_semantic(cur, vec: str, where: str, where_params: list, limit: int):
     sql = f"""
         SELECT m.id, m.conversation_id, c.session_id, c.project_path,
                c.name, c.ai_title, m.role, m.content, m.sequence_num, m.created_at,
                1 - (m.embedding <=> %s::vector) AS score
         FROM   messages m
         JOIN   conversations c ON c.id = m.conversation_id
-        WHERE  m.embedding IS NOT NULL
-        {project_filter}
+        WHERE  m.embedding IS NOT NULL{where}
         ORDER  BY m.embedding <=> %s::vector
         LIMIT  %s
     """
-    params = [vec, *(([project_path]) if project_path else []), vec, limit]
-    cur.execute(sql, params)
+    cur.execute(sql, [vec, *where_params, vec, limit])
     return cur.fetchall()
 
 
-def _query_fulltext(cur, query: str, project_path, project_filter: str, limit: int):
+def _query_fulltext(cur, query: str, where: str, where_params: list, limit: int):
     sql = f"""
         SELECT m.id, m.conversation_id, c.session_id, c.project_path,
                c.name, c.ai_title, m.role, m.content, m.sequence_num, m.created_at,
@@ -264,17 +484,15 @@ def _query_fulltext(cur, query: str, project_path, project_filter: str, limit: i
         FROM   messages m
         JOIN   conversations c ON c.id = m.conversation_id,
                websearch_to_tsquery('english', %s) AS q
-        WHERE  m.content_tsv @@ q
-        {project_filter}
+        WHERE  m.content_tsv @@ q{where}
         ORDER  BY score DESC
         LIMIT  %s
     """
-    params = [query, *(([project_path]) if project_path else []), limit]
-    cur.execute(sql, params)
+    cur.execute(sql, [query, *where_params, limit])
     return cur.fetchall()
 
 
-def _query_hybrid(cur, vec: str, query: str, project_path, project_filter: str,
+def _query_hybrid(cur, vec: str, query: str, where: str, where_params: list,
                   limit: int, candidates: int):
     sql = f"""
         WITH semantic AS (
@@ -282,8 +500,7 @@ def _query_hybrid(cur, vec: str, query: str, project_path, project_filter: str,
                    ROW_NUMBER() OVER (ORDER BY m.embedding <=> %s::vector) AS rank
             FROM   messages m
             JOIN   conversations c ON c.id = m.conversation_id
-            WHERE  m.embedding IS NOT NULL
-            {project_filter}
+            WHERE  m.embedding IS NOT NULL{where}
             ORDER  BY m.embedding <=> %s::vector
             LIMIT  %s
         ),
@@ -293,8 +510,7 @@ def _query_hybrid(cur, vec: str, query: str, project_path, project_filter: str,
             FROM   messages m
             JOIN   conversations c ON c.id = m.conversation_id,
                    websearch_to_tsquery('english', %s) AS q
-            WHERE  m.content_tsv @@ q
-            {project_filter}
+            WHERE  m.content_tsv @@ q{where}
             ORDER  BY ts_rank_cd(m.content_tsv, q) DESC
             LIMIT  %s
         ),
@@ -313,8 +529,8 @@ def _query_hybrid(cur, vec: str, query: str, project_path, project_filter: str,
         ORDER  BY r.score DESC
         LIMIT  %s
     """
-    proj = ([project_path] if project_path else [])
-    params = [vec, *proj, vec, candidates, query, *proj, candidates, limit]
+    params = [vec, *where_params, vec, candidates,
+              query, *where_params, candidates, limit]
     cur.execute(sql, params)
     return cur.fetchall()
 
