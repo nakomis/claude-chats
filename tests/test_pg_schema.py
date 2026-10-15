@@ -30,7 +30,7 @@ SCHEMA_FILE = os.path.join(
 # Must equal EXPECTED in home-infra's scripts/check-convmem-pg-schema.sh. Same
 # algorithm (sha256), same normalisation, so it is the same value by
 # construction.
-SCHEMA_SHA256 = "670498e2ff02f8d0fcaae1d30a5597077a7fccc635a9e43134afd4344b11afc5"
+SCHEMA_SHA256 = "2d72c33d05165ec443215d40d233baad572435b8b58d5439040c92dd1d8cbfbc"
 
 
 def _normalise_sql(s: str) -> str:
