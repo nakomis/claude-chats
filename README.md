@@ -124,9 +124,37 @@ Once installed, three tools are available inside Claude Code:
 
 | Tool | Description |
 |---|---|
-| `search_memory` | Hybrid semantic + full-text search across all recorded messages, fused with Reciprocal Rank Fusion. Returns the most relevant excerpts with surrounding context. Also accepts `mode` (`hybrid` / `semantic` / `fulltext`). |
+| `search_memory` | Hybrid semantic + full-text search across all recorded messages, fused with Reciprocal Rank Fusion. Returns the most relevant excerpts with surrounding context. Also accepts `mode` (`hybrid` / `semantic` / `fulltext`) and `since` (how far back to look — default the last 3 months; see below). |
 | `get_conversation` | Fetch the full transcript for a session by ID. Supports pagination via `start_seq` / `end_seq`. |
 | `list_recent_sessions` | List recent sessions, newest first. Optionally filter by project path. |
+
+### The `since` window
+
+`search_memory` searches the **last 3 months** by default. The corpus grows
+without bound and a session almost always wants recent material; anything older
+is asked for explicitly. `since` accepts a relative period (`3 months`, `30d`,
+`last 2 weeks`, `1 year`), an ISO date or timestamp (`2026-01-15`), or `all`
+for the full history. The window that was applied comes back in the result, and
+an empty result inside a window says so, with the suggestion to widen it.
+
+A date filter is not free on the vector half of the search. `messages_embedding_idx`
+is `ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`: the approximate
+scan picks candidates by distance and the `created_at` predicate is applied
+**afterwards**, so a window can discard most of the *k* results — you ask for 10
+and get 2, or none, with no error and no warning. pgvector 0.8's iterative index
+scans keep pulling candidates until the filter is satisfied, so the search
+session sets `ivfflat.iterative_scan = relaxed_order` and reads the value back
+before trusting it. Measured on Luke (118,283 messages, 65,401 of them inside
+3 months), `limit=10`:
+
+| | rows returned |
+|---|---|
+| no date filter, `iterative_scan = off` | 10 |
+| 3-month window, `iterative_scan = off` | **0** |
+| 3-month window, `iterative_scan = relaxed_order` | 10 |
+
+The full-text half has no such problem: against the `content_tsv` GIN index the
+date bound is an ordinary predicate.
 
 ## Database
 
