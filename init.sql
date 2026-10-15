@@ -127,6 +127,26 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
     GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
 CREATE INDEX IF NOT EXISTS messages_content_tsv_idx ON messages USING GIN (content_tsv);
 
+-- Range scans on created_at, for the windowed backup (HOME-458/HOME-464): the
+-- nightly dump COPYs everything from a cutoff, and the archiver exports one
+-- calendar month at a time. Both were full sequential scans of the whole table.
+--
+-- BRIN rather than btree, because the heap is ALREADY ordered by created_at --
+-- rows arrive in time order and the measured correlation is 0.980 -- which is
+-- the exact condition BRIN exists for. It keeps a summary per block range
+-- instead of an entry per row.
+--
+-- Measured on the live table on 15 Oct 2026, using the nightly dump's own
+-- predicate (created_at >= the cutoff): 1,897 ms over 11,172 buffers by
+-- sequential scan, against 267 ms over 6,185 through this index. Seven times
+-- faster for 24 kB, where the GIN index costs 44 MB and the ivfflat one 949 MB.
+--
+-- NOT created CONCURRENTLY. This file is reapplied on every Luke playbook run
+-- and is IF NOT EXISTS throughout; a CONCURRENTLY build that fails leaves an
+-- INVALID index behind, which IF NOT EXISTS would then skip for ever. A BRIN
+-- build on this table takes seconds.
+CREATE INDEX IF NOT EXISTS messages_created_at_brin ON messages USING BRIN (created_at);
+
 -- Autovacuum is enabled globally by default, but the stock 10% analyze
 -- threshold let the planner statistics drift badly out of date on the
 -- insert-heavy messages table (row estimates were ~35x too low), which
