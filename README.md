@@ -118,6 +118,10 @@ CLAUDE_CHATS_PROVIDER=ollama \
 
 `init.sql` declares `vector(1024)`, so a provider with a different output width needs `CLAUDE_CHATS_DIMENSIONS` set to something it supports, or a schema change.
 
+### Search recall: `CLAUDE_CHATS_IVFFLAT_PROBES`
+
+How many of the ivfflat index's 100 lists a vector search visits (default `20`, range 1-32768; anything else stops the MCP at startup). pgvector's own default of 1 found 0.58 of the true top 10 on Luke's 123k rows; 20 finds 0.97 at about 0.25 s (CHATS-15). Run `scripts/ann-recall-bench.py` before changing it, and check its plan column: at 5 the planner abandons the index for an 8-24 s sequential scan. Re-run it as the table grows, since that cost estimate moves with the row count.
+
 ## MCP tools
 
 Once installed, three tools are available inside Claude Code:

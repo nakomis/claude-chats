@@ -201,9 +201,6 @@ def test_iterative_scan_is_set_and_then_read_back():
     cur = SpyCur()
     assert _enable_iterative_scan(cur) == ITERATIVE_SCAN
     assert f"SET ivfflat.iterative_scan = {ITERATIVE_SCAN}" in cur.statements
-    # ivfflat.probes is left alone on purpose — raising it measured far slower
-    # for the same rows.
-    assert not any("ivfflat.probes" in s for s in cur.statements)
     # The read-back is the point: a SET that quietly did nothing would leave
     # date-filtered vector search under-returning with no symptom.
     assert "SHOW ivfflat.iterative_scan" in cur.statements

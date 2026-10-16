@@ -43,11 +43,34 @@ DEFAULT_SINCE = "3 months"
 # stream costs nothing.
 ITERATIVE_SCAN = "relaxed_order"
 
-# ivfflat.probes is deliberately left at pgvector's default of 1. Raising it
-# looks like it ought to help recall, and measured on Luke it costs far more
-# than it buys: probes=5 took 8.5 s and 23.5 s on two query vectors where
-# probes=1 took 2.4 s and 0.16 s, for the same five rows. The iterative scan is
-# what makes the window correct; probes is not the lever (CHATS-14).
+# How many of the index's lists an ivfflat scan visits. pgvector's default of 1
+# misses far too much: measured on Luke (123,481 rows, lists=100, 26 queries,
+# recall against an exact scan), probes=1 returned 0.58 of the true top 10 and
+# some queries none of them. probes=20 returned 0.97 (0.99 inside 3 months) at
+# p50 0.23 s, max 0.45 s; an exact scan takes 2-7 s (CHATS-15).
+#
+# CHATS-14 measured probes=5 at 8.5 s and 23.5 s and left this at 1. That was
+# not the index being slow: at probes=5 the planner's cost estimate tips it
+# onto a parallel seq scan + top-N sort, while at 4 and at 10 it stays on the
+# index. The estimate is not monotonic in probes, so any new value needs an
+# EXPLAIN check first; scripts/ann-recall-bench.py measures recall, latency and
+# the plan per setting.
+_PROBES_MAX = 32768  # pgvector's own upper bound
+
+
+def _probes_from_env(raw: str | None) -> int:
+    if raw is None or raw.strip() == "":
+        return 20
+    try:
+        probes = int(raw)
+    except ValueError:
+        raise ValueError(f"CLAUDE_CHATS_IVFFLAT_PROBES must be an integer, got {raw!r}") from None
+    if not 1 <= probes <= _PROBES_MAX:
+        raise ValueError(f"CLAUDE_CHATS_IVFFLAT_PROBES must be 1-{_PROBES_MAX}, got {probes}")
+    return probes
+
+
+IVFFLAT_PROBES = _probes_from_env(os.environ.get("CLAUDE_CHATS_IVFFLAT_PROBES"))
 
 # Postgres stores timestamptz in UTC (correct — leave it). This is purely how
 # the MCP *presents* it: a bare UTC clock time (21:37) invites a reader whose
@@ -236,6 +259,26 @@ def _enable_iterative_scan(cur) -> str | None:
         return None
 
 
+def _set_probes(cur) -> int | None:
+    """Set ivfflat.probes for this session and return the value genuinely in
+    effect, or None if it could not be set.
+
+    Call after `_enable_iterative_scan`, which loads pgvector's GUCs (without
+    that, the SET lands on a placeholder and the read-back proves nothing). A
+    failure here rolls the transaction back, which also undoes the iterative
+    scan; with IVFFLAT_PROBES range-checked at startup that needs a server
+    without pgvector at all, where the iterative scan has already failed.
+    """
+    try:
+        # Validated int from startup, never caller input.
+        cur.execute(f"SET ivfflat.probes = {IVFFLAT_PROBES}")
+        cur.execute("SHOW ivfflat.probes")
+        return int(cur.fetchone()[0])
+    except (psycopg.Error, ValueError):
+        cur.connection.rollback()
+        return None
+
+
 def _filters(project_path: str | None, since: datetime | None) -> tuple[str, list]:
     """The WHERE additions shared by all three search paths, as a SQL fragment
     plus its parameters in order. One place, so the semantic and full-text
@@ -385,12 +428,23 @@ def search_memory(
         with conn.cursor() as cur:
             if mode_used in ("semantic", "hybrid"):
                 scan = _enable_iterative_scan(cur)
+                probes = _set_probes(cur)
+                if probes is None:
+                    scan = None  # its rollback undid the iterative scan too
                 if cutoff is not None and scan != ITERATIVE_SCAN:
                     warnings.append(
                         "pgvector iterative index scans are unavailable "
                         f"(ivfflat.iterative_scan = {scan!r}); with a `since` window the "
                         "vector half of this search can return fewer results than asked "
                         "for. Use since='all', or mode='fulltext'."
+                    )
+                if probes != IVFFLAT_PROBES:
+                    in_effect = ("could not be set, so pgvector's default of 1 applies"
+                                 if probes is None else f"is {probes}, not {IVFFLAT_PROBES}")
+                    warnings.append(
+                        f"ivfflat.probes {in_effect}; the vector half of this search "
+                        "will miss close matches (about 4 in 10 at probes=1). "
+                        "mode='fulltext' is unaffected."
                     )
 
             if mode_used == "semantic":
@@ -473,7 +527,9 @@ def _query_semantic(cur, vec: str, where: str, where_params: list, limit: int):
         LIMIT  %s
     """
     cur.execute(sql, [vec, *where_params, vec, limit])
-    return cur.fetchall()
+    # relaxed_order lets the iterative scan hand rows back slightly out of
+    # distance order; restore it (score is the last column).
+    return sorted(cur.fetchall(), key=lambda r: r[-1], reverse=True)
 
 
 def _query_fulltext(cur, query: str, where: str, where_params: list, limit: int):
