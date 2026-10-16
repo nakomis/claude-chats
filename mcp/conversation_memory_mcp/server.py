@@ -439,10 +439,12 @@ def search_memory(
                         "for. Use since='all', or mode='fulltext'."
                     )
                 if probes != IVFFLAT_PROBES:
+                    in_effect = ("could not be set, so pgvector's default of 1 applies"
+                                 if probes is None else f"is {probes}, not {IVFFLAT_PROBES}")
                     warnings.append(
-                        f"ivfflat.probes is {probes!r}, not {IVFFLAT_PROBES}; the vector "
-                        "half of this search may miss close matches. mode='fulltext' "
-                        "is unaffected."
+                        f"ivfflat.probes {in_effect}; the vector half of this search "
+                        "will miss close matches (about 4 in 10 at probes=1). "
+                        "mode='fulltext' is unaffected."
                     )
 
             if mode_used == "semantic":
@@ -525,7 +527,9 @@ def _query_semantic(cur, vec: str, where: str, where_params: list, limit: int):
         LIMIT  %s
     """
     cur.execute(sql, [vec, *where_params, vec, limit])
-    return cur.fetchall()
+    # relaxed_order lets the iterative scan hand rows back slightly out of
+    # distance order; restore it (score is the last column).
+    return sorted(cur.fetchall(), key=lambda r: r[-1], reverse=True)
 
 
 def _query_fulltext(cur, query: str, where: str, where_params: list, limit: int):
