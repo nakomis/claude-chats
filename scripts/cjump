@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# cjump — jump to a past Claude Code conversation.
+#
+#   cjump "building a pewter hook for my tripod"
+#   cjump 76843580-8293-4607-b5f5-15b8e11b980c     # skip the search
+#
+# Asks Haiku (via conversation-memory) which session matches the description.
+# If that session is already running in a Terminal tab, un-minimises and raises
+# that window, then closes the window cjump was run from. Otherwise it cd's to
+# the session's directory and execs `claude --resume <id>` in this window.
+#
+# Options:
+#   -k, --keep    don't close this window after jumping to an open session
+#   -n, --dry-run say what would happen, change nothing
+#
+# Env:
+#   CLAUDE_RESUME_FLAGS  extra flags for claude (default --allow-dangerously-skip-permissions)
+#   CJUMP_MODEL          model for the search (default haiku)
+
+set -euo pipefail
+
+keep=0 dry=0
+args=()
+while (($#)); do
+  case $1 in
+    -k|--keep) keep=1 ;;
+    -n|--dry-run) dry=1 ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+query="${args[*]:-}"
+[[ -n $query ]] || { echo "usage: cjump [-k] [-n] <description | session-id>" >&2; exit 2; }
+
+flags=${CLAUDE_RESUME_FLAGS---allow-dangerously-skip-permissions}
+uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+# --- 1. Find the session -----------------------------------------------------
+if [[ $query =~ $uuid_re ]]; then
+  sid=$query title="" confidence=high
+else
+  echo "Searching for: $query" >&2
+  # Search conversation-memory directly (same code and env as the MCP; ~3 s),
+  # rather than letting a model drive the MCP (~20 s of tool round-trips).
+  candidates=$(uv run -q --project ~/repos/nakomis/claude-chats/mcp python - "$query" 2>/dev/null <<'PY'
+import json, logging, os, sys, tomllib
+logging.disable(logging.CRITICAL)
+cfg = tomllib.load(open(os.path.expanduser("~/repos/nakomis/mcps/meta-mcp/config.toml"), "rb"))
+for m in cfg["mcps"]:
+    if m["name"] == "conversation-memory":
+        os.environ.update(m.get("env", {}))
+from conversation_memory_mcp.server import search_memory
+r = search_memory(query=sys.argv[1], limit=20, since="all")
+r = json.loads(r) if isinstance(r, str) else r
+sessions = {}
+for x in r.get("results", []):
+    s = sessions.setdefault(x["session_id"], {
+        "session_id": x["session_id"], "name": x["name"], "ai_title": x["ai_title"],
+        "project": x["project_path"], "when": x["created_at"], "hits": 0, "snippets": []})
+    s["hits"] += 1
+    for c in x["context"]:
+        text = " ".join(str(c.get("content", "")).split())
+        if text and not text.startswith("{") and len(s["snippets"]) < 3:
+            s["snippets"].append(f'{c["role"]}: {text[:200]}')
+            break
+print(json.dumps(list(sessions.values())))
+PY
+) || { echo "conversation-memory search failed" >&2; exit 1; }
+  [[ $candidates != "[]" ]] || { echo "No matching conversation found." >&2; exit 1; }
+
+  schema='{"type":"object","properties":{
+    "session_id":{"type":["string","null"]},
+    "title":{"type":"string"},
+    "confidence":{"type":"string","enum":["high","medium","low"]}},
+    "required":["session_id","title","confidence"]}'
+  prompt="Martin is looking for a past Claude Code conversation: \"$query\"
+These candidate sessions came back from a search of his conversation history (hits = matching messages):
+$candidates
+Pick the session where the work itself happened. Prefer it over later catch-up or summary sessions that merely discuss it. Return its session_id, its title (name if set, else ai_title) and your confidence. Use session_id null if none plausibly matches."
+  # No tools, no MCP servers, no user hooks: one model call, ~3 s.
+  out=$(cd /tmp && claude -p --model "${CJUMP_MODEL:-haiku}" --no-session-persistence \
+          --strict-mcp-config --setting-sources project --tools "" \
+          --output-format json --json-schema "$schema" \
+          -- "$prompt" </dev/null) || { echo "claude search failed" >&2; exit 1; }
+  sid=$(jq -r '.structured_output.session_id // empty' <<<"$out")
+  title=$(jq -r '.structured_output.title // empty' <<<"$out")
+  confidence=$(jq -r '.structured_output.confidence // "low"' <<<"$out")
+  [[ $sid =~ $uuid_re ]] || { echo "No matching conversation found." >&2; exit 1; }
+fi
+echo "Found: ${title:-$sid} ($sid, confidence $confidence)" >&2
+
+if [[ $confidence == low && $dry == 0 ]]; then
+  read -r -p "Low confidence — carry on? [y/N] " ans
+  [[ $ans == [yY]* ]] || exit 1
+fi
+
+# --- 2. Is it already open? --------------------------------------------------
+# Claude Code keeps ~/.claude/sessions/<pid>.json for every live process.
+pid=""
+for f in ~/.claude/sessions/*.json; do
+  [[ -e $f ]] || continue
+  if [[ $(jq -r '.sessionId // empty' "$f" 2>/dev/null) == "$sid" ]]; then
+    p=$(jq -r '.pid' "$f")
+    if kill -0 "$p" 2>/dev/null; then pid=$p; break; fi
+  fi
+done
+# Fallback: a process started with --resume <sid> that hasn't written its file yet.
+[[ -n $pid ]] || pid=$(pgrep -f -- "--resume $sid" | head -1 || true)
+
+if [[ -n $pid ]]; then
+  tty=$(ps -o tty= -p "$pid" | tr -d ' ')
+  if [[ -z $tty || $tty == "??" ]]; then
+    echo "Session is open (pid $pid) but has no terminal I can find." >&2; exit 1
+  fi
+  echo "Already open: pid $pid on /dev/$tty" >&2
+  ((dry)) && { echo "[dry run] would raise the Terminal window on /dev/$tty"; exit 0; }
+
+  found=$(osascript - "/dev/$tty" <<'APPLESCRIPT'
+on run argv
+  set target to item 1 of argv
+  tell application "Terminal"
+    -- Loop variables are positional references that go stale as windows
+    -- reorder, so find the id of the window first and act on that.
+    set wid to missing value
+    repeat with w in windows
+      repeat with i from 1 to count of tabs of w
+        if tty of tab i of w is target then
+          set wid to id of w
+          set tabIndex to i
+          exit repeat
+        end if
+      end repeat
+      if wid is not missing value then exit repeat
+    end repeat
+    if wid is missing value then return "no"
+    set miniaturized of window id wid to false
+    set selected of tab tabIndex of window id wid to true
+    set index of window id wid to 1
+    activate
+  end tell
+  return "yes"
+end run
+APPLESCRIPT
+)
+  if [[ $found != yes ]]; then
+    echo "pid $pid is on /dev/$tty, but that isn't a Terminal.app tab." >&2; exit 1
+  fi
+
+  # Close the window we were run from, once this script has exited and the tab
+  # is back to an idle shell (so Terminal doesn't ask about running processes).
+  mytty=$(tty 2>/dev/null || true)
+  if ((keep == 0)) && [[ ${TERM_PROGRAM:-} == Apple_Terminal && $mytty == /dev/* && $mytty != "/dev/$tty" ]]; then
+    nohup osascript - "$mytty" >/dev/null 2>&1 <<'APPLESCRIPT' &
+on run argv
+  set mine to item 1 of argv
+  tell application "Terminal"
+    repeat 50 times
+      delay 0.1
+      repeat with w in windows
+        repeat with t in tabs of w
+          if tty of t is mine then
+            if busy of t then exit repeat
+            if (count of tabs of w) is 1 then close w
+            return
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+end run
+APPLESCRIPT
+    disown
+  fi
+  exit 0
+fi
+
+# --- 3. Not open: resume it here ---------------------------------------------
+transcript=$(ls ~/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -1 || true)
+if [[ -z $transcript ]]; then
+  echo "Session $sid has no transcript on $(hostname -s); it may have been on another machine." >&2
+  exit 1
+fi
+# The first cwd is the directory the project folder is named after, which is
+# where `claude --resume` looks for it.
+# first() stops jq at the first match; piping to `head -1` instead SIGPIPEs
+# jq on big transcripts, and pipefail + set -e then kill the script silently.
+dir=$(jq -rn 'first(inputs | select(.cwd) | .cwd)' "$transcript" 2>/dev/null || true)
+[[ -d $dir ]] || { echo "Directory $dir no longer exists." >&2; exit 1; }
+
+echo "Resuming in $dir" >&2
+((dry)) && { echo "[dry run] cd $dir && claude $flags --resume $sid"; exit 0; }
+cd "$dir"
+# shellcheck disable=SC2086
+exec claude $flags --resume "$sid"
