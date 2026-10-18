@@ -67,7 +67,7 @@ The `server/` directory — the ActiveMQ container, the Node STOMP worker, `serv
 | `hook/` | The capture hook, embedding helper, backfill and image archiving |
 | `mcp/` | The MCP server — hybrid search, transcript retrieval, session listing |
 | `init.sql` | Source of truth for the Postgres schema |
-| `scripts/` | Backup/restore, LaunchAgent setup, embedding evaluation harnesses |
+| `scripts/` | Backup/restore, LaunchAgent setup, embedding evaluation harnesses, and `cjump` (jump to a past conversation: raise its Terminal window, or `claude --resume` it) |
 | `localhost/` | The self-contained [single-machine edition](localhost/README.md) |
 | `docs/architecture/` | The diagram above, as `.drawio` source and exported SVG |
 | `server/` | **Superseded** — the previous ActiveMQ/worker design, kept for reference |
