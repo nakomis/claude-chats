@@ -1,5 +1,7 @@
 # claude-chats
 
+<img src="docs/logo.png" alt="claude-chats logo" width="200" align="right"/>
+
 Records Claude Code conversations to PostgreSQL with vector embeddings for semantic search, exposed via an MCP server.
 
 A hook fires on every user message and again at session end, capturing new messages. Each message is embedded so the MCP tools can do similarity search across every conversation you have ever had with Claude — across every machine you have them on.
