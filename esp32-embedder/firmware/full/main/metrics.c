@@ -47,7 +47,7 @@
 
 #define METRICS_EVERY_S 60
 #define FIRST_DELAY_MS 45000             // let Wi-Fi, Fleet and the boot self-test settle first
-#define METRICS_STACK 5120               // in PSRAM: the HTTP client and snprintf are the deep part
+#define METRICS_STACK 6144               // in PSRAM (so free): the HTTP client is the deep part, plus the line and fields
 #define METRICS_PRIO 6                   // as statusd: compute tasks (5) would starve anything lower for a pass
 #define METRICS_CORE 0                   // away from lwIP's tcpip task (core 1)
 #define MIN_INTERNAL (24 * 1024)         // free internal RAM to start a POST (a phase's low is ~12.8 KB)
