@@ -33,6 +33,9 @@ bool model_progress(int *unit, int *units, uint32_t *elapsed_ms);
 // CHATS-17: crashes (panic or watchdog resets) in a row before this boot's self-test passed; 0 normally.
 // At 3 the board boots without the model, so it stays reachable.
 int model_crash_streak(void);
+// CHATS-20: the model is loaded and not lent to an update. False on a board that booted without it
+// (no card, or the crash-loop boot above).
+bool model_loaded(void);
 
 // ---- CHATS-5: the model for the worker (kata_worker.c) ----------------------------------------
 // The tokeniser: [CLS] .. [SEP], at most max ids, truncated as Ollama does.

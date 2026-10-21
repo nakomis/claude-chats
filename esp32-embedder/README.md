@@ -352,6 +352,20 @@ One connection is served at a time, with up to four waiting. The request head mu
 curl -s http://<board>/json | jq .now
 ```
 
+### Metrics to VictoriaMetrics (CHATS-20)
+
+Once a minute `firmware/full/main/metrics.c` POSTs one InfluxDB line-protocol line of integers to the house VictoriaMetrics, through vmauth on Cal (`http://172.29.0.33:8427/write`): plain HTTP on the LAN, which costs no TLS session's worth of internal RAM, with HTTP Basic auth as the board's own vmauth user. It's tinycrypt's design (CRYPT-28), and `worker/metrics_line.c` (the line builder, with escaping and field-name checks) is tinycrypt's, host-tested in `test/test_metrics_line.c`. vmauth pins `host_name` to the user server-side, so a leaked password (it's in plain flash) can only write as this board.
+
+```
+kata,host_name=<thing>,version=<x.y.z> uptime_s=…i,heap_free=…i,heap_largest=…i,heap_lowest=…i,psram_free=…i,rssi=…i,temp_c=…i,vcore_mv=…i,card_wait_last_ms=…i,card_wait_median_ms=…i,card_crc_mismatches=…i,card_read_retries=…i,worker_running=…i,worker_sick=…i,stalled_s=…i,crashes_in_a_row=…i,messages_total=…i,messages_today=…i,selftest_ok=…i,model_ready=…i
+```
+
+VictoriaMetrics names each series `kata_<field>`. The heap fields are internal RAM (`psram_free` is PSRAM); `rssi` is left out when not associated and `temp_c` when there's no sensor reading; `messages_total` is jobs embedded since boot (it restarts at 0, which `rate()` reads as a counter reset) and `messages_today` today's (UTC); `selftest_ok` is 1 for a bit-exact or cosine pass (cosine is the NOT VERIFIED fallback for a build whose CRCs aren't recorded yet); `model_ready` is `model_loaded()`: 0 on a board that booted without the model (no card, or the crash-loop boot) and while an update holds it.
+
+**Never in the way.** The task runs at statusd's priority with its stack in PSRAM and a 1.5 s timeout per step (connect, write, read: their sum stays under the 5 s an SQS phase waits for the gate), under `kata_worker_gate` like statusd's replies, so no SQS phase starts while its HTTP client holds its few KB of internal RAM. A minute with a phase or an update under way, or under 24 KB of internal RAM free, is skipped, not queued. A failed POST is dropped and logged once per run of failures; nothing is retried.
+
+**Provisioning.** `provision.sh` writes `metrics_url`, `metrics_user` (default: the Thing; `METRICS_USER` overrides) and `metrics_pass` (from SSM `/vmauth/device-<user>-password` in the prod account, `METRICS_PROFILE`) to the `prov` partition. `METRICS_URL=none` writes none, which turns it off, as does a password that can't be read (a warning). A board's vmauth user and password are made on the home-infra side first.
+
 ### Versioning
 
 `firmware/full/version.txt` (`x.y.z`, starting at 0.1.0) labels local builds; ESP-IDF puts it in the app descriptor, and the firmware prints it at boot. It's only a seed. In CI the version comes from the shared deployment tracker (project `kata`): one patch past sandbox's latest, or a minor or major bump with `--bump-minor` or `--bump-major` alone on a line in the PR description. A version already in the bucket is never reused; CI steps past it.

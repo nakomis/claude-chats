@@ -37,6 +37,7 @@
 #include "ota.h"
 #include "vcore.h"
 #include "kata_worker.h"
+#include "metrics.h"
 #include "statusd.h"
 #include "kw.h"
 #include "cJSON.h"
@@ -750,6 +751,7 @@ int model_health(void)
 static RTC_NOINIT_ATTR uint32_t crash_magic, crash_streak;
 
 int model_crash_streak(void) { return crash_magic == CRASH_MAGIC ? (int)crash_streak : 0; }
+bool model_loaded(void) { return model_ready && !model_lent; }
 
 // kw.h's allocations (the worker's bodies, results and JSON) go to PSRAM
 static void *ps_alloc(size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); }
@@ -806,6 +808,7 @@ void app_main(void)
         net_heap("wifi up");
         fleet_start(&prov);                   // the heartbeat; commands and publishes ride the phases
         statusd_start(&prov);                 // CHATS-16: GET /json on the LAN, from now (the self-test too)
+        metrics_start(&prov);                 // CHATS-20: her health to VictoriaMetrics, best effort
     }
     kata_worker_hello(&prov, online);         // Fleet sees this board now, not after the self-test
 

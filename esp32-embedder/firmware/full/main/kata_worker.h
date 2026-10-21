@@ -7,6 +7,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_system.h"
 #include "prov.h"
@@ -16,6 +17,18 @@ const char *reset_name(esp_reset_reason_t r);
 
 // Before Fleet starts: the temperature sensor, and the worker's fields in the heartbeat.
 void kata_worker_status_init(int vcore_mv);
+
+// CHATS-20: the worker's numbers for the metrics line (metrics.c).
+typedef struct {
+    int vcore_mv;
+    bool have_temp;
+    float temp_c;
+    bool running, sick;                  // sick is false when not running
+    int messages_boot, messages_today;   // jobs embedded since boot, and today (UTC)
+    int stalled_s;                       // worker.h: how long work has been held with no pass or hand-off
+    uint32_t card_wait_last_ms, card_wait_median_ms;
+} kata_worker_metrics_t;
+void kata_worker_metrics(kata_worker_metrics_t *m);
 
 // At boot, before the self-test (CHATS-13): one phase with no jobs, so Fleet sees the board within
 // seconds (its version and status) and any waiting command is read.
