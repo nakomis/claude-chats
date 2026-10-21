@@ -160,7 +160,17 @@ static void sd_task(void *arg)
             uint32_t lba = frag_lba[f] + (off - frag_off[f]) / 512;
             xSemaphoreTake(bfree[bi], portMAX_DELAY);
             esp_err_t e = sdmmc_read_sectors(card, abounce[bi], lba, ns);
-            if (e != ESP_OK) { read_retries++; e = sdmmc_read_sectors(card, abounce[bi], lba, ns); }
+            // CHATS-17: on 20 Oct a read timed out twice in a row (0x107) and the abort halted the board
+            // for 28 h. A card that times out once usually answers after a pause: up to four retries,
+            // 10 ms to 1 s apart, before giving up. Giving up still aborts (the pass can't go on without
+            // its weights), which now reboots, with a core dump and the crash in the next heartbeat.
+            static const int pause_ms[] = { 10, 100, 500, 1000 };
+            for (int t = 0; e != ESP_OK && t < (int)(sizeof pause_ms / sizeof *pause_ms); t++) {
+                read_retries++;
+                printf("SD: read at lba %lu: %s, retrying in %d ms\n", (unsigned long)lba, esp_err_to_name(e), pause_ms[t]);
+                vTaskDelay(pdMS_TO_TICKS(pause_ms[t]));
+                e = sdmmc_read_sectors(card, abounce[bi], lba, ns);
+            }
             if (e != ESP_OK) { printf("SD: read at lba %lu failed: %s\n", (unsigned long)lba, esp_err_to_name(e)); abort(); }
             chunk_t c = { r, d, bi, n, first, len == n };
             xQueueSend(cq, &c, portMAX_DELAY);

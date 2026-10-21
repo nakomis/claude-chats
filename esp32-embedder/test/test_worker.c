@@ -786,6 +786,118 @@ static void soak(void)
     board_free(&b, &w);
 }
 
+// The worker object of the heartbeat, parsed.
+static cJSON *status_of(worker_t *w)
+{
+    jbuf_t s;
+    jb_init(&s);
+    worker_status_json(w, &s);
+    cJSON *j = cJSON_ParseWithLength(s.p, s.n);
+    jb_free(&s);
+    CHECK(j != NULL, "the status parses");
+    return j;
+}
+
+static double status_num(cJSON *j, const char *a, const char *b)
+{
+    const cJSON *v = cJSON_GetObjectItem(j, a);
+    if (b) v = cJSON_GetObjectItem(v, b);
+    return cJSON_IsNumber(v) ? v->valuedouble : -1;
+}
+
+static void stalls(void)
+{
+    printf("-- CHATS-17: kata-prod-green's 28 h stall, and the progress watchdog\n");
+    // As the board runs (README: the model leaves ~366 KB of PSRAM, a pool budget of ~47 KB), and
+    // the queue holding plenty of work.
+    worker_cfg_t c = { INGEST, RESULTS, "kata-prod-green", "0.2.3", TAG, &kata_id, 150, 47 * 1024, 40 };
+    board_t b;
+    worker_t w;
+    board_init(&b, &w, &c);
+    // 08:11:55's pass: one segment of 225 tokens. A job that size fills the pool past the 150-token
+    // target by itself, so the pool holds just it.
+    char *bodies[6], words[2048];
+    int k = 0;
+    for (int i = 0; i < 223; i++) k += snprintf(words + k, sizeof words - k, "%sx", i ? " " : "");
+    for (int i = 0; i < 6; i++) {
+        char uuid[16];
+        snprintf(uuid, sizeof uuid, "u-st%d", i);
+        bodies[i] = make_job_text(&b, uuid, words);
+    }
+    // A step: hand-off (nothing yet), receive one job, one pass of one segment.
+    int wait = worker_step(&w);
+    int64_t pass_at = b.f.now;
+    cJSON *st = status_of(&w);
+    // Exactly what the heartbeat said for 28 h: idle, one job in the pool and no tokens (its result,
+    // built, waiting for the next phase to hand it off), and the last hand-off before the last pass.
+    CHECK(b.last_n_seg == 1 && w.last_pass.tokens == 225, "one segment, 225 tokens: %d, %d", b.last_n_seg, w.last_pass.tokens);
+    CHECK(wait == 0 && !strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(st, "state")), "idle"), "idle, straight on");
+    CHECK(status_num(st, "pool", "n") == 1 && status_num(st, "pool", "tokens") == 0, "pool n=1, tokens=0");
+    CHECK(status_num(st, "last_pass", "at") == (double)pass_at && cJSON_IsNull(cJSON_GetObjectItem(st, "last_handoff_at")),
+          "last_pass, no hand-off since");
+    CHECK(status_num(st, "stalled_s", NULL) == 0, "not stalled straight after a pass: %g", status_num(st, "stalled_s", NULL));
+    cJSON_Delete(st);
+    // That snapshot lasts only until the next step: whatever that step does, it ends "handing-off"
+    // or counts a failure. So 28 h of it means nothing stepped the worker. Its heartbeat has to say
+    // so by itself, from the clock, without a step.
+    b.f.now += 28 * 3600;
+    st = status_of(&w);
+    CHECK(status_num(st, "stalled_s", NULL) == 28 * 3600, "stalled_s with nothing stepping: %g", status_num(st, "stalled_s", NULL));
+    CHECK(worker_stalled_s(&w, b.f.now) == 28 * 3600, "worker_stalled_s");
+    cJSON_Delete(st);
+    // One step and the result goes (the worker itself was fine), and the clock restarts.
+    worker_step(&w);
+    CHECK(results(&b) == 1 && w.last_handoff_at == b.f.now - 75 && b.passes == 2, "handed off at once, then the next pass");
+    CHECK(worker_stalled_s(&w, b.f.now) == 0, "not stalled after a hand-off and a pass: %lld", (long long)worker_stalled_s(&w, b.f.now));
+    for (int i = 0; i < 20 && fq_live(fq_queue(&b.f, INGEST)); i++) b.f.now += worker_step(&w);
+    CHECK(fq_live(fq_queue(&b.f, INGEST)) == 0 && results(&b) == 6, "drained: %d results", results(&b));
+    // An empty queue isn't a stall, however long it stays empty.
+    for (int i = 0; i < 5; i++) b.f.now += worker_step(&w) + 3600;
+    CHECK(w.n == 0 && worker_stalled_s(&w, b.f.now) == 0, "idle on an empty queue: %lld", (long long)worker_stalled_s(&w, b.f.now));
+    for (int i = 0; i < 6; i++) kw_free(bodies[i]);
+    board_free(&b, &w);
+
+    // A stall inside the state machine: an extension that fails every phase. No pass may start
+    // (a job could come back to someone else mid-pass), and until now nothing counted it: idle,
+    // failures all 0, no last_error, for ever.
+    board_init(&b, &w, &c);
+    char *j0 = make_job_text(&b, "u-vis0", "a second delivery: a pass of its own");
+    char *j1 = make_job_text(&b, "u-vis1", "held while its extension keeps failing");
+    fq_queue(&b.f, INGEST)->msgs[0].receive_count = 1;
+    worker_step(&w);                          // j0 alone; j1 pending
+    worker_step(&w);                          // j0 handed off; j1 needn't be extended yet: its pass
+    CHECK(b.passes == 2 && results(&b) == 1, "j0 through, j1 embedded: %d passes", b.passes);
+    char *j2 = make_job_text(&b, "u-vis2", "held while its extension keeps failing");
+    char *j3 = make_job_text(&b, "u-vis3", "and another");
+    fq_queue(&b.f, INGEST)->msgs[2].receive_count = 1;
+    worker_step(&w);                          // j1 handed off; j2 alone (second delivery), j3 pending
+    CHECK(b.passes == 3 && w.pool_tokens > 0, "j3 pending");
+    b.f.now += 400;                           // j3 needs extending before its pass
+    b.f.fail_target = "AmazonSQS.ChangeMessageVisibilityBatch";
+    b.f.fail_target_next = 1000000;
+    int64_t first = b.f.now;
+    for (int i = 0; i < 40; i++) {
+        b.f.now += worker_step(&w);
+        // SQS took no extension; keep the job in flight anyway, so this stays the one fault
+        fq_queue_t *in = fq_queue(&b.f, INGEST);
+        for (int m = 0; m < in->n; m++) if (!in->msgs[m].deleted) in->msgs[m].visible_at = b.f.now + 900;
+    }
+    st = status_of(&w);
+    CHECK(b.passes == 3 && w.n == 1 && w.pool_tokens > 0, "no pass while the extension fails: %d passes, %d held", b.passes, w.n);
+    CHECK(status_num(st, "failures", "visibility") >= 40, "visibility failures counted: %g", status_num(st, "failures", "visibility"));
+    CHECK(cJSON_GetStringValue(cJSON_GetObjectItem(st, "last_error")) != NULL, "and last_error says why");
+    CHECK(status_num(st, "stalled_s", NULL) >= (double)(b.f.now - first), "stalled_s rises: %g", status_num(st, "stalled_s", NULL));
+    cJSON_Delete(st);
+    b.f.fail_target_next = 0;
+    worker_step(&w);
+    worker_step(&w);
+    CHECK(results(&b) == 4 && fq_live(fq_queue(&b.f, INGEST)) == 0, "all through once it works: %d", results(&b));
+    b.f.now += worker_step(&w);
+    CHECK(worker_stalled_s(&w, b.f.now) == 0, "and no longer stalled");
+    kw_free(j0); kw_free(j1); kw_free(j2); kw_free(j3);
+    board_free(&b, &w);
+}
+
 static int test_rng(void *ctx, unsigned char *out, size_t n) { return enc_rng(ctx, out, n); }
 
 int main(void)
@@ -820,5 +932,6 @@ int main(void)
     big_results();
     soak();
     out_of_memory();
+    stalls();
     return report("worker");
 }

@@ -115,6 +115,7 @@ typedef struct {
     int bad_passes;
     int invalid;                         // bodies that weren't envelopes (left for the DLQ)
     int send_failures, delete_failures, phase_failures;
+    int visibility_failures;             // extensions that didn't go through (no pass until one does)
 } worker_counts_t;
 
 typedef struct {
@@ -140,6 +141,10 @@ typedef struct {
     uint32_t card_wait[WORKER_CARD_HISTORY];
     int n_card;
     int64_t last_handoff_at;
+    // CHATS-17: when the worker last moved work on (a pass, a hand-off), or when work turned up for
+    // an idle one; 0 while there's none (the pool empty and the last receive empty). Unix seconds:
+    // the high word is 0 until 2106, so the heartbeat's task can't read it torn.
+    volatile int64_t progress_at;
     char last_error[160];
 } worker_t;
 
@@ -158,6 +163,13 @@ void worker_set_sick(worker_t *w, const char *why);
 void worker_request_park(worker_t *w);
 bool worker_is_parked(const worker_t *w);
 void worker_resume(worker_t *w);
+
+// CHATS-17: how long the worker has had work (jobs in the pool, or the last receive brought some)
+// without a pass or a hand-off: seconds, 0 if it hasn't any. Computed from the clock, not from a
+// step, so it rises however the worker came to a stop, its task stuck included. A pass takes a
+// couple of minutes, a sick board's health check about six, a back-off at most five: much longer
+// than that is a stall. From any task (reads only).
+int64_t worker_stalled_s(const worker_t *w, int64_t now);
 
 // The "worker" object of the status heartbeat (HOME-441), appended to out.
 void worker_status_json(worker_t *w, jbuf_t *out);

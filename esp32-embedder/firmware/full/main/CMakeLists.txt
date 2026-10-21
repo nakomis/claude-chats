@@ -6,7 +6,7 @@ idf_component_register(
          "../../../worker/batch.c" "../../../worker/httpreq.c"
     INCLUDE_DIRS "." "../../../tok" "../../../otacmd" "../../../worker"
     PRIV_REQUIRES esp_hw_support esp_timer esp_driver_sdmmc sdmmc fatfs esp_rom esp_wifi esp_netif esp_event
-                  esp_http_client mbedtls nvs_flash esp_app_format app_update json esp_driver_tsens lwip
+                  esp_http_client mbedtls nvs_flash esp_app_format app_update json esp_driver_tsens lwip espcoredump
     # Amazon Root CA 1 (public): IoT Core, the credentials provider and the S3 download (CHATS-10). The
     # board's own certificate, key and settings are not in the image: they're in the prov partition
     # (prov.h, provision.sh).
