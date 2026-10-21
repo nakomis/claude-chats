@@ -325,7 +325,7 @@ A rare "is everything OK?" check, answered by the board itself rather than by it
 
 `firmware/full/main/statusd.c` is one task, with its stack in PSRAM, one connection at a time and one route. The HTTP itself (routing, response heads, who may ask) is `worker/httpreq.c`, host-tested in `test/test_httpreq.c`.
 
-**What comes back.** The heartbeat's status, built at that moment (`fleet_status_build`, the same fields as `kata/<thing>/status`), plus a `now` object:
+**What comes back.** The heartbeat's status, built at that moment (`fleet_status_build`, the same fields as `kata/<thing>/status`, which since CHATS-16 include the board's `ip` and Wi-Fi `mac`, for finding it on the LAN and reserving its address), plus a `now` object:
 
 | Field | Meaning |
 |---|---|

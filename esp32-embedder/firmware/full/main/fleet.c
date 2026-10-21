@@ -9,6 +9,8 @@
 
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -50,6 +52,13 @@ static void build_status(jbuf_t *b)
               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
               (unsigned)heapwatch_lowest(),
               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    // CHATS-16: where to find the board on the LAN (statusd's GET /json), and the Wi-Fi MAC its DHCP
+    // reservation is made against
+    esp_netif_ip_info_t ip = { 0 };
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr) jb_printf(b, ",\"ip\":\"" IPSTR "\"", IP2STR(&ip.ip));
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) jb_printf(b, ",\"mac\":\"" MACSTR "\"", MAC2STR(mac));
     if (status_extra) status_extra(b);
 }
 
