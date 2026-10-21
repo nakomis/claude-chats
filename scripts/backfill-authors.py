@@ -15,12 +15,20 @@ one of them 'claude', so those are set from ``role`` alone, with model left
 NULL because only the transcript knows it.
 
 Rows with neither stay 'unknown'. Claude Code deletes old transcripts, so on
-21 Oct 2026 phi's own held only 5,236 of the unknown rows; the rest of
-June to August are recoverable only from Time Machine. Restore old
-``~/.claude/projects`` folders somewhere and pass each with ``--projects``:
-a message found in any of them counts. What no transcript covers is not
-guessed at, because the classifier measured on later rows does not transfer
-to April and May (see HOME-311).
+21 Oct 2026 phi's own held only 5,236 of the 79,901 unknown rows. Time
+Machine has the rest. Its snapshots mount read-only without root, and
+Claude Code keeps about 30 days of transcripts, so one every three weeks
+catches every session:
+
+    diskutil apfs listSnapshots /dev/diskNs1        # the backup volume
+    mount_apfs -o ro,nobrowse -s com.apple.TimeMachine.<date>.backup \
+        /dev/diskNs1 /tmp/tm-<date>
+
+then pass each ``<mount>/*/Data/Users/<you>/.claude/projects`` with
+``--projects``. Seven snapshots from 11 May to 5 Sep raised the exact
+labels to 77,457 (98%). What no transcript covers is not guessed at,
+because the classifier measured on later rows does not transfer to April
+(see HOME-311).
 
 It prints rather than connects: the Macs have no route to Luke's Postgres, and
 it has to run on every Mac that holds transcripts. Review the output, then:
