@@ -3,7 +3,7 @@
 # firmware reads at run time (firmware/full/main/prov.c), so no secret is ever in the build.
 # tinycrypt's provision-key.sh. Safe to re-run.
 #
-#   infra/scripts/provision.sh <board> [--new]        (blue, green or red)
+#   infra/scripts/provision.sh <board> [--new]        (blue, kata or red)
 #
 # Each run makes sure the board's certificate is active and attached to its Thing
 # (kata-{env}-<board>, from ClaudeChatsKataDeviceStack) and to the board policy. --new retires the
@@ -40,7 +40,7 @@ for arg in "$@"; do
         *) board=$arg ;;
     esac
 done
-[ -n "$board" ] || { echo "usage: provision.sh <board> [--new]   (blue, green or red)" >&2; exit 2; }
+[ -n "$board" ] || { echo "usage: provision.sh <board> [--new]   (blue, kata or red)" >&2; exit 2; }
 [[ "$board" =~ ^[a-z0-9]+$ ]] || { echo "board must be a lower-case word, like blue" >&2; exit 2; }
 env=${NPM_ENVIRONMENT:-sandbox}
 # shellcheck source-path=SCRIPTDIR source=aws-env.sh

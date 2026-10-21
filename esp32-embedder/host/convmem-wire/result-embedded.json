@@ -14,7 +14,7 @@
   "tokens": 23,
   "truncated_chars": false,
   "reason": null,
-  "board": "kata-prod-green",
+  "board": "kata-prod-kata",
   "fw": "0.3.0",
   "pass": {
     "n_seg": 3,

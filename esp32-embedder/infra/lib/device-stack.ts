@@ -7,7 +7,7 @@ import { Construct } from 'constructs';
 
 export interface DeviceStackProps extends cdk.StackProps {
     deployEnv: 'sandbox' | 'prod';
-    /** One IoT Thing per board, e.g. ['blue', 'green', 'red'] (infra/boards.json). */
+    /** One IoT Thing per board, e.g. ['blue', 'kata', 'red'] (infra/boards.json). */
     boards: string[];
 }
 
