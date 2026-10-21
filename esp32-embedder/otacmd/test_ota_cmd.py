@@ -194,16 +194,17 @@ def test_a_url_of_exactly_the_limit_is_refused():
 
 
 @pytest.mark.parametrize("start", [0, 2**32 - 30000])  # and across the clock wrapping
-def test_a_set_completes_within_a_minute(start):
+def test_a_set_completes_within_eight_minutes(start):
+    # CHATS-19: chunks a few phases apart, as a busy Kata reads them
     msgs = chunks(URL, 2)
-    out = run({"_now": start}, msgs[0], {"_now": (start + 60000) % 2**32}, msgs[1])
+    out = run({"_now": start}, msgs[0], {"_now": (start + 480000) % 2**32}, msgs[1])
     assert out[-1]["kind"] == "update"
 
 
 @pytest.mark.parametrize("start", [0, 2**32 - 30000])
 def test_a_stale_set_is_dropped_and_a_fresh_one_completes(start):
     msgs = chunks(URL, 2)
-    later = (start + 60001) % 2**32
+    later = (start + 480001) % 2**32
     out = run({"_now": start}, msgs[0], {"_now": later}, msgs[1], msgs[0])
     # msgs[1] found the set stale and started a new one; msgs[0] then completed it.
     assert [o["kind"] for o in out] == ["chunk", "chunk", "update"]

@@ -269,7 +269,11 @@ static int net_begin(void *ctx, char *why, size_t n)
 // the phase's SQS session, but acted on only after the session has closed and the outbox has gone
 // (run_commands). An update starts a task with an 8 KB internal stack, and a TLS session beside a
 // new one took internal RAM down to 5.4 KB (14 Oct). A command is acted on once.
-#define MAX_COMMANDS 10
+// CHATS-19: Fleet's open device page asks get_version every few seconds, and Kata reads commands only
+// between passes, so at 10 a phase an update's chunks sat behind a growing queue of them (21 Oct 2026:
+// 48 waiting). Up to 40 a phase (four receives of SQS's 10), so a phase empties the queue.
+#define MAX_COMMANDS 40
+#define RECEIVE_MAX 10                // SQS's own limit per ReceiveMessage
 #define COMMANDS_WAIT_S 1             // a long poll: every SQS server, not a sample (see take_commands)
 static char *pending[MAX_COMMANDS];
 static size_t pending_len[MAX_COMMANDS];
@@ -279,19 +283,19 @@ static int n_pending;
 static int take_some(void)
 {
     sqs_msg_t *msgs = NULL;
-    int n = 0, want = MAX_COMMANDS - n_pending;
+    int n = 0, want = MAX_COMMANDS - n_pending < RECEIVE_MAX ? MAX_COMMANDS - n_pending : RECEIVE_MAX;
     if (sqs_receive(&sqs, commands_url, want, COMMANDS_WAIT_S, 60, &msgs, &n)) {
         printf("fleet: commands: %s\n", sqs.last_error);
         return 0;
     }
-    const char *receipts[MAX_COMMANDS];
+    const char *receipts[RECEIVE_MAX];
     for (int i = 0; i < n; i++) {
         receipts[i] = msgs[i].receipt;
         pending_len[n_pending] = msgs[i].body_len;
         pending[n_pending++] = msgs[i].body;     // ours now (PSRAM)
         msgs[i].body = NULL;
     }
-    bool ok[MAX_COMMANDS];
+    bool ok[RECEIVE_MAX];
     if (n && sqs_delete_batch(&sqs, commands_url, receipts, n, ok)) printf("fleet: commands: %s\n", sqs.last_error);
     for (int i = 0; i < n; i++) sqs_msg_free(&msgs[i]);
     kw_free(msgs);
@@ -302,8 +306,8 @@ static void take_commands(void)
 {
     // A long poll, however short: a short one (wait 0) asks only a sample of SQS's servers, so the
     // five chunks of an update's URL, published together, trickled in over many phases and never
-    // completed inside ota_cmd's 60 s (14 Oct). A long poll asks them all. Then again while a
-    // receive comes back full.
+    // completed inside ota_cmd's window (14 Oct). A long poll asks them all. Then again while a
+    // receive comes back full, up to MAX_COMMANDS (CHATS-19).
     for (int got = 1; got && n_pending < MAX_COMMANDS;) {
         got = take_some();
     }

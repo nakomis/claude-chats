@@ -24,7 +24,11 @@
 #define OTA_URL_MAX 8192  // a presigned URL with an STS session token is ~1.5-3 KB
 #define OTA_VERSION_MAX 16  // "x.y.z", each part at most 4 digits
 #define OTA_SHA256_LEN 32
-#define OTA_CHUNKS_MAX_AGE_MS 60000  // a set that hasn't completed by then is dropped (CRYPT-21)
+// A set that hasn't completed by then is dropped (CRYPT-21). Kata reads Fleet's commands only between
+// passes, a couple of minutes apart, and SQS hands a set's chunks over a few at a time, so at tinycrypt's
+// 60 s a busy Kata never assembled one (CHATS-19, 21 Oct 2026). Eight minutes: inside the ten that
+// Fleet's presigned URL lasts, with time left to start the download.
+#define OTA_CHUNKS_MAX_AGE_MS 480000
 
 typedef enum
 {
