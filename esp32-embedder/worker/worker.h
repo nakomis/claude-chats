@@ -85,7 +85,7 @@ typedef struct {
 
 typedef struct {
     const char *ingest_url, *results_url;
-    const char *board, *fw, *embedder;   // kata-prod-green, 0.3.0, esp32s3-mxbai-int8-v1
+    const char *board, *fw, *embedder;   // kata-prod-kata, 0.3.0, esp32s3-mxbai-int8-v1
     const age_identity_t *identity;      // NULL: nothing decrypts (all "decrypt-failed")
     int target_tokens;                   // the planner's soft target (~150: the card-bound knee)
     size_t pool_budget;                  // bytes of bodies and results held in the pool

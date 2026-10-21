@@ -1,4 +1,4 @@
 {
-  "sandbox": ["blue", "green", "red"],
-  "prod": ["green"]
+  "sandbox": ["blue", "green", "kata", "red"],
+  "prod": ["green", "kata"]
 }

@@ -807,10 +807,10 @@ static double status_num(cJSON *j, const char *a, const char *b)
 
 static void stalls(void)
 {
-    printf("-- CHATS-17: kata-prod-green's 28 h stall, and the progress watchdog\n");
+    printf("-- CHATS-17: Kata's (then kata-prod-green) 28 h stall, and the progress watchdog\n");
     // As the board runs (README: the model leaves ~366 KB of PSRAM, a pool budget of ~47 KB), and
     // the queue holding plenty of work.
-    worker_cfg_t c = { INGEST, RESULTS, "kata-prod-green", "0.2.3", TAG, &kata_id, 150, 47 * 1024, 40 };
+    worker_cfg_t c = { INGEST, RESULTS, "kata-prod-kata", "0.2.3", TAG, &kata_id, 150, 47 * 1024, 40 };
     board_t b;
     worker_t w;
     board_init(&b, &w, &c);

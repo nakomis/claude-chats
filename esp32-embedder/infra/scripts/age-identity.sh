@@ -2,7 +2,7 @@
 # CHATS-5: give a Kata board its own age identity, the key it decrypts conversation-memory jobs with.
 # One per board (Martin, 13 Oct), so a lost board is revoked on its own. Safe to re-run.
 #
-#   infra/scripts/age-identity.sh <board>            make one if the board has none (blue, green, red…)
+#   infra/scripts/age-identity.sh <board>            make one if the board has none (blue, kata, red…)
 #   infra/scripts/age-identity.sh <board> --new      replace it (a key that may have leaked)
 #   infra/scripts/age-identity.sh <board> --revoke   remove it (a lost or retired board)
 #

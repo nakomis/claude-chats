@@ -5,7 +5,7 @@
 //   {"v":1,"kind":"embedded"|"unembedded","message_uuid":"…","envelope":{…the ingest body…},
 //    "embedder":"esp32s3-mxbai-int8-v1"|null,"vector":"<base64 of 1024 little-endian f32>"|null,
 //    "tokens":87|null,"truncated_chars":false|null,"reason":null|"claim-check"|…,
-//    "board":"kata-prod-green","fw":"0.3.0","pass":{"n_seg":3,"tokens":211,"ms":79140}|null,
+//    "board":"kata-prod-kata","fw":"0.3.0","pass":{"n_seg":3,"tokens":211,"ms":79140}|null,
 //    "ingest":{"message_id":"…","receive_count":1}}
 //
 // The envelope is the ingest message's body exactly as SQS delivered it, spliced in byte for byte:

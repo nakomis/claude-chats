@@ -17,7 +17,7 @@
   "tokens": null,
   "truncated_chars": null,
   "reason": "claim-check",
-  "board": "kata-prod-green",
+  "board": "kata-prod-kata",
   "fw": "0.3.0",
   "pass": null,
   "ingest": {
