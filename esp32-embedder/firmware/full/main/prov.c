@@ -63,6 +63,12 @@ bool prov_load(prov_t *prov)
     get_fixed(h, "role_alias", prov->role_alias, sizeof prov->role_alias, true);
     get_fixed(h, "queue_url", prov->queue_url, sizeof prov->queue_url, true);
     get_fixed(h, "results_url", prov->results_url, sizeof prov->results_url, true);
+    // CHATS-16: a list that's there but doesn't fit mustn't read as no list (the whole subnet): "!"
+    // fails statusd's parse, and statusd then refuses everyone.
+    size_t allow_len = 0;
+    if (nvs_get_str(h, "status_allow", NULL, &allow_len) == ESP_OK &&
+        !get_fixed(h, "status_allow", prov->status_allow, sizeof prov->status_allow, false))
+        strcpy(prov->status_allow, "!");
     size_t age_len = 0;
     if (nvs_get_str(h, "age_id", NULL, &age_len) == ESP_OK) prov->age_id = get_alloc(h, "age_id");
     nvs_close(h);

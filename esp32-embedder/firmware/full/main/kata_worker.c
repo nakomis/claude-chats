@@ -61,6 +61,11 @@ static bool net_ready;                  // net_setup has run: prov, sqs and the 
 static char commands_url[200];          // <thing>-commands, beside the ingest queue (CHATS-13)
 static SemaphoreHandle_t net_mx;        // one TLS session at a time: the worker's phases, ota.c's publish
 static size_t phase_big;                // the largest request or response of this phase
+// CHATS-16: statusd's view of the phases. in_phase is set under gate_mx, which statusd holds for a
+// whole reply, so a phase never starts mid-reply (a reply takes milliseconds; a phase can't wait on
+// statusd for longer than that).
+static volatile bool in_phase;
+static SemaphoreHandle_t gate_mx;
 
 // Why the chip last started (esp_reset_reason), for the heartbeat and the boot log: so a restart
 // nobody saw explains itself (CHATS-13).
@@ -112,6 +117,7 @@ static void status_extra(jbuf_t *b)
 void kata_worker_status_init(int vcore_mv)
 {
     vcore = vcore_mv;
+    gate_mx = xSemaphoreCreateMutex();
     temperature_sensor_config_t tc = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
     if (temperature_sensor_install(&tc, &tsens) != ESP_OK || temperature_sensor_enable(tsens) != ESP_OK) {
         printf("worker: no temperature sensor\n");
@@ -204,10 +210,14 @@ static int net_begin(void *ctx, char *why, size_t n)
     phase_big = 0;
     if (!net_time_ok(5000)) { snprintf(why, n, "no time from SNTP yet (SigV4 needs it)"); return -1; }
     xSemaphoreTake(net_mx, portMAX_DELAY);
+    if (gate_mx) xSemaphoreTake(gate_mx, portMAX_DELAY);   // not mid-reply (statusd)
+    in_phase = true;
+    if (gate_mx) xSemaphoreGive(gate_mx);
     heapwatch_paused(1);
     unsigned free_int = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     if (free_int < MIN_INTERNAL) {
         heapwatch_paused(0);
+        in_phase = false;
         xSemaphoreGive(net_mx);
         snprintf(why, n, "internal RAM low: %u bytes free", free_int);
         return -1;
@@ -215,7 +225,7 @@ static int net_begin(void *ctx, char *why, size_t n)
     heapwatch_creds(1);
     int rc = creds_refresh(&creds, now(NULL), prov->cred_endpoint, prov->role_alias, prov->thing_name, creds_get, NULL, why, n);
     heapwatch_creds(0);
-    if (rc < 0) { heapwatch_paused(0); xSemaphoreGive(net_mx); return -1; }
+    if (rc < 0) { heapwatch_paused(0); in_phase = false; xSemaphoreGive(net_mx); return -1; }
     if (rc == 1) printf("worker: new credentials, good until %lld\n", (long long)creds.expires);
     return 0;
 }
@@ -386,6 +396,7 @@ static void net_end(void *ctx)
     }
     heapwatch_paused(0);
     phase_end_us = esp_timer_get_time();
+    in_phase = false;
     xSemaphoreGive(net_mx);
 }
 
@@ -540,6 +551,12 @@ void kata_worker_run(const prov_t *p, bool online, bool healthy)
         }
     }
 }
+
+// ---- CHATS-16: for statusd ---------------------------------------------------------------------
+bool kata_worker_gate(int wait_ms) { return gate_mx && xSemaphoreTake(gate_mx, pdMS_TO_TICKS(wait_ms)) == pdTRUE; }
+void kata_worker_ungate(void) { xSemaphoreGive(gate_mx); }
+bool kata_worker_in_phase(void) { return in_phase; }
+const char *kata_worker_state(void) { return running ? w.state : "off"; }
 
 bool kata_worker_request_park(void)
 {

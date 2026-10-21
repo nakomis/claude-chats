@@ -33,6 +33,10 @@ void fleet_set_selftest(const char *verdict);
 void fleet_set_status_extra(void (*extra)(jbuf_t *out));
 // A heartbeat now (after a state change): it replaces the one waiting to be published.
 void fleet_status_now(void);
+// CHATS-16: the heartbeat's status, built now, into b without its closing brace (statusd.c adds its
+// own fields, then closes it). False if the status lock wasn't free within wait_ms (or Fleet never
+// started): b is untouched.
+bool fleet_status_build(jbuf_t *b, int wait_ms);
 
 // For the publisher (kata_worker.c): take what's waiting (the caller kw_frees each): the latest
 // status, or NULL, and up to max responses, oldest first. Returns how many responses.

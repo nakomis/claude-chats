@@ -21,6 +21,9 @@ typedef struct {
     char queue_url[160];              // conversation-memory's ingest queue
     char results_url[160];            // and its results queue
     char *age_id;                     // "AGE-SECRET-KEY-1...", in PSRAM; NULL if none
+    // CHATS-16: who may ask statusd for GET /json (httpreq.h's status_allow: addresses, comma-
+    // separated). Empty if not provisioned: then any peer on the board's own subnet.
+    char status_allow[80];
 } prov_t;
 
 // Reads the partition. False (and a line saying what's missing) if the board has no Wi-Fi settings;

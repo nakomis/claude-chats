@@ -26,6 +26,10 @@ void model_reclaim(void);
 
 // For the status heartbeat: "embedding", "updating", "checking" (the self-test) or "idle".
 const char *model_state(void);
+// CHATS-16: the pass in progress (an embedding, a health check or the self-test): the unit it's on
+// (0-based), how many units a pass has, and when its forward pass started (esp_timer_get_time). False
+// between passes.
+bool model_progress(int *unit, int *units, int64_t *started_us);
 
 // ---- CHATS-5: the model for the worker (kata_worker.c) ----------------------------------------
 // The tokeniser: [CLS] .. [SEP], at most max ids, truncated as Ollama does.

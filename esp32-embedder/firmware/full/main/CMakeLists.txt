@@ -1,9 +1,9 @@
 idf_component_register(
-    SRCS "full.c" "net.c" "heapwatch.c" "vcore.c" "prov.c" "fleet.c" "ota.c" "kata_worker.c" "../../../tok/tok.c" "../../../otacmd/ota_cmd.c"
+    SRCS "full.c" "net.c" "heapwatch.c" "vcore.c" "prov.c" "fleet.c" "ota.c" "kata_worker.c" "statusd.c" "../../../tok/tok.c" "../../../otacmd/ota_cmd.c"
          # CHATS-5: the worker's portable modules (host-tested in ../../../test)
          "../../../worker/kw.c" "../../../worker/sigv4.c" "../../../worker/age.c" "../../../worker/prep.c"
          "../../../worker/result.c" "../../../worker/sqs.c" "../../../worker/creds.c" "../../../worker/worker.c"
-         "../../../worker/batch.c"
+         "../../../worker/batch.c" "../../../worker/httpreq.c"
     INCLUDE_DIRS "." "../../../tok" "../../../otacmd" "../../../worker"
     PRIV_REQUIRES esp_hw_support esp_timer esp_driver_sdmmc sdmmc fatfs esp_rom esp_wifi esp_netif esp_event
                   esp_http_client mbedtls nvs_flash esp_app_format app_update json esp_driver_tsens lwip
