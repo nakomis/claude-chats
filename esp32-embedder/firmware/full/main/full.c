@@ -36,6 +36,7 @@
 #include "ota.h"
 #include "vcore.h"
 #include "kata_worker.h"
+#include "statusd.h"
 #include "kw.h"
 #include "cJSON.h"
 #include "selftest.h"
@@ -283,9 +284,17 @@ static void issue(int u)
 static int64_t t_att;
 // The pass. CHATS-5: a section CRC mismatch aborts it (the card's data can't be trusted, so neither can
 // any vector from it): -1, once the reads already queued have landed. 0 when it ran to the end.
+// CHATS-16: how far the pass in progress has got, for statusd's ETA. One store per unit (~864 a
+// pass); read from another task without a lock, which at worst mixes two adjacent units. The start
+// is 32-bit milliseconds (wrapping), so it's never read half-written.
+static volatile int prog_unit = -1;
+static volatile uint32_t prog_start_ms;
+
 static int pass_fwd(void)
 {
     int crc0 = crc_bad;
+    prog_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    prog_unit = 0;
     size_t nd = (size_t)n_tok * D;
     uint16_t *q = (uint16_t *)arena, *k = q + nd, *v = k + nd;      // fp16; o is written over q
     int8_t *h = (int8_t *)arena;                                     // FFN hidden: int8 [n][FF] ...
@@ -295,6 +304,7 @@ static int pass_fwd(void)
     issue(0);
     for (int u = 0; u < n_units; u++) {
         unit_t *t = &units[u];
+        prog_unit = u;
         int p = u & 1, mp = (t->li * 6 + t->mi) & 1, mi = t->mi;
         if (u + 1 < n_units) issue(u + 1);       // u - 1 is finished, so its buffers take u + 1's reads
         for (int i = 0; i < n_ureq[p]; i++) wait_rd(ureq[p][i]);
@@ -419,7 +429,17 @@ static bool model_buffers(void)
 }
 
 void model_pass_begin(void) { xSemaphoreTake(model_mx, portMAX_DELAY); in_pass = true; }
-void model_pass_end(void) { in_pass = false; xSemaphoreGive(model_mx); }
+void model_pass_end(void) { in_pass = false; prog_unit = -1; xSemaphoreGive(model_mx); }
+
+bool model_progress(int *unit, int *units, uint32_t *elapsed_ms)
+{
+    int u = prog_unit;
+    if (!in_pass || u < 0) return false;
+    *unit = u;
+    *units = n_units;
+    *elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000) - prog_start_ms;
+    return true;
+}
 
 bool model_lend(int timeout_ms)
 {
@@ -751,6 +771,7 @@ void app_main(void)
     if (online) {
         net_heap("wifi up");
         fleet_start(&prov);                   // the heartbeat; commands and publishes ride the phases
+        statusd_start(&prov);                 // CHATS-16: GET /json on the LAN, from now (the self-test too)
     }
     kata_worker_hello(&prov, online);         // Fleet sees this board now, not after the self-test
 

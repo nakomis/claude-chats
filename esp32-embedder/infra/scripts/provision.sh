@@ -124,15 +124,29 @@ queue_url=$(queue_param queue-url)
 results_url=$(queue_param results-queue-url)
 [ -n "$queue_url" ] && [ -n "$results_url" ] ||
     echo "no /conversation-memory/${env}/queue-url or results-queue-url: prov.bin will have no queues (deploy home-infra first)" >&2
+# CHATS-16: who may ask the board for GET /json (statusd.c): addresses, comma-separated (Leia's, for
+# kata.home.nakomis.com). Optional: without it, any peer on the board's own subnet. Only a parameter
+# that isn't there means that; any other error (an expired session, AccessDenied) stops here, so a
+# failed read never quietly opens the board to the subnet.
+if allow_out=$(aws ssm get-parameter --name "/kata/${env}/status-allow" --query Parameter.Value --output text 2>&1); then
+    status_allow=$allow_out
+elif [[ "$allow_out" == *ParameterNotFound* ]]; then
+    status_allow=
+    echo "no /kata/${env}/status-allow: the board answers GET /json to anyone on its subnet" >&2
+else
+    echo "$allow_out" >&2
+    exit 1
+fi
+unset allow_out
 
 IDF_PATH="${IDF_PATH:-$HOME/esp/esp-idf}"
 # shellcheck disable=SC1091
 . "$IDF_PATH/export.sh" > /dev/null 2>&1   # for its Python, which has the NVS partition generator
 trap 'rm -P "${dir}/prov.csv" 2> /dev/null || true' EXIT   # it holds the Wi-Fi password and age key
 prov_size=$(awk -F', *' '$1 == "prov" { print $5 }' "${fw}/partitions.csv")
-python3 - "$dir" "$endpoint" "$thing" "$cred_endpoint" "$role_alias" "$queue_url" "$results_url" <<'PY'
-import csv, os, sys
-d, endpoint, thing, cred_endpoint, role_alias, queue_url, results_url = sys.argv[1:]
+python3 - "$dir" "$endpoint" "$thing" "$cred_endpoint" "$role_alias" "$queue_url" "$results_url" "$status_allow" <<'PY'
+import csv, ipaddress, os, re, sys
+d, endpoint, thing, cred_endpoint, role_alias, queue_url, results_url, status_allow = sys.argv[1:]
 ssid, password = os.environ["KATA_SSID"], os.environ["KATA_PASSWORD"]
 age_id = os.environ["KATA_AGE_ID"]
 if age_id and (len(age_id) != 74 or not age_id.startswith("AGE-SECRET-KEY-1")):
@@ -165,6 +179,17 @@ if queue_url and results_url:
 if age_id:
     # CHATS-5: the board's age identity, to decrypt conversation-memory jobs.
     rows.append(("age_id", "data", "string", age_id))
+if status_allow:
+    # CHATS-16: as worker/httpreq.c parses it (at most 4 IPv4 addresses, prov.h's 80 bytes). A list
+    # the board can't parse makes it refuse everyone, so check it here rather than find out there.
+    addrs = [a for a in re.split(r"[ ,]+", status_allow) if a]
+    try:
+        ok = 0 < len(addrs) <= 4 and all(ipaddress.IPv4Address(a) and str(ipaddress.IPv4Address(a)) == a for a in addrs)
+    except ValueError:
+        ok = False
+    if not ok or len(status_allow) > 79:
+        sys.exit(f"/kata/.../status-allow {status_allow!r}: want 1 to 4 IPv4 addresses, comma-separated")
+    rows.append(("status_allow", "data", "string", status_allow))
 with open(os.path.join(d, "prov.csv"), "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
     w.writerow(("key", "type", "encoding", "value"))

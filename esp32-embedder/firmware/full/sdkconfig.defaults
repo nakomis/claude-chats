@@ -61,3 +61,6 @@ CONFIG_MBEDTLS_CHACHAPOLY_C=y
 CONFIG_MBEDTLS_HKDF_C=y
 # CHATS-5: the heartbeat builds Kata's status (fleet.c) in the esp_timer task
 CONFIG_ESP_TIMER_TASK_STACK_SIZE=4608
+# CHATS-16: statusd resets refused and timed-out connections (SO_LINGER 0) rather than leave a
+# TIME_WAIT pcb in internal RAM for two minutes
+CONFIG_LWIP_SO_LINGER=y

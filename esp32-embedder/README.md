@@ -319,6 +319,36 @@ Otherwise a result would land in the results DLQ after its ingest job was delete
 5. Send a ~40 KB inline job (the largest the forwarder sends) and read that phase's `worker: phase moved up to …` and `heap …` lines. The internal free and its lowest-ever point show what the biggest body costs; nothing of it should come out of internal RAM.
 6. Send a test job, encrypted to the board's key and Cal's, to the sandbox ingest queue. Check its result on the results queue: `kind: embedded`, and a vector within cos 0.999 of Ollama's for the same text. Then soak it, and compare bit for bit with a spare board.
 
+### On the LAN: GET /json (CHATS-16)
+
+A rare "is everything OK?" check, answered by the board itself rather than by its heartbeat. `https://kata.home.nakomis.com` (home-infra, HOME-513) is Leia's nginx: it checks the client certificate, terminates TLS, serves the page, and asks the board for `GET /json` over plain HTTP on the LAN. TLS on the board would cost a session's worth of internal RAM, which the SQS phases need. The board serves nothing else: no HTML, no files.
+
+`firmware/full/main/statusd.c` is one task, with its stack in PSRAM, one connection at a time and one route. The HTTP itself (routing, response heads, who may ask) is `worker/httpreq.c`, host-tested in `test/test_httpreq.c`.
+
+**What comes back.** The heartbeat's status, built at that moment (`fleet_status_build`, the same fields as `kata/<thing>/status`, which since CHATS-16 include the board's `ip` and Wi-Fi `mac`, for finding it on the LAN and reserving its address), plus a `now` object:
+
+| Field | Meaning |
+|---|---|
+| `now.state` | `sqs` during an SQS phase, otherwise the model's `idle`, `embedding`, `checking` (the self-test or a health check) or `updating` |
+| `now.model`, `now.worker` | the model's state, and the worker's (`idle`, `receiving`, `embedding`, `handing-off`, `sick`, `parked`, or `off`) |
+| `now.in_phase` | an SQS phase is under way |
+| `now.pass` | while a pass runs: `unit` of `units` (layer × matrix × row block), `elapsed_s`, and `eta_s` (elapsed scaled by the units left; the card makes units uneven, so it's rough) |
+| `now.served_at` | Unix time, once SNTP has set the clock |
+| `now.requests` | `served`, `busy` (503s) and `refused` since boot |
+| `now.build_ms` | how long the reply took to build (not to send) |
+
+**A pass pauses for it.** The task (priority 6) outranks the compute tasks (5), so a request pre-empts the pass for the milliseconds a reply takes, and the pass carries on exactly where it was. The vectors don't change.
+
+**During an SQS phase** internal RAM runs lowest (about 12.8 KB free on Green, 21 Oct 2026). Then, below 20 KB free, the reply is a 503 with `Retry-After: 5` and `{"busy":"sqs","retry_after_s":5,"internal_free":N}`: still an answer from the board, just a short one. `busy` is `sqs` almost always; `gate`, `status` or `memory` mean the phase lock, the heartbeat's lock or PSRAM wasn't free. No phase starts while a reply is being built (`kata_worker_gate`), and a phase waits at most 5 s for one before giving up that turn.
+
+One connection is served at a time, with up to four waiting. The request head must arrive within 3 s in all, however it trickles in; a peer that's refused or too slow is reset rather than closed, so it leaves no `TIME_WAIT` behind in internal RAM. `statusd` starts once Wi-Fi is up at boot: a board that boots offline doesn't serve `/json` until it's restarted.
+
+**Who may ask.** The addresses in the `prov` key `status_allow` (separated by commas or spaces, at most four; `provision.sh` writes it from SSM `/kata/{env}/status-allow`), or with no such key, any peer on the board's own subnet. Only a missing key means the subnet: a list that's there but doesn't parse (or is empty, or can't be read) refuses everyone, and `provision.sh` stops on any SSM error other than the parameter not existing. A peer that may not ask is reset without a reply. Anything but `GET /json` gets 404, 405 (`HEAD` included) or 400.
+
+```bash
+curl -s http://<board>/json | jq .now
+```
+
 ### Versioning
 
 `firmware/full/version.txt` (`x.y.z`, starting at 0.1.0) labels local builds; ESP-IDF puts it in the app descriptor, and the firmware prints it at boot. It's only a seed. In CI the version comes from the shared deployment tracker (project `kata`): one patch past sandbox's latest, or a minor or major bump with `--bump-minor` or `--bump-major` alone on a line in the PR description. A version already in the bucket is never reused; CI steps past it.

@@ -9,6 +9,8 @@
 
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -40,20 +42,41 @@ void fleet_set_status_extra(void (*extra)(jbuf_t *out)) { status_extra = extra; 
 // what BD-1 reads: retained, so IoT Core's GetRetainedMessage has the latest between heartbeats.
 // Built every FLEET_STATUS_S; only the latest waits for the publish.
 // The worker adds its own fields (status_extra: card health, passes, sick, temperature, voltage).
+// The status's fields, without the closing brace (the caller may add its own). Caller holds status_mx.
+static void build_status(jbuf_t *b)
+{
+    jb_printf(b, "{\"type\":\"status\",\"version\":\"%s\",\"state\":\"%s\",\"selftest\":\"%s\",\"uptime_s\":%lld,"
+                 "\"internal_free\":%u,\"internal_largest\":%u,\"internal_lowest\":%u,\"psram_free\":%u",
+              esp_app_get_description()->version, model_state(), selftest, (long long)(esp_timer_get_time() / 1000000),
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+              (unsigned)heapwatch_lowest(),
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    // CHATS-16: where to find the board on the LAN (statusd's GET /json), and the Wi-Fi MAC its DHCP
+    // reservation is made against
+    esp_netif_ip_info_t ip = { 0 };
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr) jb_printf(b, ",\"ip\":\"" IPSTR "\"", IP2STR(&ip.ip));
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) jb_printf(b, ",\"mac\":\"" MACSTR "\"", MAC2STR(mac));
+    if (status_extra) status_extra(b);
+}
+
+bool fleet_status_build(jbuf_t *b, int wait_ms)
+{
+    if (!status_mx || xSemaphoreTake(status_mx, pdMS_TO_TICKS(wait_ms)) != pdTRUE) return false;
+    build_status(b);
+    xSemaphoreGive(status_mx);
+    return true;
+}
+
 static void send_status(void *arg)
 {
     (void)arg;
     if (!status_mx || xSemaphoreTake(status_mx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
     jbuf_t b;                                 // PSRAM (kw.h)
     jb_init(&b);
-    jb_printf(&b, "{\"type\":\"status\",\"version\":\"%s\",\"state\":\"%s\",\"selftest\":\"%s\",\"uptime_s\":%lld,"
-                  "\"internal_free\":%u,\"internal_largest\":%u,\"internal_lowest\":%u,\"psram_free\":%u",
-              esp_app_get_description()->version, model_state(), selftest, (long long)(esp_timer_get_time() / 1000000),
-              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-              (unsigned)heapwatch_lowest(),
-              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    if (status_extra) status_extra(&b);
+    build_status(&b);
     jb_putc(&b, '}');
     if (b.oom) printf("fleet: out of memory for the status\n");
     else if (b.n > STATUS_MAX) printf("fleet: status of %u bytes is too big: not sent\n", (unsigned)b.n);

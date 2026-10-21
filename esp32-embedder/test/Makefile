@@ -16,7 +16,7 @@ CFLAGS ?= -O1 -g -std=gnu11 -Wall -Wextra -Werror $(SAN)
 INC := -I$(W) -I$(MBEDTLS)/include -I$(CJSON)
 LDLIBS := -lm
 
-TESTS := test_kw test_sigv4 test_age test_prep test_result test_sqs test_creds test_worker test_tag test_batch test_att
+TESTS := test_kw test_sigv4 test_age test_prep test_result test_sqs test_creds test_worker test_tag test_batch test_att test_httpreq
 
 all: lint $(addprefix $(B)/,$(TESTS)) $(B)/testkit
 	cd $(B) && for t in $(TESTS); do echo "== $$t"; UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$$t || exit 1; done

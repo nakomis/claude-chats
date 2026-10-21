@@ -38,3 +38,15 @@ bool kata_worker_park(int timeout_ms);
 bool kata_worker_request_park(void);
 // The update failed: back to work.
 void kata_worker_resume(void);
+
+// ---- CHATS-16: for statusd (the LAN status endpoint) ---------------------------------------------
+// Held for a whole reply: no SQS phase starts while it's held (net_begin waits on it, briefly). False
+// if it wasn't free within wait_ms.
+bool kata_worker_gate(int wait_ms);
+void kata_worker_ungate(void);
+// Is an SQS phase (TLS sessions, the internal-RAM low point) under way? Stable while gated: it can only
+// turn true under the gate.
+bool kata_worker_in_phase(void);
+// The worker's own state: worker.h's ("idle", "receiving", "embedding", "handing-off", "sick",
+// "parked"), or "off" if it never started.
+const char *kata_worker_state(void);
