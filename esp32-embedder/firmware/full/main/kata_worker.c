@@ -10,12 +10,15 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_core_dump.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 
 #include "age.h"
 #include "creds.h"
@@ -45,6 +48,9 @@ extern const char root_ca_start[] asm("_binary_AmazonRootCA1_pem_start");
 #define HTTP_TX_BUF 3072              // the request line and headers: the session token is ~1 KB
 #define GATE_WAIT_MS 5000             // CHATS-16: the longest a phase waits for statusd to finish a reply
 #define WATCHDOG_S (15 * 60)          // no step for this long: restart (nothing's lost: see worker.h)
+#define STALL_RESTART_S (60 * 60)     // CHATS-17: work held this long with no pass or hand-off: restart
+#define GUARD_FEED_S 5                // CHATS-17: the guard feeds the task watchdog this often...
+#define GUARD_STALE_S (3 * 60)        // ...while the worker's watchdog has ticked within this (it ticks every 60 s)
 
 static worker_t w;
 static volatile bool running;
@@ -62,6 +68,7 @@ static bool net_ready;                  // net_setup has run: prov, sqs and the 
 static char commands_url[200];          // <thing>-commands, beside the ingest queue (CHATS-13)
 static SemaphoreHandle_t net_mx;        // one TLS session at a time: the worker's phases, ota.c's publish
 static size_t phase_big;                // the largest request or response of this phase
+static volatile int64_t last_watchdog_us; // CHATS-17: when the worker's watchdog (esp_timer) last ran
 // CHATS-16: statusd's view of the phases. in_phase is set under gate_mx, which statusd holds for a
 // whole reply, so a phase never starts mid-reply (a reply takes milliseconds; a phase can't wait on
 // statusd for longer than that).
@@ -102,7 +109,26 @@ static void status_extra(jbuf_t *b)
     uint32_t last = 0, med = 0;
     if (running) worker_card_wait(&w, &last, &med);
     if (have_t) jb_printf(b, ",\"temp_c\":%.1f", t);
-    jb_printf(b, ",\"reset\":\"%s\"", reset_name(esp_reset_reason()));
+    esp_reset_reason_t why = esp_reset_reason();
+    jb_printf(b, ",\"reset\":\"%s\"", reset_name(why));
+    // CHATS-17: after a crash, which task and where, from the core dump it left in flash (the full dump
+    // is read off with esptool and decoded with espcoredump.py against the same build's ELF)
+    if (why == ESP_RST_PANIC || why == ESP_RST_TASK_WDT || why == ESP_RST_INT_WDT || why == ESP_RST_WDT) {
+        static esp_core_dump_summary_t crash;
+        static int have_crash = -1;              // read once: the dump doesn't change until the next crash
+        if (have_crash < 0) have_crash = esp_core_dump_image_check() == ESP_OK && esp_core_dump_get_summary(&crash) == ESP_OK;
+        // A dump with no task name is no help (and an abort's pc is always the abort): the backtrace's
+        // first frames say who called it. After a task-watchdog panic the task is whichever one the
+        // interrupt landed in, not the one that stopped feeding it.
+        if (have_crash && crash.exc_task[0]) {
+            jb_printf(b, ",\"crash\":{\"task\":\"%.16s\",\"pc\":\"0x%08lx\",\"bt\":[", crash.exc_task, (unsigned long)crash.exc_pc);
+            int n = crash.exc_bt_info.corrupted ? 0 : (int)(crash.exc_bt_info.depth < 6 ? crash.exc_bt_info.depth : 6);
+            for (int i = 0; i < n; i++) jb_printf(b, "%s\"0x%08lx\"", i ? "," : "", (unsigned long)crash.exc_bt_info.bt[i]);
+            jb_puts(b, "]}");
+        }
+    }
+    int streak = model_crash_streak();
+    if (streak) jb_printf(b, ",\"crashes_in_a_row\":%d", streak);
     jb_printf(b, ",\"vcore_mv\":%d,\"card\":{\"wait_last_s\":%.1f,\"wait_median_s\":%.1f,\"crc_mismatches\":%d,\"read_retries\":%d}",
               vcore, last / 1e3, med / 1e3, crc, retries);
     if (running) {
@@ -502,6 +528,32 @@ static void watchdog(void *arg)
         printf("worker: no step for %d minutes: restarting (every job is still on a queue)\n", WATCHDOG_S / 60);
         esp_restart();
     }
+    last_watchdog_us = esp_timer_get_time();  // the guard task's sign that the esp_timer task lives
+    // CHATS-17: the loop above can tick while the worker gets nowhere (a visibility extension that
+    // never goes through, say). Progress, not steps, is what matters.
+    int64_t stalled = worker_stalled_s(&w, now(NULL));
+    if (stalled > STALL_RESTART_S) {
+        printf("worker: no pass or hand-off for %lld minutes with work waiting: restarting (every job is still on a queue)\n",
+               (long long)(stalled / 60));
+        esp_restart();
+    }
+}
+
+// CHATS-17: the worker's watchdog is an esp_timer callback, so a wedged esp_timer task would silence it
+// (and the heartbeat). This task feeds the hardware-backed task watchdog only while that callback keeps
+// running; if it stops for GUARD_STALE_S, the task watchdog panics, and a panic reboots.
+static void guard(void *arg)
+{
+    (void)arg;
+    if (esp_task_wdt_add(NULL) != ESP_OK) {
+        printf("worker: guard: can't join the task watchdog\n");
+        for (;;) vTaskDelay(portMAX_DELAY);   // a WithCaps task shouldn't delete itself
+    }
+    for (;;) {
+        if (esp_timer_get_time() - last_watchdog_us < (int64_t)GUARD_STALE_S * 1000000) esp_task_wdt_reset();
+        else printf("worker: guard: the worker's watchdog hasn't run for %d s: letting the task watchdog reboot\n", GUARD_STALE_S);
+        vTaskDelay(pdMS_TO_TICKS(GUARD_FEED_S * 1000));
+    }
 }
 
 void kata_worker_run(const prov_t *p, bool online, bool healthy)
@@ -540,6 +592,10 @@ void kata_worker_run(const prov_t *p, bool online, bool healthy)
     esp_timer_handle_t wd;
     const esp_timer_create_args_t wa = { .callback = watchdog, .name = "worker_wd" };
     if (esp_timer_create(&wa, &wd) == ESP_OK) esp_timer_start_periodic(wd, 60ULL * 1000000);
+    last_watchdog_us = esp_timer_get_time();
+    // CHATS-17: priority 7, above the compute tasks (5) and statusd (6), so a pass can't starve it
+    if (xTaskCreatePinnedToCoreWithCaps(guard, "guard", 3072, NULL, 7, NULL, 0, MALLOC_CAP_SPIRAM) != pdPASS)
+        printf("worker: no guard task: a wedged esp_timer task would go unnoticed\n");
     for (;;) {
         // At least PHASE_GAP_S between phases, however busy the queue (a sick board forwarding a
         // backlog has no passes to space them out): each one costs a TLS handshake or two.

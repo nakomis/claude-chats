@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "esp_app_desc.h"
+#include "esp_attr.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_rom_crc.h"
@@ -94,6 +95,22 @@ static int raw_open(void)
     return 0;
 }
 
+// CHATS-17: one read, with paced retries. On 20 Oct a read timed out twice in a row (0x107) and the
+// abort halted the board for 28 h. A card that times out once usually answers after a pause: up to four
+// more tries, 10 ms to 1 s apart, before the caller gives up. Used by every read of the card.
+static esp_err_t sd_sectors(uint8_t *buf, uint32_t lba, size_t ns)
+{
+    static const int pause_ms[] = { 10, 100, 500, 1000 };
+    esp_err_t e = sdmmc_read_sectors(card, buf, lba, ns);
+    for (int t = 0; e != ESP_OK && t < (int)(sizeof pause_ms / sizeof *pause_ms); t++) {
+        read_retries++;
+        printf("SD: read at lba %lu: %s, retrying in %d ms\n", (unsigned long)lba, esp_err_to_name(e), pause_ms[t]);
+        vTaskDelay(pdMS_TO_TICKS(pause_ms[t]));
+        e = sdmmc_read_sectors(card, buf, lba, ns);
+    }
+    return e;
+}
+
 static uint32_t sd_read(void *dst, uint32_t off, size_t len, uint32_t crc)
 {
     int64_t t = esp_timer_get_time();
@@ -105,8 +122,7 @@ static uint32_t sd_read(void *dst, uint32_t off, size_t len, uint32_t crc)
         if (n > frag_off[f + 1] - off) n = frag_off[f + 1] - off;     // stop at the fragment's end
         size_t ns = (n + 511) / 512;
         uint32_t lba = frag_lba[f] + (off - frag_off[f]) / 512;
-        esp_err_t e = sdmmc_read_sectors(card, abounce[0], lba, ns);
-        if (e != ESP_OK) { read_retries++; e = sdmmc_read_sectors(card, abounce[0], lba, ns); }
+        esp_err_t e = sd_sectors(abounce[0], lba, ns);
         if (e != ESP_OK) { printf("SD: read at lba %lu failed: %s\n", (unsigned long)lba, esp_err_to_name(e)); abort(); }
         crc = esp_rom_crc32_le(crc, abounce[0], n);
         memcpy(d, abounce[0], n);
@@ -159,8 +175,7 @@ static void sd_task(void *arg)
             size_t ns = (n + 511) / 512;
             uint32_t lba = frag_lba[f] + (off - frag_off[f]) / 512;
             xSemaphoreTake(bfree[bi], portMAX_DELAY);
-            esp_err_t e = sdmmc_read_sectors(card, abounce[bi], lba, ns);
-            if (e != ESP_OK) { read_retries++; e = sdmmc_read_sectors(card, abounce[bi], lba, ns); }
+            esp_err_t e = sd_sectors(abounce[bi], lba, ns);   // CHATS-17: paced retries
             if (e != ESP_OK) { printf("SD: read at lba %lu failed: %s\n", (unsigned long)lba, esp_err_to_name(e)); abort(); }
             chunk_t c = { r, d, bi, n, first, len == n };
             xQueueSend(cq, &c, portMAX_DELAY);
@@ -725,6 +740,17 @@ int model_health(void)
     return rc || bad ? -1 : 0;
 }
 
+// CHATS-17: crashes in a row, across reboots (RTC memory survives a panic's reset, not a power cut).
+// A panic reboots; if it's the card, it would die in model_init every time, a few seconds apart, with
+// nothing reported and no way in for an update. After CRASH_LOOP_N in a row the board boots without
+// the model: Wi-Fi, Fleet, the heartbeat and /json come up and say so, and an update or a power cycle
+// (a new card) starts afresh. A self-test that passes clears the count.
+#define CRASH_LOOP_N 3
+#define CRASH_MAGIC 0x6b617461u                 // "kata": RTC memory is garbage after a power cut
+static RTC_NOINIT_ATTR uint32_t crash_magic, crash_streak;
+
+int model_crash_streak(void) { return crash_magic == CRASH_MAGIC ? (int)crash_streak : 0; }
+
 // kw.h's allocations (the worker's bodies, results and JSON) go to PSRAM
 static void *ps_alloc(size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); }
 static void *ps_realloc(void *p, size_t n) { return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM); }
@@ -756,8 +782,16 @@ void app_main(void)
     bool probation = ota_boot();
     model_mx = xSemaphoreCreateMutex();
 
+    esp_reset_reason_t rr = esp_reset_reason();
+    bool crashed = rr == ESP_RST_PANIC || rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT;
+    if (crash_magic != CRASH_MAGIC || !crashed) crash_streak = 0;
+    crash_magic = CRASH_MAGIC;
+    if (crashed) crash_streak++;
+    bool crash_loop = crash_streak >= CRASH_LOOP_N;
+    if (crash_loop) printf("%lu crashes in a row: starting without the model (see the core dump)\n", (unsigned long)crash_streak);
+
     // The model first: its 100 KB tile needs internal RAM in one piece, before Wi-Fi breaks it up.
-    model_ready = model_init() == 0;
+    model_ready = !crash_loop && model_init() == 0;
     ids = ps(512 * 4);
     if (!model_ready || !ids) printf("model not loaded: no self-test, no embedding (Fleet can still update this board)\n");
 
@@ -778,6 +812,7 @@ void app_main(void)
     // The self-test, and on probation the health check: a bad new image rolls back here.
     if (model_ready && ids) selftest_run();
     bool ok = model_ready && ids && healthy();
+    if (ok) crash_streak = 0;                // CHATS-17: the card and the model work: not a loop
     ota_health(ok);
     printf("== self-test done (%d CRC mismatches, %d tokeniser mismatches)%s ==\n", crc_bad, tok_bad,
            probation ? ", new image" : "");

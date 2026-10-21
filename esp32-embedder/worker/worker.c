@@ -341,7 +341,7 @@ static void handoff(worker_t *w)
             remove_job(w, i--);
         }
     bool *tried = kw_alloc((size_t)(w->n ? w->n : 1) * sizeof *tried);
-    if (!tried) return;
+    if (!tried) { snprintf(w->last_error, sizeof w->last_error, "out of memory for the hand-off"); return; }
     memset(tried, 0, (size_t)(w->n ? w->n : 1) * sizeof *tried);
     int sent = 0;
     for (;;) {
@@ -369,13 +369,13 @@ static void handoff(worker_t *w)
         }
     }
     kw_free(tried);
-    if (sent) w->last_handoff_at = now(w);
+    if (sent) w->progress_at = w->last_handoff_at = now(w);
 
     // Deletes, ten at a time. A refused entry is a stale receipt handle (the job was redelivered):
     // nothing to retry, and the redelivery costs a duplicate embedding and an idempotent upsert. A
     // call that fails is tried again next phase, three times in all.
     bool *att = kw_alloc((size_t)(w->n ? w->n : 1) * sizeof *att);
-    if (!att) return;
+    if (!att) { snprintf(w->last_error, sizeof w->last_error, "out of memory for the deletes"); return; }
     memset(att, 0, (size_t)(w->n ? w->n : 1) * sizeof *att);
     for (;;) {
         int idx[SQS_MAX_BATCH], k = 0;
@@ -409,7 +409,11 @@ static int visibility(worker_t *w, bool all_pending, int seconds)
 {
     int64_t t = now(w), rc_all = 0;
     bool *att = kw_alloc((size_t)(w->n ? w->n : 1) * sizeof *att);
-    if (!att) return -1;
+    if (!att) {
+        COUNT(w, visibility_failures, 1);
+        snprintf(w->last_error, sizeof w->last_error, "out of memory for the visibility extension");
+        return -1;
+    }
     memset(att, 0, (size_t)(w->n ? w->n : 1) * sizeof *att);
     for (;;) {
         int idx[SQS_MAX_BATCH], k = 0;
@@ -434,7 +438,15 @@ static int visibility(worker_t *w, bool all_pending, int seconds)
                 if (j->state == JOB_PENDING && !all_pending) j->visible_until = -1;
             }
         }
-        if (rc) { rc_all = -1; wlog(w, "worker: visibility failed: %s", w->io.sqs->last_error); break; }
+        if (rc) {
+            // Counted, and in last_error: no pass starts until an extension goes through, so a
+            // failure that persists stops the worker, and the heartbeat has to say why (CHATS-17).
+            rc_all = -1;
+            COUNT(w, visibility_failures, 1);
+            wlog(w, "worker: visibility failed: %s", w->io.sqs->last_error);
+            snprintf(w->last_error, sizeof w->last_error, "%s", w->io.sqs->last_error);
+            break;
+        }
     }
     kw_free(att);
     for (int i = w->n - 1; i >= 0; i--)
@@ -521,7 +533,13 @@ static void pass(worker_t *w)
     }
     int32_t *ids = kw_alloc(PREP_MAX_TOKENS * sizeof *ids);
     float *vecs = kw_alloc((size_t)np * RESULT_DIMS * sizeof *vecs);
-    if (!ids || !vecs) { kw_free(ids); kw_free(vecs); wlog(w, "worker: out of memory for a pass"); return; }
+    if (!ids || !vecs) {
+        kw_free(ids);
+        kw_free(vecs);
+        wlog(w, "worker: out of memory for a pass");
+        snprintf(w->last_error, sizeof w->last_error, "out of memory for a pass");
+        return;
+    }
     int seg[64], tokens = 0;
     for (int k = 0; k < np; k++) {
         job_t *j = &w->pool[pend[pick[k]]];
@@ -536,7 +554,7 @@ static void pass(worker_t *w)
     w->last_pass.tokens = tokens;
     w->last_pass.ms = info.ms;
     w->last_pass.card_wait_ms = info.card_wait_ms;
-    w->last_pass.at = now(w);
+    w->progress_at = w->last_pass.at = now(w);
     w->card_wait[w->n_card++ % WORKER_CARD_HISTORY] = info.card_wait_ms;
     COUNT(w, passes, 1);
     if (!rc) {
@@ -604,6 +622,7 @@ int worker_step(worker_t *w)
             if (w->pool[i].state == JOB_PENDING) remove_job(w, i);
         w->io.net_end(w->io.ctx);
         if (w->n == 0) {
+            w->progress_at = 0;
             w->parked = true;
             w->state = "parked";
             wlog(w, "worker: parked for an update: nothing held");
@@ -632,6 +651,10 @@ int worker_step(worker_t *w)
         for (int i = 0; i < w->n; i++)
             if (w->pool[i].state == JOB_PENDING) unembedded(w, &w->pool[i], REASON_KATA_UNHEALTHY);
     if (count_state(w, JOB_RESULT)) handoff(w);
+    // CHATS-17: the stall clock runs while there's work: jobs held, or the receive brought some
+    // (even if none could be kept). It starts when work turns up; passes and hand-offs move it on.
+    if (!w->n && !arrived) w->progress_at = 0;
+    else if (!w->progress_at) w->progress_at = now(w);
     int extended = visibility(w, false, WORKER_VISIBILITY_S);
     w->io.net_end(w->io.ctx);
     if (extended) {
@@ -681,6 +704,12 @@ void worker_card_wait(const worker_t *w, uint32_t *last_ms, uint32_t *median_ms)
     *median_ms = !n ? 0 : n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
+int64_t worker_stalled_s(const worker_t *w, int64_t t)
+{
+    int64_t since = w->progress_at;
+    return since && t > since ? t - since : 0;
+}
+
 // From another task (the heartbeat): reads only, so a count may be one step stale.
 void worker_status_json(worker_t *w, jbuf_t *b)
 {
@@ -693,9 +722,12 @@ void worker_status_json(worker_t *w, jbuf_t *b)
               w->n, w->pool_tokens, w->boot.passes, w->today.passes, w->boot.messages, w->today.messages, ub, ut);
     for (int i = 0; i < 5; i++)
         if (w->boot.unembedded[i]) jb_printf(b, ",\"%s\":%d", REASONS[i], w->boot.unembedded[i]);
-    jb_printf(b, "},\"bad_passes\":{\"boot\":%d,\"in_row\":%d},\"invalid\":%d,\"failures\":{\"phase\":%d,\"send\":%d,\"delete\":%d}",
+    jb_printf(b, "},\"bad_passes\":{\"boot\":%d,\"in_row\":%d},\"invalid\":%d,\"failures\":{\"phase\":%d,\"send\":%d,\"delete\":%d,"
+                 "\"visibility\":%d}",
               w->boot.bad_passes, w->bad_in_row, w->boot.invalid, w->boot.phase_failures, w->boot.send_failures,
-              w->boot.delete_failures);
+              w->boot.delete_failures, w->boot.visibility_failures);
+    // CHATS-17: from the clock here, not from a step, so it rises even if nothing steps the worker
+    jb_printf(b, ",\"stalled_s\":%lld", (long long)worker_stalled_s(w, now(w)));
     if (w->last_pass.at)
         jb_printf(b, ",\"last_pass\":{\"n_seg\":%d,\"tokens\":%d,\"ms\":%lu,\"card_wait_ms\":%lu,\"at\":%lld}", w->last_pass.n_seg,
                   w->last_pass.tokens, (unsigned long)w->last_pass.ms, (unsigned long)w->last_pass.card_wait_ms,
