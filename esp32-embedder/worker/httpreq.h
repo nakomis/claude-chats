@@ -33,8 +33,8 @@ size_t httpreq_head(char *out, size_t cap, int status, const char *content_type,
 // "a.b.c.d" (exactly) -> address as a host-order integer. False if malformed.
 bool httpreq_parse_ip(const char *s, size_t n, uint32_t *ip);
 // prov's status_allow: addresses separated by commas and/or spaces. Returns how many (up to max), or
-// -1 if any is malformed, or there are more than max (statusd then refuses everyone, and says why:
-// a list that didn't parse mustn't widen to the whole subnet).
+// -1 if any is malformed, there are more than max, or the string isn't empty but holds none (statusd
+// then refuses everyone, and says why: a list that didn't parse mustn't widen to the whole subnet).
 int httpreq_parse_allow(const char *s, uint32_t *out, int max);
 // Who may ask (host-order addresses). With an allow list (n_allow > 0) only those addresses; without
 // one, any peer on the board's own subnet (self & mask). Never a peer when the board has no address.

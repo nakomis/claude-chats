@@ -117,7 +117,8 @@ int httpreq_parse_allow(const char *s, uint32_t *out, int max)
         if (count == max || !httpreq_parse_ip(s + start, i - start, &out[count])) return -1;
         count++;
     }
-    return count;
+    // Something there but no address in it (",", "  "): a list, just a broken one, never "no list"
+    return n && !count ? -1 : count;
 }
 
 bool httpreq_peer_ok(uint32_t peer, uint32_t self, uint32_t mask, const uint32_t *allow, int n_allow)

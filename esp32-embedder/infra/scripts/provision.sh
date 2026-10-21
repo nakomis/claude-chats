@@ -125,9 +125,19 @@ results_url=$(queue_param results-queue-url)
 [ -n "$queue_url" ] && [ -n "$results_url" ] ||
     echo "no /conversation-memory/${env}/queue-url or results-queue-url: prov.bin will have no queues (deploy home-infra first)" >&2
 # CHATS-16: who may ask the board for GET /json (statusd.c): addresses, comma-separated (Leia's, for
-# kata.home.nakomis.com). Optional: without it, any peer on the board's own subnet.
-status_allow=$(aws ssm get-parameter --name "/kata/${env}/status-allow" --query Parameter.Value --output text 2> /dev/null || true)
-[ -n "$status_allow" ] || echo "no /kata/${env}/status-allow: the board answers GET /json to anyone on its subnet" >&2
+# kata.home.nakomis.com). Optional: without it, any peer on the board's own subnet. Only a parameter
+# that isn't there means that; any other error (an expired session, AccessDenied) stops here, so a
+# failed read never quietly opens the board to the subnet.
+if allow_out=$(aws ssm get-parameter --name "/kata/${env}/status-allow" --query Parameter.Value --output text 2>&1); then
+    status_allow=$allow_out
+elif [[ "$allow_out" == *ParameterNotFound* ]]; then
+    status_allow=
+    echo "no /kata/${env}/status-allow: the board answers GET /json to anyone on its subnet" >&2
+else
+    echo "$allow_out" >&2
+    exit 1
+fi
+unset allow_out
 
 IDF_PATH="${IDF_PATH:-$HOME/esp/esp-idf}"
 # shellcheck disable=SC1091

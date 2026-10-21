@@ -285,14 +285,15 @@ static int64_t t_att;
 // The pass. CHATS-5: a section CRC mismatch aborts it (the card's data can't be trusted, so neither can
 // any vector from it): -1, once the reads already queued have landed. 0 when it ran to the end.
 // CHATS-16: how far the pass in progress has got, for statusd's ETA. One store per unit (~864 a
-// pass); read from another task without a lock, which at worst mixes two adjacent units.
+// pass); read from another task without a lock, which at worst mixes two adjacent units. The start
+// is 32-bit milliseconds (wrapping), so it's never read half-written.
 static volatile int prog_unit = -1;
-static volatile int64_t prog_start_us;
+static volatile uint32_t prog_start_ms;
 
 static int pass_fwd(void)
 {
     int crc0 = crc_bad;
-    prog_start_us = esp_timer_get_time();
+    prog_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     prog_unit = 0;
     size_t nd = (size_t)n_tok * D;
     uint16_t *q = (uint16_t *)arena, *k = q + nd, *v = k + nd;      // fp16; o is written over q
@@ -430,13 +431,13 @@ static bool model_buffers(void)
 void model_pass_begin(void) { xSemaphoreTake(model_mx, portMAX_DELAY); in_pass = true; }
 void model_pass_end(void) { in_pass = false; prog_unit = -1; xSemaphoreGive(model_mx); }
 
-bool model_progress(int *unit, int *units, int64_t *started_us)
+bool model_progress(int *unit, int *units, uint32_t *elapsed_ms)
 {
     int u = prog_unit;
     if (!in_pass || u < 0) return false;
     *unit = u;
     *units = n_units;
-    *started_us = prog_start_us;
+    *elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000) - prog_start_ms;
     return true;
 }
 

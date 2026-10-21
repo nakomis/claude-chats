@@ -335,13 +335,15 @@ A rare "is everything OK?" check, answered by the board itself rather than by it
 | `now.pass` | while a pass runs: `unit` of `units` (layer × matrix × row block), `elapsed_s`, and `eta_s` (elapsed scaled by the units left; the card makes units uneven, so it's rough) |
 | `now.served_at` | Unix time, once SNTP has set the clock |
 | `now.requests` | `served`, `busy` (503s) and `refused` since boot |
-| `now.build_ms` | how long the reply took to build |
+| `now.build_ms` | how long the reply took to build (not to send) |
 
 **A pass pauses for it.** The task (priority 6) outranks the compute tasks (5), so a request pre-empts the pass for the milliseconds a reply takes, and the pass carries on exactly where it was. The vectors don't change.
 
-**During an SQS phase** internal RAM runs lowest (about 12.8 KB free on Green, 21 Oct 2026). Then, below 20 KB free, the reply is a 503 with `Retry-After: 5` and `{"busy":"sqs","retry_after_s":5,"internal_free":N}`: still an answer from the board, just a short one. No phase starts while a reply is being built (`kata_worker_gate`).
+**During an SQS phase** internal RAM runs lowest (about 12.8 KB free on Green, 21 Oct 2026). Then, below 20 KB free, the reply is a 503 with `Retry-After: 5` and `{"busy":"sqs","retry_after_s":5,"internal_free":N}`: still an answer from the board, just a short one. `busy` is `sqs` almost always; `gate`, `status` or `memory` mean the phase lock, the heartbeat's lock or PSRAM wasn't free. No phase starts while a reply is being built (`kata_worker_gate`), and a phase waits at most 5 s for one before giving up that turn.
 
-**Who may ask.** The addresses in the `prov` key `status_allow` (comma-separated, at most four; `provision.sh` writes it from SSM `/kata/{env}/status-allow` if that exists), or with none provisioned, any peer on the board's own subnet. A list that's there but doesn't parse refuses everyone. A peer that may not ask is closed on without a reply. Anything but `GET /json` gets 404, 405 or 400.
+One connection is served at a time, with up to four waiting. The request head must arrive within 3 s in all, however it trickles in; a peer that's refused or too slow is reset rather than closed, so it leaves no `TIME_WAIT` behind in internal RAM. `statusd` starts once Wi-Fi is up at boot: a board that boots offline doesn't serve `/json` until it's restarted.
+
+**Who may ask.** The addresses in the `prov` key `status_allow` (separated by commas or spaces, at most four; `provision.sh` writes it from SSM `/kata/{env}/status-allow`), or with no such key, any peer on the board's own subnet. Only a missing key means the subnet: a list that's there but doesn't parse (or is empty, or can't be read) refuses everyone, and `provision.sh` stops on any SSM error other than the parameter not existing. A peer that may not ask is reset without a reply. Anything but `GET /json` gets 404, 405 (`HEAD` included) or 400.
 
 ```bash
 curl -s http://<board>/json | jq .now

@@ -27,7 +27,9 @@
 #define STATUSD_CORE 0                   // away from lwIP's tcpip task (core 1)
 #define STATUSD_MIN_INTERNAL (20 * 1024) // mid-phase, below this free a 503 (the phase's low is ~12.8 KB)
 #define STATUSD_RETRY_S 5
-#define IO_TIMEOUT_S 2
+#define HEAD_DEADLINE_MS 3000      // the whole request head, however it trickles in
+#define SEND_TIMEOUT_S 2
+#define BACKLOG 4                  // waiting connections: a few pcbs, so two viewers don't look like a dead board
 
 static uint32_t allow[HTTPREQ_MAX_ALLOW];
 static int n_allow;                      // -1: status_allow didn't parse, so nobody may ask
@@ -71,9 +73,9 @@ static void now_json(jbuf_t *b, int64_t t0)
     time_t t = time(NULL);
     if (t > 1700000000) jb_printf(b, ",\"served_at\":%lld", (long long)t);   // once SNTP has set the clock
     int unit, units;
-    int64_t started;
-    if (model_progress(&unit, &units, &started)) {
-        double elapsed = (double)(t0 - started) / 1e6;
+    uint32_t elapsed_ms;
+    if (model_progress(&unit, &units, &elapsed_ms)) {
+        double elapsed = elapsed_ms / 1e3;
         jb_printf(b, ",\"pass\":{\"unit\":%d,\"units\":%d,\"elapsed_s\":%.1f", unit, units, elapsed);
         if (unit > 0) jb_printf(b, ",\"eta_s\":%.0f", elapsed * (units - unit) / unit);
         jb_putc(b, '}');
@@ -104,11 +106,22 @@ static void serve_json(int s)
             } else {
                 served++;
                 reply(s, 200, "application/json", b.p, b.n, 0);
+                if (served == 1)   // how deep the status build goes (the stack is a guess)
+                    printf("statusd: first reply, %u bytes; stack high-water mark %u bytes free\n", (unsigned)b.n,
+                           (unsigned)uxTaskGetStackHighWaterMark(NULL));
             }
         }
         jb_free(&b);
     }
     kata_worker_ungate();
+}
+
+// Closes with a reset rather than a FIN: no TIME_WAIT pcb (2 minutes of internal RAM) for a peer
+// that's been refused or has gone quiet.
+static void drop(int s)
+{
+    struct linger l = { .l_onoff = 1, .l_linger = 0 };
+    setsockopt(s, SOL_SOCKET, SO_LINGER, &l, sizeof l);
 }
 
 static void handle(int s, uint32_t peer)
@@ -118,13 +131,21 @@ static void handle(int s, uint32_t peer)
     if (sta) esp_netif_get_ip_info(sta, &ip);
     if (n_allow < 0 || !httpreq_peer_ok(peer, ntohl(ip.ip.addr), ntohl(ip.netmask.addr), allow, n_allow)) {
         refused++;
-        return;                                       // closed without a word
+        drop(s);                                      // closed without a word
+        return;
     }
+    // The whole head within HEAD_DEADLINE_MS, not each recv: a byte every second would otherwise hold
+    // the one connection for half an hour.
+    int64_t deadline = esp_timer_get_time() + HEAD_DEADLINE_MS * 1000LL;
     size_t n = 0;
     httpreq_route_t r = HTTPREQ_INCOMPLETE;
     while (r == HTTPREQ_INCOMPLETE) {
+        int64_t left_us = deadline - esp_timer_get_time();
+        if (left_us <= 0) { drop(s); return; }
+        struct timeval tv = { .tv_sec = left_us / 1000000, .tv_usec = left_us % 1000000 };
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         int got = recv(s, rx + n, HTTPREQ_MAX_HEAD - n, 0);
-        if (got <= 0) return;                         // gone, or the 2 s timeout
+        if (got <= 0) { drop(s); return; }            // gone, or out of time
         n += (size_t)got;
         r = httpreq_route(rx, n);
     }
@@ -146,8 +167,9 @@ static void statusd_task(void *arg)
         struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(STATUSD_PORT), .sin_addr.s_addr = htonl(INADDR_ANY) };
         int on = 1;
         if (ls < 0 || setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on) || bind(ls, (struct sockaddr *)&a, sizeof a) ||
-            listen(ls, 1)) {
-            printf("statusd: can't listen on port %d (errno %d): trying again in a minute\n", STATUSD_PORT, errno);
+            listen(ls, BACKLOG)) {
+            int e = errno;
+            printf("statusd: can't listen on port %d (errno %d): trying again in a minute\n", STATUSD_PORT, e);
             if (ls >= 0) close(ls);
             vTaskDelay(pdMS_TO_TICKS(60000));
             continue;
@@ -158,15 +180,16 @@ static void statusd_task(void *arg)
             struct sockaddr_in peer;
             socklen_t pl = sizeof peer;
             int s = accept(ls, (struct sockaddr *)&peer, &pl);
-            if (s < 0) break;                         // the listener's gone bad: make a new one
-            struct timeval tv = { .tv_sec = IO_TIMEOUT_S };
-            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            if (s < 0) {                              // the listener's gone bad: make a new one
+                int e = errno;
+                printf("statusd: accept failed (errno %d): listening again\n", e);
+                break;
+            }
+            struct timeval tv = { .tv_sec = SEND_TIMEOUT_S };
             setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
             handle(s, ntohl(peer.sin_addr.s_addr));
-            shutdown(s, SHUT_RDWR);
-            close(s);
+            close(s);                                 // a plain close: SHUT_RD could turn it into a reset mid-reply
         }
-        printf("statusd: accept failed (errno %d): listening again\n", errno);
         close(ls);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

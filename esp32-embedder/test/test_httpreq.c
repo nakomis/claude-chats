@@ -95,6 +95,11 @@ static void test_ip(void)
     CHECK(httpreq_parse_allow(" 172.29.0.32, 172.29.0.15 ,", a, HTTPREQ_MAX_ALLOW) == 2 && a[1] == ip("172.29.0.15"),
           "two, with spaces and a trailing comma");
     CHECK(httpreq_parse_allow("172.29.0.32,leia", a, HTTPREQ_MAX_ALLOW) == -1, "a name, not an address");
+    // There, but empty of addresses: broken, not absent (absent would open it to the whole subnet)
+    CHECK(httpreq_parse_allow(",", a, HTTPREQ_MAX_ALLOW) == -1, "a lone comma");
+    CHECK(httpreq_parse_allow(" ", a, HTTPREQ_MAX_ALLOW) == -1, "a space");
+    CHECK(httpreq_parse_allow(",, ,", a, HTTPREQ_MAX_ALLOW) == -1, "separators only");
+    CHECK(httpreq_parse_allow("172.29.0.32\t", a, HTTPREQ_MAX_ALLOW) == -1, "a tab isn't a separator");
     CHECK(httpreq_parse_allow("1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4,5.5.5.5", a, HTTPREQ_MAX_ALLOW) == -1, "too many");
 }
 

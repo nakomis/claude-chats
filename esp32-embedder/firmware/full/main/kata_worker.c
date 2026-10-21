@@ -43,6 +43,7 @@ extern const char root_ca_start[] asm("_binary_AmazonRootCA1_pem_start");
 #define HTTP_TIMEOUT_MS 30000         // longer than SQS's 20 s long poll
 #define HTTP_RX_BUF 2048              // internal RAM, only while a phase runs
 #define HTTP_TX_BUF 3072              // the request line and headers: the session token is ~1 KB
+#define GATE_WAIT_MS 5000             // CHATS-16: the longest a phase waits for statusd to finish a reply
 #define WATCHDOG_S (15 * 60)          // no step for this long: restart (nothing's lost: see worker.h)
 
 static worker_t w;
@@ -210,7 +211,13 @@ static int net_begin(void *ctx, char *why, size_t n)
     phase_big = 0;
     if (!net_time_ok(5000)) { snprintf(why, n, "no time from SNTP yet (SigV4 needs it)"); return -1; }
     xSemaphoreTake(net_mx, portMAX_DELAY);
-    if (gate_mx) xSemaphoreTake(gate_mx, portMAX_DELAY);   // not mid-reply (statusd)
+    // Not mid-reply (statusd). A reply takes milliseconds; one that hasn't finished in GATE_WAIT_MS
+    // is stuck, and costs this phase, not the worker.
+    if (gate_mx && xSemaphoreTake(gate_mx, pdMS_TO_TICKS(GATE_WAIT_MS)) != pdTRUE) {
+        xSemaphoreGive(net_mx);
+        snprintf(why, n, "statusd still replying after %d ms", GATE_WAIT_MS);
+        return -1;
+    }
     in_phase = true;
     if (gate_mx) xSemaphoreGive(gate_mx);
     heapwatch_paused(1);
