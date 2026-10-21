@@ -52,6 +52,9 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
 # boot loop may not), and on 20 Oct 2026 one SD timeout's abort() left kata-prod-green halted for 28 h
 # until her power was cut. The core dump still goes to flash first, and the next heartbeat names it.
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+# ...after 30 s, so a crash that recurs at once (a dead card) can't churn the core dump's flash every
+# few seconds; after three in a row full.c boots without the model and reports instead
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=30
 # CHATS-10: tinycrypt's OTA groundwork, ahead of Fleet. Two app slots (partitions.csv), and a new
 # image that fails before it's marked valid is rolled back by the bootloader. Images are signed
 # (RSA-3072, the secure boot v2 scheme) outside the build (sign.sh locally, tools/ci-publish.sh in

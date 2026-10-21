@@ -117,9 +117,18 @@ static void status_extra(jbuf_t *b)
         static esp_core_dump_summary_t crash;
         static int have_crash = -1;              // read once: the dump doesn't change until the next crash
         if (have_crash < 0) have_crash = esp_core_dump_image_check() == ESP_OK && esp_core_dump_get_summary(&crash) == ESP_OK;
-        if (have_crash)
-            jb_printf(b, ",\"crash\":{\"task\":\"%.16s\",\"pc\":\"0x%08lx\"}", crash.exc_task, (unsigned long)crash.exc_pc);
+        // A dump with no task name is no help (and an abort's pc is always the abort): the backtrace's
+        // first frames say who called it. After a task-watchdog panic the task is whichever one the
+        // interrupt landed in, not the one that stopped feeding it.
+        if (have_crash && crash.exc_task[0]) {
+            jb_printf(b, ",\"crash\":{\"task\":\"%.16s\",\"pc\":\"0x%08lx\",\"bt\":[", crash.exc_task, (unsigned long)crash.exc_pc);
+            int n = crash.exc_bt_info.corrupted ? 0 : (int)(crash.exc_bt_info.depth < 6 ? crash.exc_bt_info.depth : 6);
+            for (int i = 0; i < n; i++) jb_printf(b, "%s\"0x%08lx\"", i ? "," : "", (unsigned long)crash.exc_bt_info.bt[i]);
+            jb_puts(b, "]}");
+        }
     }
+    int streak = model_crash_streak();
+    if (streak) jb_printf(b, ",\"crashes_in_a_row\":%d", streak);
     jb_printf(b, ",\"vcore_mv\":%d,\"card\":{\"wait_last_s\":%.1f,\"wait_median_s\":%.1f,\"crc_mismatches\":%d,\"read_retries\":%d}",
               vcore, last / 1e3, med / 1e3, crc, retries);
     if (running) {
@@ -538,7 +547,7 @@ static void guard(void *arg)
     (void)arg;
     if (esp_task_wdt_add(NULL) != ESP_OK) {
         printf("worker: guard: can't join the task watchdog\n");
-        vTaskDelete(NULL);
+        for (;;) vTaskDelay(portMAX_DELAY);   // a WithCaps task shouldn't delete itself
     }
     for (;;) {
         if (esp_timer_get_time() - last_watchdog_us < (int64_t)GUARD_STALE_S * 1000000) esp_task_wdt_reset();
