@@ -24,6 +24,11 @@ typedef struct {
     // CHATS-16: who may ask statusd for GET /json (httpreq.h's status_allow: addresses, comma-
     // separated). Empty if not provisioned: then any peer on the board's own subnet.
     char status_allow[80];
+    // CHATS-20: where Kata pushes her metrics (metrics.c): vmauth on Cal, basic auth as her own user.
+    // Empty url: no metrics (provision.sh writes none with METRICS_URL=none, or if the password can't be read).
+    char metrics_url[128];
+    char metrics_user[48];
+    char metrics_pass[65];
 } prov_t;
 
 // Reads the partition. False (and a line saying what's missing) if the board has no Wi-Fi settings;

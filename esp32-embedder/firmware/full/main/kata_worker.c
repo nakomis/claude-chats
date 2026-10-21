@@ -141,6 +141,21 @@ static void status_extra(jbuf_t *b)
     }
 }
 
+// CHATS-20: the same worker numbers for metrics.c (the metrics task; racy reads, as the heartbeat's).
+void kata_worker_metrics(kata_worker_metrics_t *m)
+{
+    memset(m, 0, sizeof *m);
+    m->vcore_mv = vcore;
+    m->have_temp = tsens && temperature_sensor_get_celsius(tsens, &m->temp_c) == ESP_OK;
+    m->running = running;
+    if (!running) return;
+    m->sick = w.sick;
+    m->messages_boot = w.boot.messages;
+    m->messages_today = w.today.messages;
+    worker_card_wait(&w, &m->card_wait_last_ms, &m->card_wait_median_ms);
+    m->stalled_s = (int)worker_stalled_s(&w, (int64_t)time(NULL));
+}
+
 void kata_worker_status_init(int vcore_mv)
 {
     vcore = vcore_mv;

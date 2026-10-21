@@ -36,6 +36,7 @@ static int out_n;
 static portMUX_TYPE out_lock = portMUX_INITIALIZER_UNLOCKED;
 
 void fleet_set_selftest(const char *verdict) { selftest = verdict; }
+const char *fleet_selftest(void) { return selftest; }
 void fleet_set_status_extra(void (*extra)(jbuf_t *out)) { status_extra = extra; }
 
 // The heartbeat (esp_timer task): what Fleet shows as the board's status, and (CHATS-5, HOME-441)

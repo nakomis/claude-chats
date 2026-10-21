@@ -21,6 +21,14 @@
 #              firmware/full/flash.sh writes it alongside the app; none of it is in the firmware
 #              image, so every board runs the same (published) image.
 #
+# Metrics (CHATS-20): the board pushes its health to the house VictoriaMetrics through vmauth on Cal
+# (HOME-437). METRICS_URL (default http://172.29.0.33:8427; "none" for no metrics). vmauth has a user
+# per device, named METRICS_USER (default: the Thing; "kata-prod-kata" while the board is still
+# provisioned as kata-prod-green), whose password is SSM /vmauth/device-<user>-password (read via
+# METRICS_PROFILE, default nakom.is-prod, where vmauth's credentials live). vmauth pins host_name to the
+# user, so a leaked password can only write metrics as this board. If the password can't be read, the
+# board is provisioned without metrics (a warning, not a failure). Firmware: main/metrics.c.
+#
 # INSECURE: the private key is made here and flashed in plain text, and the Wi-Fi password and the
 # age identity sit in prov.bin and the board's flash. Anyone holding the board can read all three.
 #
@@ -138,6 +146,15 @@ else
     exit 1
 fi
 unset allow_out
+# CHATS-20: metrics (see the top). Through the environment, so the password never shows up in `ps`.
+export KATA_METRICS_URL=${METRICS_URL:-http://172.29.0.33:8427} KATA_METRICS_USER=${METRICS_USER:-$thing} KATA_METRICS_PASS=
+if [ "$KATA_METRICS_URL" = none ]; then
+    KATA_METRICS_URL=
+elif ! KATA_METRICS_PASS=$(aws ssm get-parameter --profile "${METRICS_PROFILE:-nakom.is-prod}" \
+        --name "/vmauth/device-${KATA_METRICS_USER}-password" --with-decryption --query Parameter.Value --output text 2> /dev/null); then
+    echo "warning: can't read /vmauth/device-${KATA_METRICS_USER}-password (profile ${METRICS_PROFILE:-nakom.is-prod}): no metrics for ${thing}" >&2
+    KATA_METRICS_URL= KATA_METRICS_PASS=
+fi
 
 IDF_PATH="${IDF_PATH:-$HOME/esp/esp-idf}"
 # shellcheck disable=SC1091
@@ -190,6 +207,13 @@ if status_allow:
     if not ok or len(status_allow) > 79:
         sys.exit(f"/kata/.../status-allow {status_allow!r}: want 1 to 4 IPv4 addresses, comma-separated")
     rows.append(("status_allow", "data", "string", status_allow))
+# CHATS-20: metrics to vmauth, sizes as prov.h's.
+if os.environ["KATA_METRICS_URL"]:
+    murl, muser, mpass = os.environ["KATA_METRICS_URL"], os.environ["KATA_METRICS_USER"], os.environ["KATA_METRICS_PASS"]
+    if len(murl.encode()) > 127 or len(muser.encode()) > 47 or len(mpass.encode()) > 64:
+        sys.exit("metrics URL, user or password too long for prov.h (127 / 47 / 64 bytes)")
+    rows += [("metrics_url", "data", "string", murl), ("metrics_user", "data", "string", muser),
+             ("metrics_pass", "data", "string", mpass)]
 with open(os.path.join(d, "prov.csv"), "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
     w.writerow(("key", "type", "encoding", "value"))

@@ -28,6 +28,7 @@ bool fleet_start(const prov_t *prov);
 bool fleet_respond(const char *json);
 // The self-test's verdict, for the heartbeat: "bit-exact", "cos", "failed" or "not run".
 void fleet_set_selftest(const char *verdict);
+const char *fleet_selftest(void);
 
 // CHATS-5: the worker's fields, appended to every heartbeat (",\"key\":value..." into out).
 void fleet_set_status_extra(void (*extra)(jbuf_t *out));

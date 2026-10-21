@@ -71,6 +71,10 @@ bool prov_load(prov_t *prov)
     if (ae != ESP_ERR_NVS_NOT_FOUND &&
         (ae != ESP_OK || !get_fixed(h, "status_allow", prov->status_allow, sizeof prov->status_allow, false)))
         strcpy(prov->status_allow, "!");
+    // CHATS-20: all optional: without a URL, no metrics
+    get_fixed(h, "metrics_url", prov->metrics_url, sizeof prov->metrics_url, true);
+    get_fixed(h, "metrics_user", prov->metrics_user, sizeof prov->metrics_user, true);
+    get_fixed(h, "metrics_pass", prov->metrics_pass, sizeof prov->metrics_pass, true);
     size_t age_len = 0;
     if (nvs_get_str(h, "age_id", NULL, &age_len) == ESP_OK) prov->age_id = get_alloc(h, "age_id");
     nvs_close(h);
