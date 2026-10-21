@@ -20,8 +20,11 @@
 // stack is in PSRAM and the line is built on it. The POST runs under kata_worker_gate, as statusd's
 // replies do, so no phase starts while the HTTP client holds its few KB of internal RAM; a minute
 // with a phase under way (or an update, or little internal RAM free) is skipped, not queued. A failed
-// POST is dropped, not retried, with one log line per run of failures. Every call times out in 3 s,
-// so a dead vmauth can't hold the gate for long.
+// POST is dropped, not retried, with one log line per run of failures. Each step times out in 1.5 s,
+// so a dead vmauth can't hold the gate past the 5 s a phase waits for it (net_begin).
+//
+// Each POST is a new connection, and Kata closes first, so a TIME_WAIT pcb sits in internal RAM for
+// two minutes: one or two at a time, a few hundred bytes. SO_LINGER (on, for statusd) would make it an RST.
 #include "metrics.h"
 
 #include <inttypes.h>
@@ -52,7 +55,7 @@
 #define METRICS_CORE 0                   // away from lwIP's tcpip task (core 1)
 #define MIN_INTERNAL (24 * 1024)         // free internal RAM to start a POST (a phase's low is ~12.8 KB)
 #define GATE_WAIT_MS 200                 // a phase in progress holds the gate: skip the minute, don't wait
-#define TIMEOUT_MS 3000
+#define TIMEOUT_MS 1500                  // per connect/write/read: their sum stays under net_begin's 5 s gate wait
 
 static const prov_t *prov;
 static char url[sizeof(((prov_t *)0)->metrics_url) + 8];
@@ -111,8 +114,9 @@ static int build_line(char *out, size_t cap)
     FIELD("crashes_in_a_row", model_crash_streak());
     FIELD("messages_total", m.messages_boot);
     FIELD("messages_today", m.messages_today);
+    // "cos" passes too: the NOT VERIFIED fallback for a build whose CRCs aren't recorded yet.
     FIELD("selftest_ok", !strcmp(st, "bit-exact") || !strcmp(st, "cos"));
-    FIELD("model_ready", strcmp(model_state(), "updating") != 0);
+    FIELD("model_ready", model_loaded());
 #undef FIELD
     return metrics_line(out, cap, "kata", prov->thing_name, esp_app_get_description()->version, f, n);
 }

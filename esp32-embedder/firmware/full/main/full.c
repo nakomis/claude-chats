@@ -751,6 +751,7 @@ int model_health(void)
 static RTC_NOINIT_ATTR uint32_t crash_magic, crash_streak;
 
 int model_crash_streak(void) { return crash_magic == CRASH_MAGIC ? (int)crash_streak : 0; }
+bool model_loaded(void) { return model_ready && !model_lent; }
 
 // kw.h's allocations (the worker's bodies, results and JSON) go to PSRAM
 static void *ps_alloc(size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); }
