@@ -36,6 +36,8 @@ Deduplication happens locally, because the hook re-reads the whole transcript on
 
 A message sent while Claude is still working isn't written as a message at all. Claude Code records it as a `queued_command` attachment, and until HOME-411 the hook dropped it, pictures and all. It is now captured like any other message. So that rows already delivered keep their numbers, it shares the `sequence_num` of the message before it, and `created_at` settles the order. `scripts/backfill-mid-turn.py` recovers the ones missed before the fix; run it on each Mac.
 
+Each row's `author` (`martin`, `claude` or `tool`) comes from the transcript's structure, not its text: see `classify_author`. Rows captured before that existed say `unknown`. `scripts/backfill-authors.py` sets them from whatever transcripts survive, including ones restored from Time Machine, and from `role` for assistant rows; it prints SQL to review and pipe into Postgres on Luke.
+
 ### Delivery — the ingest hop (lives in `home-infra`)
 
 This half is **not in this repository**. It lives in [`nakomis/home-infra`](https://github.com/nakomis/home-infra), whose `docs/architecture/conversation-memory.drawio` is the authoritative topology; the diagram above shows only enough of it to make sense of the ends.
