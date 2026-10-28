@@ -10,7 +10,7 @@ Embedding provider is configured via CLAUDE_CHATS_PROVIDER — see embed.py.
 import calendar
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -19,6 +19,13 @@ from mcp.server.fastmcp import FastMCP
 from conversation_memory_mcp.embed import get_embedding
 
 DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
+
+# Where recall_facts reads from (CHATS-26). Unset means the same database as
+# everything else. CHATS-29 adds a read replica of the facts tables; pointing
+# this at it moves the facts queries there without touching the other tools,
+# and an unreachable replica falls back to DB_URL rather than failing recall.
+READ_DB_URL = os.environ.get("CLAUDE_CHATS_READ_DB_URL") or None
+READ_CONNECT_TIMEOUT = 3  # seconds; a dead replica must not stall a recall
 
 CONTEXT_WINDOW = 2  # messages either side of a search hit
 
@@ -91,6 +98,18 @@ def _vec(embedding: list[float]) -> str:
 
 def _conn():
     return psycopg.connect(DB_URL)
+
+
+def _facts_conn() -> tuple[psycopg.Connection, str]:
+    """A connection for facts reads, and which side it is: "replica" when
+    CLAUDE_CHATS_READ_DB_URL is set and answers, otherwise "primary". A replica
+    that is down or refusing us is not an error: the primary has the same rows."""
+    if READ_DB_URL:
+        try:
+            return psycopg.connect(READ_DB_URL, connect_timeout=READ_CONNECT_TIMEOUT), "replica"
+        except psycopg.Error:
+            pass
+    return psycopg.connect(DB_URL), "primary"
 
 
 def _aware_utc(ts: datetime) -> datetime:
@@ -589,6 +608,356 @@ def _query_hybrid(cur, vec: str, query: str, where: str, where_params: list,
               query, *where_params, candidates, limit]
     cur.execute(sql, params)
     return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Facts (CHATS-26)
+# ---------------------------------------------------------------------------
+
+# Half-life, in days, by fact kind: how long until a fact of that kind is only
+# half as likely to still hold, measured from last_confirmed. None means the
+# fact never decays (an event happened; that does not stop being true). These
+# are hand-picked starting values — the one place to swap in learned ones.
+FACT_HALF_LIFE_DAYS: dict[str, float | None] = {
+    "identity":  365.25 * 10,    # who or what something is
+    "config":    365.25 * 0.75,  # how something is set up (9 months)
+    "situation": 14.0,           # what is going on at the moment
+    "event":     None,           # something that happened
+}
+
+DEFAULT_FACT_LIMIT = 10
+MAX_FACT_LIMIT = 50
+
+# How many candidates each half of the hybrid search contributes per result
+# asked for. Decay is applied after fusion, so the pool has to be wider than
+# `limit` or a stale-but-relevant fact could crowd out a fresher one.
+FACT_CANDIDATE_FACTOR = 10
+
+
+def decay_factor(kind: str, last_confirmed: datetime, now: datetime | None = None) -> float:
+    """2^(-age / half_life) for a fact of this kind, age from last_confirmed.
+
+    1.0 for kinds that never decay and for a last_confirmed in the future
+    (clock skew between machines must not push a score above its relevance).
+    """
+    half_life = FACT_HALF_LIFE_DAYS[kind]
+    if half_life is None:
+        return 1.0
+    now = now or datetime.now(timezone.utc)
+    age_days = max(0.0, (now - _aware_utc(last_confirmed)).total_seconds() / 86400)
+    return 2.0 ** (-age_days / half_life)
+
+
+def _short_date(ts: datetime) -> str:
+    """'27 Sep 2026', in the operator's local zone."""
+    local = _aware_utc(ts).astimezone(LOCAL_TZ)
+    return f"{local.day} {local.strftime('%b %Y')}"
+
+
+def fact_age_phrase(observed_at: datetime, last_confirmed: datetime) -> str:
+    """'stated 27 Sep 2026, confirmed 3 Oct 2026' — or 'not re-confirmed since'
+    when it was last confirmed the day it was stated."""
+    stated = _short_date(observed_at)
+    confirmed = _short_date(last_confirmed)
+    if confirmed == stated:
+        return f"stated {stated}, not re-confirmed since"
+    return f"stated {stated}, confirmed {confirmed}"
+
+
+def fact_labels(*, valid_to: datetime | None, expected_until: date | None,
+                temporary: bool, now: datetime | None = None) -> list[str]:
+    """The flags a reader should see next to a fact's text. 'possibly resolved'
+    is for a fact whose expected end has passed and which nothing has since
+    superseded — it may well still hold, but nobody has said so."""
+    now = now or datetime.now(timezone.utc)
+    labels = []
+    if valid_to is not None:
+        labels.append("superseded")
+    if temporary:
+        labels.append("temporary")
+    if (valid_to is None and expected_until is not None
+            and expected_until < now.astimezone(LOCAL_TZ).date()):
+        labels.append("possibly resolved")
+    return labels
+
+
+def _fact_filters(since: datetime | None, host: str | None, project_path: str | None,
+                  kind: str | None, include_history: bool) -> tuple[str, list]:
+    """The WHERE additions shared by both halves of the facts search, as a SQL
+    fragment plus its parameters in order (f = facts, c = conversations). Always
+    excludes soft-deleted rows; excludes superseded ones unless history is asked
+    for. Facts from docs and playbooks have no conversation, so they never match
+    a project_path."""
+    frag, params = "\n        AND f.deleted_at IS NULL", []
+    if not include_history:
+        frag += "\n        AND f.valid_to IS NULL"
+    if since is not None:
+        frag += "\n        AND f.last_confirmed >= %s"
+        params.append(since)
+    if host:
+        # The fact's own host, else its conversation's.
+        frag += "\n        AND COALESCE(f.host, c.host) = %s"
+        params.append(host)
+    if project_path:
+        frag += "\n        AND c.project_path = %s"
+        params.append(project_path)
+    if kind:
+        frag += "\n        AND f.kind = %s"
+        params.append(kind)
+    return frag, params
+
+
+_FACT_COLUMNS = """f.id, f.text, f.kind, f.subject, f.attribute, f.observed_at,
+               f.last_confirmed, f.valid_to, f.temporary, f.expected_until,
+               f.first_seq, f.last_seq, f.source, COALESCE(f.host, c.host),
+               c.session_id, c.name, c.ai_title, c.project_path,
+               sf.text, sf.observed_at"""
+
+
+def _facts_sql(with_vector: bool, where: str) -> str:
+    """The recall query: RRF over a vector ranking and a full-text ranking (the
+    same fusion as search_memory), then the columns recall presents. With
+    with_vector=False only the full-text half runs."""
+    ctes = []
+    if with_vector:
+        ctes.append(f"""semantic AS (
+            SELECT f.id,
+                   ROW_NUMBER() OVER (ORDER BY f.embedding <=> %s::vector) AS rank
+            FROM   facts f
+            LEFT JOIN conversations c ON c.id = f.conversation_id
+            WHERE  f.embedding IS NOT NULL{where}
+            ORDER  BY f.embedding <=> %s::vector
+            LIMIT  %s
+        )""")
+    ctes.append(f"""fulltext AS (
+            SELECT f.id,
+                   ROW_NUMBER() OVER (ORDER BY ts_rank_cd(f.text_tsv, q) DESC) AS rank
+            FROM   facts f
+            LEFT JOIN conversations c ON c.id = f.conversation_id,
+                   websearch_to_tsquery('english', %s) AS q
+            WHERE  f.text_tsv @@ q{where}
+            ORDER  BY ts_rank_cd(f.text_tsv, q) DESC
+            LIMIT  %s
+        )""")
+    if with_vector:
+        ctes.append("""rrf AS (
+            SELECT COALESCE(s.id, t.id) AS id,
+                   COALESCE(1.0 / (60 + s.rank), 0) +
+                   COALESCE(1.0 / (60 + t.rank), 0) AS score
+            FROM   semantic s
+            FULL OUTER JOIN fulltext t ON s.id = t.id
+        )""")
+    else:
+        ctes.append("""rrf AS (
+            SELECT t.id, 1.0 / (60 + t.rank) AS score FROM fulltext t
+        )""")
+    return f"""
+        WITH {", ".join(ctes)}
+        SELECT {_FACT_COLUMNS}, r.score
+        FROM   rrf r
+        JOIN   facts f ON f.id = r.id
+        LEFT JOIN conversations c ON c.id = f.conversation_id
+        LEFT JOIN facts sf ON sf.id = f.superseded_by
+        ORDER  BY r.score DESC
+    """
+
+
+def _facts_params(vec: str | None, query: str, where_params: list, candidates: int) -> list:
+    if vec is None:
+        return [query, *where_params, candidates]
+    return [vec, *where_params, vec, candidates, query, *where_params, candidates]
+
+
+def _enable_hnsw_iterative_scan(cur) -> str | None:
+    """The HNSW counterpart of `_enable_iterative_scan`: without it the filters
+    (kind, host, history) are applied after the index scan picks its candidates
+    and can leave fewer than asked for. Returns the value in effect, or None."""
+    try:
+        cur.execute("SELECT '[1,0]'::vector <=> '[0,1]'::vector")
+        cur.execute("SET hnsw.iterative_scan = relaxed_order")
+        cur.execute("SHOW hnsw.iterative_scan")
+        return cur.fetchone()[0]
+    except psycopg.Error:
+        cur.connection.rollback()
+        return None
+
+
+def present_fact(row, relevance: float, now: datetime | None = None) -> dict:
+    """One recall result from a row of `_facts_sql` (score column dropped) and
+    its fused relevance. Pure: no database, deterministic given `now`."""
+    (fact_id, text, kind, subject, attribute, observed_at, last_confirmed,
+     valid_to, temporary, expected_until, first_seq, last_seq, source, host,
+     session_id, name, ai_title, project_path,
+     successor_text, successor_observed_at) = row
+    now = now or datetime.now(timezone.utc)
+
+    decay = decay_factor(kind, last_confirmed, now)
+    # A superseded fact is, by definition, no longer the case.
+    still_true = 0.0 if valid_to is not None else decay
+    labels = fact_labels(valid_to=valid_to, expected_until=expected_until,
+                         temporary=temporary, now=now)
+
+    out: dict = {
+        "id":              str(fact_id),
+        "text":            text,
+        "kind":            kind,
+        "subject":         subject,
+        "attribute":       attribute,
+        "observed_at":     _human_time(observed_at, now),
+        "observed_at_utc": _utc_iso(observed_at),
+        "last_confirmed":  _human_time(last_confirmed, now),
+        "last_confirmed_utc": _utc_iso(last_confirmed),
+        "age":             fact_age_phrase(observed_at, last_confirmed),
+        "still_true_pct":  round(still_true * 100),
+        "labels":          labels,
+        "relevance":       round(float(relevance), 6),
+        "score":           round(float(relevance) * decay, 6),
+        "host":            host,
+        "source": (
+            {"session_id": session_id, "name": name, "ai_title": ai_title,
+             "project_path": project_path, "first_seq": first_seq, "last_seq": last_seq}
+            if session_id is not None else {"source": source}
+        ),
+    }
+    if temporary:
+        out["temporary"] = True
+        out["expected_until"] = expected_until.isoformat() if expected_until else None
+    if valid_to is not None:
+        out["superseded"] = {
+            "valid_to": _human_time(valid_to, now),
+            "valid_to_utc": _utc_iso(valid_to),
+            "by": (None if successor_text is None else
+                   {"text": successor_text,
+                    "observed_at": _human_time(successor_observed_at, now)}),
+        }
+    return out
+
+
+@mcp.tool()
+def recall_facts(
+    query: str,
+    limit: int = DEFAULT_FACT_LIMIT,
+    since: str | None = "all",
+    host: str | None = None,
+    project_path: str | None = None,
+    kind: str | None = None,
+    include_history: bool = False,
+) -> dict:
+    """Recall durable facts about Martin, his machines and his projects.
+
+    Facts are standalone statements extracted from past conversations ("Mace has
+    16 GB of RAM"), each with the date it was stated and the date it was last
+    confirmed.  Prefer this to search_memory for "what is X?" questions; use
+    search_memory when you need the conversation itself.
+
+    Ranking: hybrid vector + full-text search fused with Reciprocal Rank
+    Fusion, then multiplied by 2^(-age / half_life), age counted from when the
+    fact was last confirmed.  Half-lives: identity 10 years, config 9 months,
+    situation 2 weeks; events never decay.  A superseded fact is hidden unless
+    include_history=True.  No LLM is called.
+
+    Return value shape:
+        {
+          "status":    "ok" | "fallback" | "no_results" | "error",
+          "mode_used": "hybrid" | "fulltext",
+          "read_from": "primary" | "replica",
+          "since":     "all",
+          "since_utc": null,
+          "warning":   "<string>",   # only present when status != "ok"
+          "results":   [...]
+        }
+
+    Each result contains: text, kind, subject, attribute, observed_at and
+    last_confirmed (relative + operator-local, with *_utc siblings), age
+    ("stated 27 Sep 2026, confirmed 3 Oct 2026"), still_true_pct (the decay
+    factor as a percentage; 0 once superseded), labels (any of "superseded",
+    "temporary", "possibly resolved" — the last meaning its expected_until has
+    passed and nothing has replaced it, so check before relying on it),
+    relevance, score (relevance x decay), host, and source.  Temporary facts
+    carry expected_until; superseded ones carry what replaced them.
+
+    source is {session_id, name, ai_title, project_path, first_seq, last_seq}
+    for a fact from a conversation — pass session_id with start_seq=first_seq
+    and end_seq=last_seq to get_conversation to see the exchange itself — or
+    {source: "<doc or playbook>"} for one that did not come from a conversation.
+
+    Args:
+        query:           What to recall.  A short statement or question; websearch
+                         syntax works for the full-text half.
+        limit:           Number of results (default 10, at most 50).
+        since:           Only facts last confirmed on or after this.  Same forms
+                         as search_memory (a period like "6 months", an ISO date,
+                         or "all").  Default "all": decay already discounts old
+                         facts, and an identity fact may be years old.
+        host:            Restrict to facts from one machine.
+        project_path:    Restrict to facts from conversations in that project
+                         directory (excludes facts from docs and playbooks).
+        kind:            Restrict to "identity", "config", "situation" or "event".
+        include_history: Also return superseded facts, with what replaced them.
+    """
+    try:
+        cutoff, since_label = parse_since(since if since is not None else "all")
+    except ValueError as exc:
+        return {"status": "error", "mode_used": "none", "read_from": None,
+                "since": str(since), "since_utc": None,
+                "warning": str(exc), "results": []}
+    if kind is not None and kind not in FACT_HALF_LIFE_DAYS:
+        return {"status": "error", "mode_used": "none", "read_from": None,
+                "since": since_label, "since_utc": _utc_iso(cutoff) if cutoff else None,
+                "warning": f"kind={kind!r} not understood. Use one of: "
+                           + ", ".join(FACT_HALF_LIFE_DAYS) + ".",
+                "results": []}
+    limit = max(1, min(int(limit), MAX_FACT_LIMIT))
+
+    warnings: list[str] = []
+    mode_used = "hybrid"
+    vec: str | None = None
+    try:
+        vec = _vec(get_embedding(query, for_query=True))
+    except Exception:
+        mode_used = "fulltext"
+        warnings.append("Embedding service unavailable; fell back to full-text search.")
+
+    where, where_params = _fact_filters(cutoff, host, project_path, kind, include_history)
+    candidates = limit * FACT_CANDIDATE_FACTOR
+    sql = _facts_sql(vec is not None, where)
+    params = _facts_params(vec, query, where_params, candidates)
+
+    conn, read_from = _facts_conn()
+    with conn:
+        with conn.cursor() as cur:
+            if vec is not None and _enable_hnsw_iterative_scan(cur) != "relaxed_order":
+                warnings.append(
+                    "pgvector HNSW iterative scans are unavailable; with filters the "
+                    "vector half of this search can return fewer results than asked for."
+                )
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    now = datetime.now(timezone.utc)
+    results = [present_fact(r[:-1], r[-1], now) for r in rows]
+    results.sort(key=lambda r: r["score"], reverse=True)
+    results = results[:limit]
+
+    status = "ok"
+    if not results:
+        status = "no_results"
+        if cutoff is not None:
+            warnings.append("Nothing found in the window; retry with since='all'.")
+    elif warnings:
+        status = "fallback"
+
+    out: dict = {
+        "status": status,
+        "mode_used": mode_used,
+        "read_from": read_from,
+        "since": since_label,
+        "since_utc": _utc_iso(cutoff) if cutoff else None,
+        "results": results,
+    }
+    if warnings:
+        out["warning"] = " ".join(warnings)
+    return out
 
 
 @mcp.tool()
