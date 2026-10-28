@@ -23,15 +23,22 @@ class Session:
     name: str
     started_at: datetime
     exchanges: list[list[dict]] = field(default_factory=list)
+    # When each exchange began (its first message), parallel to exchanges. Sessions can
+    # run for weeks, so this, not started_at, is what dates an exchange's facts.
+    exchange_times: list[datetime] = field(default_factory=list)
 
 
-def build_exchanges(rows, max_chars=MAX_CHARS):
-    """rows: (author, content) in sequence order -> list of exchanges.
+def build_exchanges(rows, max_chars=MAX_CHARS, with_times=False):
+    """rows: (author, content) or (author, content, created_at) in sequence order.
 
-    Each exchange is a list of {"role": "user"|"assistant", "content": str}.
+    Returns the exchanges, each a list of {"role": "user"|"assistant", "content": str};
+    with_times=True returns (exchanges, times), times being each exchange's first
+    message's created_at.
     """
-    exchanges, cur, spoke, prev = [], None, False, None
-    for author, content in rows:
+    exchanges, times, cur, start, spoke, prev = [], [], None, None, False, None
+    for row in rows:
+        author, content = row[0], row[1]
+        when = row[2] if len(row) > 2 else None
         if author not in ("martin", "claude"):
             continue
         if (author, content) == prev:
@@ -41,14 +48,18 @@ def build_exchanges(rows, max_chars=MAX_CHARS):
         if author == "martin":
             if cur and spoke:
                 exchanges.append(cur)
+                times.append(start)
                 cur, spoke = None, False
+            if cur is None:
+                start = when
             cur = (cur or []) + [{"role": "user", "content": text}]
         elif cur is not None:
             cur.append({"role": "assistant", "content": text})
             spoke = True
     if cur and spoke:
         exchanges.append(cur)
-    return exchanges
+        times.append(start)
+    return (exchanges, times) if with_times else exchanges
 
 
 def dsn(arg=None):
@@ -64,7 +75,8 @@ def load_session(conn, session_id, max_chars=MAX_CHARS) -> Session:
         raise KeyError(f"session {session_id} is not in conversation-memory")
     conv_id, name, started_at = row
     rows = conn.execute(
-        "SELECT author, content FROM messages WHERE conversation_id = %s ORDER BY sequence_num",
+        "SELECT author, content, created_at FROM messages WHERE conversation_id = %s ORDER BY sequence_num",
         (conv_id,),
     ).fetchall()
-    return Session(session_id, name, started_at, build_exchanges(rows, max_chars))
+    exchanges, times = build_exchanges(rows, max_chars, with_times=True)
+    return Session(session_id, name, started_at, exchanges, times)

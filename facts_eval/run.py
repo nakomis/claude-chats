@@ -30,6 +30,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(1, str(HERE.parent))  # so module: specs can name repo packages, e.g. facts.extract
 
 import export  # noqa: E402
 import extractors  # noqa: E402

@@ -72,6 +72,7 @@ The `server/` directory — the ActiveMQ container, the Node STOMP worker, `serv
 | `mcp/` | The MCP server — hybrid search, transcript retrieval, session listing |
 | `init.sql` | Source of truth for the Postgres schema |
 | `scripts/` | Backup/restore, LaunchAgent setup, embedding evaluation harnesses, and `cjump` (jump to a past conversation: raise its Terminal window, or `claude --resume` it) |
+| `facts/` | Claude Facts: durable facts extracted from each exchange by Claude Haiku (CHATS-21). **Apache-2.0**, adapted from Mem0 |
 | `facts_eval/` | Scores a fact extractor (Mem0, or our own) against a hand-checked reference set: [one command](facts_eval/README.md) (CHATS-22) |
 | `localhost/` | The self-contained [single-machine edition](localhost/README.md) |
 | `docs/architecture/` | The diagram above, as `.drawio` source and exported SVG |
@@ -199,6 +200,12 @@ Note: HyDE is most beneficial when using a model with a long context window. Wit
 ```bash
 ollama pull nomic-embed-text
 ```
+
+## Licence
+
+CC0 (see [`LICENSE`](LICENSE)), **except [`facts/`](facts/)**, which is Apache-2.0:
+its extraction prompt is adapted from [Mem0](https://github.com/mem0ai/mem0), and
+the folder carries Mem0's licence.
 
 ## Support
 
