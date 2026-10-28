@@ -12,7 +12,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from facts.prompts import KINDS, PROMPT_VERSION, SYSTEM_PROMPT, build_user_prompt
@@ -57,6 +57,28 @@ class ExtractResult:
     calls: list[dict] = field(default_factory=list)
     error: str | None = None
     dropped: list[str] = field(default_factory=list)  # why any returned item was not kept
+    # True when the failure says nothing about this exchange: the API, the network or the
+    # credentials are the problem (auth, billing, rate limit, 5xx/overloaded, timeouts).
+    # The service must not count such a failure as an attempt at the exchange.
+    systemic: bool = False
+
+
+SYSTEMIC_STATUS = {401, 402, 403, 429}
+
+
+def is_systemic(error):
+    """True for an exception that is about the service or the route to it, not the exchange.
+
+    Authentication, permission, billing, rate limits, 5xx (including 529 overloaded, after the
+    SDK's own retries) and anything that never got an answer. Matched by attribute and class
+    name so this module does not import anthropic.
+    """
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int):
+        return status in SYSTEMIC_STATUS or status >= 500
+    names = {c.__name__ for c in type(error).__mro__}
+    return bool(names & {"APIConnectionError", "APITimeoutError", "ConnectError", "TimeoutException",
+                         "TransportError", "ConnectionError", "TimeoutError"})
 
 
 def looks_secret(text):
@@ -91,6 +113,17 @@ def _str(value):
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _valid_date(value):
+    """'YYYY-MM-DD' that is a real date, else None (2026-02-30 would fail the whole insert)."""
+    if not value or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return None
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
 def parse_reply(text):
     """Model reply -> (facts, dropped reasons). Raises ValueError if it is not the JSON asked for.
 
@@ -121,7 +154,7 @@ def parse_reply(text):
             subject=subject,
             attribute=attribute.lower() if attribute else None,
             temporary=item.get("temporary") is True,
-            expected_until=until if until and re.fullmatch(r"\d{4}-\d{2}-\d{2}", until) else None,
+            expected_until=_valid_date(until),
         ))
     return facts, dropped
 
@@ -181,7 +214,8 @@ class Extractor:
             return ExtractResult(facts, calls, None, dropped)
         except Exception as e:  # noqa: BLE001 - recorded, the caller decides
             last = calls[-1]["stop"] if calls else None
-            return ExtractResult([], calls, f"{e!r} (last stop: {last})")
+            return ExtractResult([], calls, f"{type(e).__name__}: {str(e)[:200]} (last stop: {last})",
+                                 systemic=is_systemic(e))
 
 
 def observation_date(when):

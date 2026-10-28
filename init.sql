@@ -236,3 +236,20 @@ CREATE TABLE IF NOT EXISTS fact_events (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS fact_events_fact_id_idx ON fact_events (fact_id);
+
+-- How far the extractor service (CHATS-25) has got in each conversation: every
+-- exchange up to last_seq (a messages.sequence_num) has been turned into facts
+-- or deliberately given up on. The service writes it in the same transaction as
+-- the exchange's facts, so a crash or rerun neither duplicates nor skips one.
+-- fail_seq / fail_count count consecutive failed extractions of the exchange
+-- that begins after last_seq, so one poison exchange is given up on after a few
+-- tries instead of blocking its conversation (gave_up counts how many were).
+-- No error text is kept: it can quote the model's reply.
+CREATE TABLE IF NOT EXISTS facts_progress (
+    conversation_id UUID        PRIMARY KEY REFERENCES conversations (id) ON DELETE CASCADE,
+    last_seq        INTEGER     NOT NULL,
+    fail_seq        INTEGER,
+    fail_count      INTEGER     NOT NULL DEFAULT 0,
+    gave_up         INTEGER     NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

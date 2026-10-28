@@ -211,6 +211,46 @@ def test_a_failing_second_call_is_recorded():
     assert res.facts == [] and "overloaded" in res.error and "end_turn" in res.error
 
 
+def test_an_impossible_expected_until_is_dropped_not_the_fact():
+    facts, _ = extract.parse_reply(reply(
+        {"text": "Backhaul is down.", "kind": "situation", "temporary": True, "expected_until": "2026-02-30"},
+        {"text": "Leap day.", "kind": "event", "expected_until": "2028-02-29"},
+        {"text": "No such month.", "kind": "event", "expected_until": "2026-13-01"}))
+    assert [f.expected_until for f in facts] == [None, "2028-02-29", None]
+    assert facts[0].text == "Backhaul is down."
+
+
+class StatusError(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.status_code = status
+
+
+class APIConnectionError(Exception):  # stands in for anthropic's, matched by class name
+    pass
+
+
+@pytest.mark.parametrize("error,systemic", [
+    (StatusError(401), True), (StatusError(403), True), (StatusError(402), True), (StatusError(429), True),
+    (StatusError(500), True), (StatusError(529), True), (APIConnectionError("no route"), True),
+    (TimeoutError("slow"), True), (StatusError(400), False), (ValueError("invalid JSON"), False),
+    (RuntimeError("odd"), False),
+])
+def test_systemic_failures_are_told_from_content_failures(error, systemic):
+    assert extract.is_systemic(error) is systemic
+
+
+def test_an_api_outage_is_marked_systemic_and_a_bad_reply_is_not():
+    class Down(FakeClient):
+        def _create(self, **kw):
+            raise StatusError(529)
+
+    msgs = [{"role": "user", "content": "hi"}]
+    assert extract.Extractor(Down()).extract(msgs, "2026-09-27").systemic is True
+    bad = extract.Extractor(FakeClient("not json", "still not json")).extract(msgs, "2026-09-27")
+    assert bad.error and bad.systemic is False
+
+
 @pytest.mark.parametrize("when,expected", [
     (datetime(2026, 10, 27, 23, 30, tzinfo=timezone.utc), "2026-10-27"),   # GMT: same day
     (datetime(2026, 9, 27, 23, 30, tzinfo=timezone.utc), "2026-09-28"),    # BST: already the next day
