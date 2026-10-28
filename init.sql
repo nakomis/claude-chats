@@ -157,3 +157,82 @@ ALTER TABLE messages
          autovacuum_vacuum_scale_factor  = 0.05);
 ALTER TABLE conversations
     SET (autovacuum_analyze_scale_factor = 0.02);
+
+-- Claude Facts (CHATS-21): durable facts extracted from conversations, one row
+-- per fact. Stored as dated observations and never hard-deleted: a superseded
+-- fact gets valid_to + superseded_by, an unwanted one gets deleted_at, and the
+-- recall side hides both unless asked for history.
+--
+-- kind drives the half-life used at recall (identity / config / situation /
+-- event). subject + attribute ('Mace' / 'RAM') are what consolidation compares
+-- to find contradictions. observed_at is the conversation's date, not the date
+-- the extractor ran; last_confirmed moves when a later exchange restates or
+-- relies on the fact, and recall measures age from it.
+--
+-- The source is the exchange's message range: conversation_id plus the first
+-- and last sequence_num it covered. Facts mined from repo docs (CHATS-31) or
+-- playbooks (CHATS-32) have no conversation and say where they came from in
+-- source instead. embedder / embedder_board / embedder_fw mean the same as on
+-- messages.
+--
+-- New tables only: nothing here locks messages or conversations beyond the
+-- foreign key's brief check on first creation, which the lock_timeout above
+-- bounds.
+CREATE TABLE IF NOT EXISTS facts (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    text            TEXT        NOT NULL,
+    kind            TEXT        NOT NULL CHECK (kind IN ('identity', 'config', 'situation', 'event')),
+    subject         TEXT,
+    attribute       TEXT,
+    observed_at     TIMESTAMPTZ NOT NULL,
+    last_confirmed  TIMESTAMPTZ NOT NULL,
+    valid_to        TIMESTAMPTZ,
+    superseded_by   UUID        REFERENCES facts (id),
+    temporary       BOOLEAN     NOT NULL DEFAULT false,
+    expected_until  DATE,
+    conversation_id UUID        REFERENCES conversations (id),
+    first_seq       INTEGER,
+    last_seq        INTEGER,
+    source          TEXT,
+    host            TEXT,
+    extractor       TEXT        NOT NULL,
+    embedding       vector(1024),
+    embedder        TEXT,
+    embedder_board  TEXT,
+    embedder_fw     TEXT,
+    text_tsv        tsvector    GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,
+    CHECK (conversation_id IS NOT NULL OR source IS NOT NULL)
+);
+
+-- HNSW rather than the ivfflat messages uses: it needs no training data (the
+-- table starts empty and ivfflat's lists would be fitted to nothing), and its
+-- recall does not depend on a probes setting (CHATS-15).
+CREATE INDEX IF NOT EXISTS facts_embedding_idx
+    ON facts USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS facts_text_tsv_idx        ON facts USING GIN (text_tsv);
+CREATE INDEX IF NOT EXISTS facts_subject_attr_idx    ON facts (subject, attribute);
+CREATE INDEX IF NOT EXISTS facts_observed_at_idx     ON facts (observed_at);
+CREATE INDEX IF NOT EXISTS facts_conversation_id_idx ON facts (conversation_id);
+-- Replica catch-up and audits read "everything changed since".
+CREATE INDEX IF NOT EXISTS facts_updated_at_idx      ON facts (updated_at);
+-- Facts waiting for a vector (the embed queue's backlog).
+CREATE INDEX IF NOT EXISTS facts_unembedded_idx      ON facts (created_at) WHERE embedding IS NULL;
+
+-- One row per consolidation decision, so any change to a fact can be explained
+-- or undone: which facts, what was decided, and the reason the model gave.
+-- action: merged (a duplicate folded into another), confirmed (last_confirmed
+-- moved), superseded (valid_to set), soft_deleted / restored (deleted_at set or
+-- cleared).
+CREATE TABLE IF NOT EXISTS fact_events (
+    id            BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    fact_id       UUID        NOT NULL REFERENCES facts (id),
+    other_fact_id UUID        REFERENCES facts (id),
+    action        TEXT        NOT NULL CHECK (action IN ('merged', 'confirmed', 'superseded', 'soft_deleted', 'restored')),
+    reason        TEXT,
+    actor         TEXT        NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS fact_events_fact_id_idx ON fact_events (fact_id);
