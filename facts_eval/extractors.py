@@ -182,21 +182,15 @@ class Mem0Extractor:
 
 
 def parses_as_json(response):
-    """Would a JSON-reply extractor accept this text? Strips a ``` fence first."""
+    """Would the facts extractor accept this reply as JSON? Same parser as facts/extract.py."""
+    from facts.extract import load_json_object
+
     if response is None:
         return None
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip())
-    if not text:
+    if not response.strip():
         return True
     try:
-        json.loads(text, strict=False)
+        load_json_object(response)
         return True
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.S)
-        if not m:
-            return False
-        try:
-            json.loads(m.group(0), strict=False)
-            return True
-        except json.JSONDecodeError:
-            return False
+    except ValueError:
+        return False

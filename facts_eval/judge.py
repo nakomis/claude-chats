@@ -58,32 +58,57 @@ def build_prompt(session, gold_facts, facts):
         facts="\n".join(f"{n}. {f}" for n, f in enumerate(facts, 1)) or "(none)")
 
 
+class JudgeError(ValueError):
+    """The judge's reply held no usable verdict."""
+
+
 def parse_verdict(text, gold_ids, n_facts):
-    """Pull the judge's JSON out of its reply; anything it skipped counts as missing / unjudged."""
-    m = re.search(r"\{.*\}", text, re.S)
-    data = json.loads(m.group(0)) if m else {}
-    gold = {g: data.get("gold", {}).get(g, "missing") for g in gold_ids}
+    """Pull the judge's JSON out of its reply.
+
+    A reply with no JSON object or no "gold" map raises JudgeError: a failed judge
+    must never read as a bad extractor. Within a usable reply, a reference fact it
+    skipped counts as missing and an extracted fact it skipped as unjudged.
+    """
+    m = re.search(r"\{.*\}", text or "", re.S)
+    try:
+        data = json.loads(m.group(0)) if m else None
+    except json.JSONDecodeError as e:
+        raise JudgeError(f"judge reply is not valid JSON: {e}") from None
+    if not isinstance(data, dict) or not isinstance(data.get("gold"), dict):
+        raise JudgeError("judge reply has no gold verdicts")
+    gold = {g: data["gold"].get(g, "missing") for g in gold_ids}
     by_n = {x.get("n"): x.get("verdict") for x in data.get("memories", []) if isinstance(x, dict)}
     memories = [by_n.get(n, "unjudged") for n in range(1, n_facts + 1)]
     return {"gold": gold, "memories": memories}
 
 
-def judge(session, gold_facts, facts, client=None):
-    import boto3
-    from botocore.config import Config
+def judge(session, gold_facts, facts, client=None, attempts=3):
+    """Judge one session. Retries an unusable reply; after the last attempt the session
+    is marked judge_failed, its reference facts 'unjudged', and left out of recall."""
+    if client is None:
+        import boto3
+        from botocore.config import Config
 
-    client = client or boto3.Session().client(
-        "bedrock-runtime", config=Config(read_timeout=600, retries={"max_attempts": 8}))
-    r = client.converse(modelId=JUDGE_MODEL,
-                        messages=[{"role": "user", "content": [{"text": build_prompt(session, gold_facts, facts)}]}],
-                        inferenceConfig={"maxTokens": 16000, "temperature": 0})
-    text = "".join(b["text"] for b in r["output"]["message"]["content"] if "text" in b)
-    return parse_verdict(text, list(gold_facts), len(facts))
+        client = boto3.Session().client(
+            "bedrock-runtime", config=Config(read_timeout=600, retries={"max_attempts": 8}))
+    prompt = build_prompt(session, gold_facts, facts)
+    error = None
+    for _ in range(attempts):
+        r = client.converse(modelId=JUDGE_MODEL, messages=[{"role": "user", "content": [{"text": prompt}]}],
+                            inferenceConfig={"maxTokens": 32000, "temperature": 0})
+        text = "".join(b["text"] for b in r["output"]["message"]["content"] if "text" in b)
+        try:
+            return parse_verdict(text, list(gold_facts), len(facts))
+        except JudgeError as e:
+            error = f"{e} (stop: {r.get('stopReason')})"
+    return {"gold": {g: "unjudged" for g in gold_facts}, "memories": ["unjudged"] * len(facts),
+            "judge_failed": error}
 
 
 def summarise(verdicts):
     """verdicts: list of judge() results for one run -> the numbers the comparison table shows."""
-    gold = [g for v in verdicts for g in v["gold"].values()]
+    judged = [v for v in verdicts if not v.get("judge_failed")]
+    gold = [g for v in judged for g in v["gold"].values()]
     mems = [m for v in verdicts for m in v["memories"]]
     row = {
         "recall": sum(GOLD_SCORE.get(g, 0) for g in gold) / len(gold) if gold else 0.0,
@@ -91,4 +116,5 @@ def summarise(verdicts):
         "facts": len(mems),
     }
     row.update({v: mems.count(v) for v in VERDICTS})
+    row["judge_failed"] = len(verdicts) - len(judged)  # sessions left out of recall
     return row
