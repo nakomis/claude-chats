@@ -108,3 +108,34 @@ def test_example_reference_matches_example_session():
     prompt = judge.build_prompt(session, ref["sessions"][0]["facts"], ["Kappa is Chi and Tau's son."])
     assert "M: " in prompt and "C: " in prompt and "X1:" in prompt
     assert "tool output" not in judge.transcript(session)
+
+
+@pytest.mark.parametrize("reply", ["", "I could not judge this.", '{"memories": []}', '{"gold": "all fine"}', "{bad json}"])
+def test_an_unusable_judge_reply_raises_instead_of_scoring_zero(reply):
+    with pytest.raises(judge.JudgeError):
+        judge.parse_verdict(reply, ["R1"], 1)
+
+
+class FakeBedrock:
+    def __init__(self, *texts):
+        self.texts, self.calls = list(texts), 0
+
+    def converse(self, **kw):
+        self.calls += 1
+        return {"output": {"message": {"content": [{"text": self.texts.pop(0)}]}}, "stopReason": "end_turn"}
+
+
+def test_judge_retries_then_marks_the_session_failed():
+    session = export.Session("s", "s", None, [[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]])
+    ok = judge.judge(session, {"R1": "x"}, ["f"], client=FakeBedrock("nonsense", '{"gold": {"R1": "full"}}'))
+    assert ok == {"gold": {"R1": "full"}, "memories": ["unjudged"]}
+    failed = judge.judge(session, {"R1": "x"}, ["f"], client=FakeBedrock("a", "b", "c"))
+    assert failed["judge_failed"] and failed["gold"] == {"R1": "unjudged"}
+
+
+def test_failed_sessions_are_left_out_of_recall():
+    s = judge.summarise([
+        {"gold": {"A": "full", "B": "missing"}, "memories": ["correct"]},
+        {"gold": {"C": "unjudged"}, "memories": ["unjudged", "unjudged"], "judge_failed": "no JSON"},
+    ])
+    assert s["recall"] == 0.5 and s["judge_failed"] == 1 and s["facts"] == 3

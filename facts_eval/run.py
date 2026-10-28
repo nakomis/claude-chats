@@ -92,7 +92,7 @@ def score(sessions, reference, rows):
 
 
 def print_table(summaries):
-    cols = ["recall", "full", "partial", "missing", "facts"] + judge.VERDICTS + ["unparseable"]
+    cols = ["recall", "full", "partial", "missing", "facts"] + judge.VERDICTS + ["unparseable", "judge_failed"]
     print(f"\n{'run':44} " + " ".join(f"{c:>9}" for c in cols))
     for name, s in summaries:
         cells = [f"{s['recall']:9.0%}"] + [f"{s.get(c, 0):9}" for c in cols[1:]]
@@ -115,6 +115,7 @@ def main():
     ap.add_argument("--db", help="CM database DSN (default $CM_DATABASE_URL, else libpq's PG* variables)")
     ap.add_argument("--compare", action="store_true", help="print every stored run and exit")
     ap.add_argument("--export", nargs="+", metavar="SESSION_ID", help="print these sessions' exchanges and exit")
+    ap.add_argument("--rejudge", metavar="RUN", help="judge a stored run again (its folder name), without re-extracting")
     args = ap.parse_args()
 
     if args.compare:
@@ -132,11 +133,22 @@ def main():
             print(judge.transcript(s))
         return
 
+    reference = load_reference(args.reference or eval_dir() / "reference.json")
+
+    if args.rejudge:
+        out = eval_dir() / "runs" / args.rejudge
+        rows = json.loads((out / "rows.json").read_text())
+        ran = {r["session_id"] for r in rows}
+        reference = [s for s in reference if s["session_id"] in ran]
+        sessions = [export.load_session(conn, s["session_id"]) for s in reference]
+        summary = json.loads((out / "summary.json").read_text())
+        finish(out, sessions, reference, rows, summary["extractor"])
+        return
+
     if not args.extractor:
-        ap.error("give an extractor spec, --compare or --export")
+        ap.error("give an extractor spec, --compare, --export or --rejudge")
     extractors.parse_spec(args.extractor)  # fail fast on a typo
 
-    reference = load_reference(args.reference or eval_dir() / "reference.json")
     if args.sessions:
         wanted = set(args.sessions.split(","))
         reference = [s for s in reference if s["session_id"] in wanted]
@@ -150,6 +162,11 @@ def main():
 
     rows = run_extractor(args.extractor, sessions, out)
     (out / "rows.json").write_text(json.dumps(rows, indent=1))
+    finish(out, sessions, reference, rows, args.extractor)
+
+
+def finish(out, sessions, reference, rows, extractor):
+    """Judge a run's rows, write verdicts and summary, print the comparison table."""
     print("judging...", flush=True)
     verdicts = score(sessions, reference, rows)
     (out / "verdicts.json").write_text(json.dumps(verdicts, indent=1))
@@ -158,10 +175,14 @@ def main():
     summary["unparseable"] = sum(1 for r in rows for ok in r["parse_ok"] if ok is False)
     summary["errors"] = sum(1 for r in rows if r["error"])
     summary["tokens"] = token_totals(rows)
-    summary["extractor"] = args.extractor
+    summary["extractor"] = extractor
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
 
     print_table(stored_runs())
+    for v in verdicts:
+        if v.get("judge_failed"):
+            print(f"\nWARNING: judge failed for session {v['session_id']}: {v['judge_failed']} "
+                  f"(left out of recall; re-run with --rejudge {out.name})")
     print(f"\ntokens this run: {summary['tokens']}; results in {out}")
 
 
