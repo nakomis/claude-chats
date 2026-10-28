@@ -27,17 +27,29 @@ class Session:
     exchange_times: list[datetime] = field(default_factory=list)
 
 
-def build_exchanges(rows, max_chars=MAX_CHARS, with_times=False):
-    """rows: (author, content) or (author, content, created_at) in sequence order.
+@dataclass
+class Exchange:
+    """One exchange with where it sits in its session."""
+    messages: list[dict]
+    started_at: datetime | None = None   # first message's created_at
+    first_seq: int | None = None         # sequence_num range of the kept messages
+    last_seq: int | None = None
+    closed: bool = False                 # True once a later message of Martin's has been seen
 
-    Returns the exchanges, each a list of {"role": "user"|"assistant", "content": str};
-    with_times=True returns (exchanges, times), times being each exchange's first
-    message's created_at.
+
+def split_exchanges(rows, max_chars=MAX_CHARS):
+    """rows: (author, content[, created_at[, sequence_num]]) in sequence order -> [Exchange].
+
+    The one implementation of the exchange rules: build_exchanges (the eval harness) and
+    facts.service (production) both go through it, so they cannot disagree about what an
+    exchange is. The last exchange is open (closed=False) when the rows end before
+    Martin's next message; whether it is finished is the caller's call (idle time).
     """
-    exchanges, times, cur, start, spoke, prev = [], [], None, None, False, None
+    out, cur, spoke, prev = [], None, False, None
     for row in rows:
         author, content = row[0], row[1]
         when = row[2] if len(row) > 2 else None
+        seq = row[3] if len(row) > 3 else None
         if author not in ("martin", "claude"):
             continue
         if (author, content) == prev:
@@ -46,19 +58,32 @@ def build_exchanges(rows, max_chars=MAX_CHARS, with_times=False):
         text = content[:max_chars]
         if author == "martin":
             if cur and spoke:
-                exchanges.append(cur)
-                times.append(start)
+                cur.closed = True
+                out.append(cur)
                 cur, spoke = None, False
             if cur is None:
-                start = when
-            cur = (cur or []) + [{"role": "user", "content": text}]
+                cur = Exchange([], when, seq, seq)
+            cur.messages.append({"role": "user", "content": text})
+            cur.last_seq = seq
         elif cur is not None:
-            cur.append({"role": "assistant", "content": text})
+            cur.messages.append({"role": "assistant", "content": text})
+            cur.last_seq = seq
             spoke = True
     if cur and spoke:
-        exchanges.append(cur)
-        times.append(start)
-    return (exchanges, times) if with_times else exchanges
+        out.append(cur)
+    return out
+
+
+def build_exchanges(rows, max_chars=MAX_CHARS, with_times=False):
+    """rows: (author, content) or (author, content, created_at) in sequence order.
+
+    Returns the exchanges, each a list of {"role": "user"|"assistant", "content": str};
+    with_times=True returns (exchanges, times), times being each exchange's first
+    message's created_at.
+    """
+    found = split_exchanges(rows, max_chars)
+    exchanges = [e.messages for e in found]
+    return (exchanges, [e.started_at for e in found]) if with_times else exchanges
 
 
 def dsn(arg=None):
