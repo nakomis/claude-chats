@@ -114,13 +114,16 @@ def seed(conn, session, script, host="phi"):
 class FakeExtractor:
     version = "fake-model+test"
 
-    def __init__(self, facts_per=1, fail_on=()):
+    def __init__(self, facts_per=1, fail_on=(), systemic_on=()):
         self.calls, self.facts_per, self.fail_on = [], facts_per, set(fail_on)
+        self.systemic_on = set(systemic_on)  # "the API is down" for these exchanges, or "all"
 
     def extract(self, new_messages, observation_date, earlier_messages=(), already_extracted=()):
         self.calls.append(SimpleNamespace(messages=new_messages, date=observation_date,
                                           earlier=list(earlier_messages), already=list(already_extracted)))
         first = new_messages[0]["content"]
+        if first in self.systemic_on or "all" in self.systemic_on:
+            return ExtractResult([], [{"uncached_in": 1}], "StatusError: HTTP 529", systemic=True)
         if first in self.fail_on:
             return ExtractResult([], [{"uncached_in": 3, "output_tokens": 1}], "boom")
         facts = [Fact(f"{first} fact {i}", "config", "Mace", "ram", True, "2026-11-01") for i in range(self.facts_per)]
@@ -131,7 +134,7 @@ def fake_embed(text):
     return [0.5] * 1024
 
 
-CFG = service.Config(embed_url="http://unused")
+CFG = service.Config(embed_url="http://unused", since="all")
 SCRIPT = [("martin", "m1", 0), ("tool", "ls", 1), ("claude", "c1", 2),
           ("martin", "m2", 10), ("claude", "c2", 11), ("martin", "m3", 20), ("claude", "c3", 21)]
 
@@ -214,7 +217,7 @@ def test_a_failed_exchange_is_retried_then_given_up_without_blocking(conn):
 
 
 @needs_db
-def test_an_insert_failure_rolls_the_whole_exchange_back(conn):
+def test_an_insert_failure_rolls_the_whole_exchange_back(conn, capsys):
     cid = seed(conn, "s-4", SCRIPT[:3])
 
     class BadSecondFact(FakeExtractor):
@@ -227,6 +230,9 @@ def test_an_insert_failure_rolls_the_whole_exchange_back(conn):
     assert stats.errors == 1 and stats.exchanges == 0
     assert facts_of(conn) == []                       # the good fact rolled back with it
     assert progress(conn, cid) == (-1, 1, 1, 0)  # nothing done, one failure counted
+    err = capsys.readouterr().err
+    assert "CheckViolation" in err and "sqlstate 23514" in err
+    assert "never stored" not in err and "m1 fact 0" not in err   # psycopg's DETAIL would quote the row
 
 
 @needs_db
@@ -276,3 +282,167 @@ def test_only_one_run_at_a_time(conn, dsn):
         other.execute("SELECT pg_advisory_lock(%s)", (service.LOCK_KEY,))
         assert service.run(conn, CFG, FakeExtractor(), fake_embed) is None
     assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+
+
+# ---- outages, the breaker, exit status, FACTS_SINCE, embedding, connection ---------
+
+def test_since_must_be_set_deliberately():
+    with pytest.raises(service.ConfigError, match="FACTS_SINCE is not set"):
+        service.since_sql(service.Config())
+    assert service.since_sql(service.Config(since="all")) == ""
+    assert service.since_sql(service.Config(since="ALL")) == ""
+    assert service.since_sql(service.Config(since="2026-10-28")) == "2026-10-28"
+    with pytest.raises(service.ConfigError, match="not an ISO"):
+        service.since_sql(service.Config(since="yesterday"))
+
+
+@needs_db
+def test_a_real_run_refuses_without_since_but_a_dry_run_may_look(conn):
+    seed(conn, "s-9", SCRIPT)
+    with pytest.raises(service.ConfigError):
+        service.run(conn, service.Config(embed_url="x"), FakeExtractor(), fake_embed)
+    assert conn.execute("SELECT count(*) FROM facts_progress").fetchone()[0] == 0
+    stats = service.run(conn, service.Config(embed_url="x"), FakeExtractor(), None, limit=1, dry_run=True, out=lambda *_: None)
+    assert stats.exchanges == 1
+
+
+@needs_db
+def test_an_outage_does_not_burn_attempts(conn):
+    cid = seed(conn, "s-10", SCRIPT)
+    down = FakeExtractor(systemic_on={"m2"})
+    for _ in range(5):  # far more ticks than max_attempts
+        stats = service.run(conn, CFG, down, fake_embed)
+        assert stats.systemic_errors <= 1 and stats.gave_up == 0
+    assert progress(conn, cid) == (3, None, 0, 0)       # m1 done; m2 never marked or counted
+    assert [f[0] for f in facts_of(conn)] == ["m1 fact 0"]
+    up = service.run(conn, CFG, FakeExtractor(), fake_embed)  # the API comes back: m2 and m3 go through
+    assert up.exchanges == 2 and up.errors == 0 and progress(conn, cid) == (7, None, 0, 0)
+
+
+@needs_db
+def test_a_content_failure_after_an_outage_counts_from_one(conn):
+    cid = seed(conn, "s-11", SCRIPT)
+    service.run(conn, CFG, FakeExtractor(systemic_on={"m2"}), fake_embed)
+    service.run(conn, CFG, FakeExtractor(fail_on={"m2"}), fake_embed)
+    assert progress(conn, cid) == (3, 4, 1, 0)
+
+
+@needs_db
+def test_the_breaker_stops_a_run_after_consecutive_systemic_errors(conn):
+    for i in range(6):
+        seed(conn, f"s-12-{i}", SCRIPT[:3])
+    ex = FakeExtractor(systemic_on={"all"})
+    stats = service.run(conn, service.Config(embed_url="x", since="all", max_systemic=3), ex, fake_embed)
+    assert stats.aborted and stats.errors == 3 and stats.systemic_errors == 3
+    assert len(ex.calls) == 3                            # it stopped asking, rather than trying all six
+    assert conn.execute("SELECT count(*) FROM facts_progress").fetchone()[0] == 0   # no attempts recorded
+    assert stats.failed
+
+
+@needs_db
+def test_a_success_resets_the_breaker(conn):
+    for i in range(4):
+        seed(conn, f"s-13-{i}", SCRIPT[:3])
+    ex = FakeExtractor(systemic_on={"m1"})
+    ex.systemic_on = {"m1"}
+    calls = iter([True, True, False, True])           # fail, fail, succeed, fail: never three in a row
+
+    real = ex.extract
+
+    def flip(new_messages, *a, **k):
+        if next(calls):
+            return real(new_messages, *a, **k).__class__([], [], "HTTP 529", systemic=True)
+        ex.systemic_on = set()
+        r = real(new_messages, *a, **k)
+        ex.systemic_on = {"m1"}
+        return r
+
+    ex.extract = flip
+    stats = service.run(conn, service.Config(embed_url="x", since="all", max_systemic=3), ex, fake_embed)
+    assert not stats.aborted and stats.systemic_errors == 3 and stats.exchanges == 1
+    assert not stats.failed                              # it got something done
+
+
+@needs_db
+def test_exit_status_is_non_zero_when_a_run_errors_and_produces_nothing(conn, dsn, monkeypatch, capsys):
+    seed(conn, "s-14", SCRIPT)
+    for k, v in {"FACTS_DATABASE_URL": dsn, "FACTS_EMBED_URL": "http://unused", "FACTS_SINCE": "all"}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(service, "make_embedder", lambda cfg: fake_embed)
+    monkeypatch.setattr(service, "make_extractor", lambda cfg: FakeExtractor(systemic_on={"all"}))
+    with pytest.raises(SystemExit) as e:
+        service.main([])
+    assert e.value.code == 1
+    assert '"errors": 1' in capsys.readouterr().out      # the facts-run line is still printed
+    monkeypatch.setattr(service, "make_extractor", lambda cfg: FakeExtractor())
+    service.main([])                                     # healthy: returns, exit status 0
+    assert '"exchanges": 3' in capsys.readouterr().out
+    service.main([])                                     # nothing to do is not a failure either
+    monkeypatch.delenv("FACTS_SINCE")
+    with pytest.raises(SystemExit) as e:
+        service.main([])
+    assert "FACTS_SINCE" in str(e.value.code)
+
+
+@needs_db
+def test_a_bad_fact_does_not_hold_up_embedding_the_rest(conn):
+    seed(conn, "s-15", SCRIPT)
+    service.run(conn, CFG, FakeExtractor(facts_per=2), None, limit=3)  # embed step needs an embedder
+    bad = {"m1 fact 0", "m1 fact 1", "m2 fact 0"}
+
+    def picky(text):
+        if text in bad:
+            raise ValueError("embedding has 3 dimensions, expected 1024")
+        return fake_embed(text)
+
+    stats = service.Stats()
+    service.embed_pending(conn, CFG, picky, stats)
+    assert (stats.embedded, stats.embed_errors) == (3, 3)   # three bad ones first, and the rest still done
+
+
+@needs_db
+def test_an_unreachable_embedder_stops_the_batch_after_three(conn):
+    seed(conn, "s-16", SCRIPT)
+    service.run(conn, CFG, FakeExtractor(facts_per=2), fake_embed, limit=3)  # facts get embedded here ...
+    conn.execute("UPDATE facts SET embedding = NULL, embedder = NULL")      # ... so undo it
+
+    class ConnectError(Exception):
+        pass
+
+    def down(text):
+        raise ConnectError("no route")
+
+    stats = service.Stats()
+    service.embed_pending(conn, CFG, down, stats)
+    assert (stats.embedded, stats.embed_errors) == (0, 3)
+
+
+@needs_db
+def test_releasing_the_lock_cannot_mask_the_real_error(conn):
+    seed(conn, "s-17", SCRIPT)
+
+    class Proxy:
+        def __init__(self, c):
+            self.c = c
+
+        def execute(self, q, *a):
+            if "pg_advisory_unlock" in q:
+                raise RuntimeError("connection lost")
+            return self.c.execute(q, *a)
+
+        def __getattr__(self, name):
+            return getattr(self.c, name)
+
+    class Explodes(FakeExtractor):
+        def extract(self, *a, **k):
+            raise KeyError("the real error")
+
+    with pytest.raises(KeyError, match="the real error"):
+        service.run(Proxy(conn), CFG, Explodes(), fake_embed)
+
+
+@needs_db
+def test_the_connection_has_a_statement_timeout_and_keepalives(dsn):
+    with service.connect(service.Config(dsn=dsn, statement_timeout_ms=1234)) as c:
+        assert c.execute("SHOW statement_timeout").fetchone()[0] == "1234ms"
+        assert c.execute("SHOW tcp_keepalives_idle").fetchone() is not None   # server side exists; client params accepted

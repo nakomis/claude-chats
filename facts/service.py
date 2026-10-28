@@ -30,14 +30,19 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 
-from facts.extract import ALREADY_EXTRACTED, EARLIER_MESSAGES, Extractor, observation_date
+from facts.extract import ALREADY_EXTRACTED, EARLIER_MESSAGES, Extractor, is_systemic, observation_date
 from facts_eval.export import MAX_CHARS, split_exchanges
 
 DEFAULT_KEY_PARAM = "/conversation-memory/prod/facts/anthropic-api-key"
 LOCK_KEY = 0x66616374  # "fact": one service run at a time per database
 DEFAULT_KIND = "situation"  # for the rare fact the model gave no valid kind
+
+
+class ConfigError(Exception):
+    """A setting that is missing or unusable; the message says what to do."""
 
 
 @dataclass
@@ -53,7 +58,12 @@ class Config:
     idle_minutes: int = 30
     max_attempts: int = 3
     max_runtime_seconds: int = 780     # stop starting new exchanges after this (timer is every 15 min)
-    since: str = ""                    # ignore messages before this ISO date/time (no backfill of history)
+    # Ignore messages before this ISO date/time. Required for a real run: empty is an error, and
+    # the whole history is processed only when it is explicitly "all" (paid calls for every exchange).
+    since: str = ""
+    max_systemic: int = 3              # consecutive transport/auth errors that stop the run
+    api_timeout: float = 120.0         # seconds, per Anthropic request
+    statement_timeout_ms: int = 60000  # per SQL statement
     model: str = ""                    # blank = the Extractor's default
 
     @classmethod
@@ -72,9 +82,26 @@ class Config:
             idle_minutes=int(env.get("FACTS_IDLE_MINUTES", d.idle_minutes)),
             max_attempts=int(env.get("FACTS_MAX_ATTEMPTS", d.max_attempts)),
             max_runtime_seconds=int(env.get("FACTS_MAX_RUNTIME_SECONDS", d.max_runtime_seconds)),
-            since=env.get("FACTS_SINCE", ""),
+            since=env.get("FACTS_SINCE", "").strip(),
+            max_systemic=int(env.get("FACTS_MAX_SYSTEMIC_ERRORS", d.max_systemic)),
+            api_timeout=float(env.get("FACTS_API_TIMEOUT_SECONDS", d.api_timeout)),
+            statement_timeout_ms=int(env.get("FACTS_STATEMENT_TIMEOUT_MS", d.statement_timeout_ms)),
             model=env.get("FACTS_MODEL", ""),
         )
+
+
+def since_sql(cfg):
+    """The FACTS_SINCE value as the queries take it: '' = no lower bound. Raises ConfigError if unusable."""
+    if not cfg.since:
+        raise ConfigError("FACTS_SINCE is not set. Give an ISO date or time (messages before it are ignored), "
+                          "or FACTS_SINCE=all to process the whole history deliberately.")
+    if cfg.since.lower() == "all":
+        return ""
+    try:
+        datetime.fromisoformat(cfg.since)
+    except ValueError:
+        raise ConfigError(f"FACTS_SINCE={cfg.since!r} is not an ISO date or time (or 'all')") from None
+    return cfg.since
 
 
 @dataclass
@@ -94,6 +121,13 @@ class Stats:
     output_tokens: int = 0
     dry_run: bool = False
     seconds: float = 0.0
+    systemic_errors: int = 0  # outage-type failures (not counted as attempts at an exchange)
+    aborted: bool = False     # the run stopped early on consecutive systemic errors
+
+    @property
+    def failed(self):
+        """Errors and nothing to show for the run: the exit status that makes systemd's unit fail."""
+        return (self.errors + self.embed_errors) > 0 and self.exchanges + self.embedded == 0
 
     def add_tokens(self, calls):
         for c in calls:
@@ -123,7 +157,7 @@ def anthropic_api_key(env=None, ssm_client=None):
 def make_extractor(cfg, env=None):
     import anthropic
 
-    client = anthropic.Anthropic(api_key=anthropic_api_key(env), max_retries=6)
+    client = anthropic.Anthropic(api_key=anthropic_api_key(env), max_retries=6, timeout=cfg.api_timeout)
     return Extractor(client, **({"model": cfg.model} if cfg.model else {}))
 
 
@@ -146,7 +180,13 @@ def make_embedder(cfg):
 # ---- database ---------------------------------------------------------------------
 
 def pending_conversations(conn, cfg):
-    """(id, host, last_seq, fail_seq, fail_count, idle) for each conversation with unprocessed messages."""
+    """(id, host, last_seq, fail_seq, fail_count, idle) for each conversation with unprocessed messages.
+
+    A conversation whose tail cannot (yet) form an exchange, such as a last message of Martin's that
+    Claude never answered, is selected again every run. That is deliberate and cheap: progress is not
+    advanced past it, because a late reply would then be lost, and each re-selection costs one indexed
+    read of that conversation's few unprocessed rows and no model call.
+    """
     return conn.execute(
         """
         SELECT c.id, c.host, COALESCE(p.last_seq, -1), p.fail_seq, COALESCE(p.fail_count, 0),
@@ -160,7 +200,7 @@ def pending_conversations(conn, cfg):
                           AND m.created_at >= COALESCE(NULLIF(%(since)s, '')::timestamptz, '-infinity'))
          ORDER BY c.started_at, c.id
         """,
-        {"idle": cfg.idle_minutes, "since": cfg.since},
+        {"idle": cfg.idle_minutes, "since": since_sql(cfg)},
     ).fetchall()
 
 
@@ -172,7 +212,7 @@ def pending_exchanges(conn, cfg, conv_id, last_seq):
            AND created_at >= COALESCE(NULLIF(%(since)s, '')::timestamptz, '-infinity')
          ORDER BY sequence_num
         """,
-        {"c": conv_id, "seq": last_seq, "since": cfg.since},
+        {"c": conv_id, "seq": last_seq, "since": since_sql(cfg)},
     ).fetchall()
     return split_exchanges(rows)
 
@@ -243,9 +283,22 @@ def record_failure(conn, conv_id, last_seq, first_seq, prior_fail_seq, prior_cou
 
 # ---- the run ----------------------------------------------------------------------
 
+def db_error_text(e):
+    """Type and SQLSTATE only: a psycopg message can carry the DETAIL line, which quotes fact text."""
+    return f"database: {type(e).__name__} (sqlstate {getattr(e, 'sqlstate', None)})"
+
+
+def db_is_systemic(e):
+    """A lost or unusable connection says nothing about the exchange; a constraint error does."""
+    import psycopg
+
+    return isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError))
+
+
 def extract_pending(conn, cfg, extractor, stats, limit, dry_run, out=print):
     started = time.monotonic()
     dry_seen = {}
+    streak = 0  # consecutive systemic errors
     for conv_id, host, last_seq, fail_seq, fail_count, idle in pending_conversations(conn, cfg):
         if stats.exchanges + stats.errors >= limit or time.monotonic() - started > cfg.max_runtime_seconds:
             break
@@ -260,15 +313,27 @@ def extract_pending(conn, cfg, extractor, stats, limit, dry_run, out=print):
             already = (recent_facts(conn, conv_id) + dry_seen.get(conv_id, []))[-ALREADY_EXTRACTED:]
             res = extractor.extract(ex.messages, observation_date(ex.started_at), earlier, already)
             stats.add_tokens(res.calls)
-            error = res.error
+            error, systemic = res.error, res.systemic
             if not error and not dry_run:
                 try:
                     commit_exchange(conn, ex, conv_id, host, extractor.version, res.facts)
-                except Exception as e:  # noqa: BLE001 - the transaction rolled back; counts as a failed attempt
-                    error = f"database: {type(e).__name__}: {e}"
+                except Exception as e:  # noqa: BLE001 - the transaction rolled back
+                    error, systemic = db_error_text(e), db_is_systemic(e)
             if error:
                 stats.errors += 1
-                log(f"conversation {conv_id} seq {ex.first_seq}-{ex.last_seq}: failed: {error[:200]}")
+                log(f"conversation {conv_id} seq {ex.first_seq}-{ex.last_seq}: failed"
+                    f"{' (systemic, not counted as an attempt)' if systemic else ''}: {error[:200]}")
+                if systemic:
+                    # An outage, a bad key, a rate limit: nothing to learn about this exchange, so no
+                    # attempt is recorded. Several in a row mean stop and let the next tick try again.
+                    stats.systemic_errors += 1
+                    streak += 1
+                    if streak >= cfg.max_systemic:
+                        stats.aborted = True
+                        log(f"{streak} systemic errors in a row; stopping this run")
+                        return
+                    break  # leave this conversation for the next run, try the next one
+                streak = 0
                 if dry_run:
                     break
                 n = record_failure(conn, conv_id, last_seq, ex.first_seq, fail_seq, fail_count)
@@ -279,6 +344,7 @@ def extract_pending(conn, cfg, extractor, stats, limit, dry_run, out=print):
                     last_seq, fail_seq, fail_count = ex.last_seq, None, 0
                     continue
                 break  # retry this exchange next run, and keep the rest of the conversation in order
+            streak = 0
             stats.exchanges += 1
             stats.facts += len(res.facts)
             stats.dropped += len(res.dropped)
@@ -291,23 +357,32 @@ def extract_pending(conn, cfg, extractor, stats, limit, dry_run, out=print):
             last_seq, fail_seq, fail_count = ex.last_seq, None, 0
 
 
+def embed_failure_is_systemic(e):
+    """Cal unreachable or erroring (transport, 5xx) versus this one fact being unembeddable (4xx, bad shape)."""
+    status = getattr(getattr(e, "response", None), "status_code", 0)  # httpx.HTTPStatusError
+    return (is_systemic(e) or status >= 500
+            or type(e).__name__ in ("ConnectError", "ReadTimeout", "ConnectTimeout", "RemoteProtocolError"))
+
+
 def embed_pending(conn, cfg, embed, stats):
     rows = conn.execute(
         "SELECT id, text FROM facts WHERE embedding IS NULL AND deleted_at IS NULL ORDER BY created_at LIMIT %s",
         (cfg.embed_batch,)).fetchall()
-    consecutive = 0
+    streak = 0  # consecutive failures that point at Cal, not at the fact
     for fact_id, text in rows:
         try:
             vec = embed(text)
         except Exception as e:  # noqa: BLE001 - retried next run
             stats.embed_errors += 1
-            consecutive += 1
-            log(f"fact {fact_id}: embedding failed: {str(e)[:200]}")
-            if consecutive >= 3:
-                log("three embedding failures in a row; leaving the rest for the next run")
+            log(f"fact {fact_id}: embedding failed: {type(e).__name__}")
+            # A fact Cal rejects is skipped, so a few permanently bad ones cannot hold up the rest;
+            # only an unreachable or failing Cal stops the batch.
+            streak = streak + 1 if embed_failure_is_systemic(e) else 0
+            if streak >= cfg.max_systemic:
+                log(f"{streak} embedding failures in a row; leaving the rest for the next run")
                 break
             continue
-        consecutive = 0
+        streak = 0
         conn.execute(
             "UPDATE facts SET embedding = %s::vector, embedder = %s, embedder_board = NULL, embedder_fw = NULL, "
             "updated_at = now() WHERE id = %s AND embedding IS NULL",
@@ -316,7 +391,15 @@ def embed_pending(conn, cfg, embed, stats):
 
 
 def run(conn, cfg, extractor, embed, limit=None, dry_run=False, out=print):
-    """One service run over an open autocommit connection. Returns Stats; None if another run holds the lock."""
+    """One service run over an open autocommit connection. Returns Stats; None if another run holds the lock.
+
+    Raises ConfigError (before touching anything) when FACTS_SINCE is unusable. A dry run with no
+    FACTS_SINCE looks at everything, as --limit bounds what it pays for.
+    """
+    if dry_run and not cfg.since:
+        cfg = replace(cfg, since="all")
+    since = since_sql(cfg)
+    log(f"facts run: since {since or 'the beginning of history (FACTS_SINCE=all)'}{', dry run' if dry_run else ''}")
     stats = Stats(dry_run=dry_run)
     t = time.monotonic()
     if not conn.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,)).fetchone()[0]:
@@ -327,9 +410,21 @@ def run(conn, cfg, extractor, embed, limit=None, dry_run=False, out=print):
         if not dry_run:
             embed_pending(conn, cfg, embed, stats)
     finally:
-        conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+        try:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+        except Exception as e:  # noqa: BLE001 - must not mask the real error; the lock dies with the session
+            log(f"could not release the advisory lock: {type(e).__name__}")
     stats.seconds = round(time.monotonic() - t, 1)
     return stats
+
+
+def connect(cfg):
+    """An autocommit connection with a statement timeout and TCP keepalives, so a dead Luke fails the run."""
+    import psycopg
+
+    return psycopg.connect(cfg.dsn, autocommit=True, connect_timeout=15,
+                           options=f"-c statement_timeout={cfg.statement_timeout_ms}",
+                           keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
 
 
 def main(argv=None):
@@ -339,19 +434,26 @@ def main(argv=None):
                     help="call the model but write nothing to the database and embed nothing; print the facts")
     args = ap.parse_args(argv)
 
-    import psycopg
-
     cfg = Config.from_env()
     if not cfg.dsn:
         sys.exit("FACTS_DATABASE_URL (or CM_DATABASE_URL) is not set")
     if not cfg.embed_url and not args.dry_run:
         sys.exit("FACTS_EMBED_URL (or OLLAMA_BASE_URL) is not set")
-    extractor = make_extractor(cfg)
-    embed = make_embedder(cfg) if cfg.embed_url else None
-    with psycopg.connect(cfg.dsn, autocommit=True, connect_timeout=15) as conn:
-        stats = run(conn, cfg, extractor, embed, args.limit, args.dry_run)
-    if stats is not None:
-        print("facts-run " + json.dumps(stats.__dict__, sort_keys=True), flush=True)
+    try:
+        if not args.dry_run:
+            since_sql(cfg)  # fail before paying for anything
+        extractor = make_extractor(cfg)
+        embed = make_embedder(cfg) if cfg.embed_url else None
+        with connect(cfg) as conn:
+            stats = run(conn, cfg, extractor, embed, args.limit, args.dry_run)
+    except ConfigError as e:
+        sys.exit(str(e))
+    if stats is None:
+        return
+    print("facts-run " + json.dumps(stats.__dict__, sort_keys=True), flush=True)
+    if stats.failed:
+        # Errors and nothing done: exit non-zero so the oneshot unit fails and the failed-unit alert fires.
+        sys.exit(1)
 
 
 if __name__ == "__main__":
