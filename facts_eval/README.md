@@ -44,6 +44,11 @@ made small models run away and carried secrets into the prompt. A message identi
 to the one before it is dropped, because CM stores some messages twice. Each
 message is cut at 3,000 characters.
 
+## Connecting to CM
+
+`--db`, else `CM_DATABASE_URL`, else libpq's standard `PGHOST` / `PGUSER` /
+`PGPASSWORD` / `PGDATABASE` variables.
+
 ## The judge
 
 gpt-oss-120b on Bedrock (`FACTS_EVAL_JUDGE` to change it), chosen because it is not

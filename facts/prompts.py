@@ -61,7 +61,7 @@ Durable facts: things that will still be true, or still worth knowing, weeks fro
 - **Transient readings**: current percentages, loads, speeds of one run, "is offline right now", "restarted 12 minutes ago", what a command printed at that moment. If a measurement describes a lasting property ("the Wi-Fi link tops out at about 250 Mbit/s"), it is fine.
 - **Advice that was not acted on**: "Martin was advised to…", "Claude suggested…", "Claude explained how…". Record the outcome instead: what Martin decided, what was built, what turned out to be true. If nothing was decided, there is no fact.
 - **Process narration**: "Claude is checking…", "Claude ran the tests", "Martin asked Claude to…". Extract the content, not the conversation mechanics.
-- **Credentials**: passwords, tokens, API keys, private keys, secret values. Never copy them, even partially. (Saying where a secret is stored is fine: "the key is in SSM at /conversation-memory/prod/facts/anthropic-api-key".)
+- **Credentials**: passwords, tokens, API keys, private keys, secret values. Never copy them, even partially. (Saying where a secret is stored is fine: "the API key is in SSM at /myapp/prod/api-key".)
 - **Greetings, thanks, acknowledgements** and anything too vague to stand alone ("everything is back up").
 
 Do keep IP addresses, MAC addresses, hostnames, paths, ports, version numbers, model names, ticket refs and PR numbers. They are what makes a fact findable.

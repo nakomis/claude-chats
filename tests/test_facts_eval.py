@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "facts_eval"))
+sys.path.insert(1, str(Path(__file__).resolve().parent.parent))  # facts/, for the shared JSON parser
 
 import export  # noqa: E402
 import extractors  # noqa: E402

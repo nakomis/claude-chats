@@ -13,7 +13,6 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 
-DEFAULT_DSN = "postgresql://claude:claude@luke.local:5432/claude_chats"
 MAX_CHARS = 3000  # per message; the extractor prompt is ~9k tokens before any conversation
 
 
@@ -63,7 +62,8 @@ def build_exchanges(rows, max_chars=MAX_CHARS, with_times=False):
 
 
 def dsn(arg=None):
-    return arg or os.environ.get("CM_DATABASE_URL", DEFAULT_DSN)
+    """--db, else $CM_DATABASE_URL, else "" so libpq falls back to PGHOST, PGUSER, PGDATABASE..."""
+    return arg or os.environ.get("CM_DATABASE_URL", "")
 
 
 def load_session(conn, session_id, max_chars=MAX_CHARS) -> Session:

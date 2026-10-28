@@ -12,7 +12,8 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from facts.prompts import KINDS, PROMPT_VERSION, SYSTEM_PROMPT, build_user_prompt
 
@@ -21,12 +22,23 @@ MAX_TOKENS = 8000          # thinking at effort low counts towards this too
 EARLIER_MESSAGES = 8       # messages before the exchange, for resolving "it" and "that PR"
 ALREADY_EXTRACTED = 40     # this session's most recent facts, so they are not repeated
 
+TZ = ZoneInfo("Europe/London")  # Martin's "yesterday" and "on Friday" are London days
+
+# Best-effort, belt and braces: the prompt is the main defence. Known token shapes,
+# plus "password/token/key is|=|: <value>" where the value is not a path or a
+# reference to where the secret lives (those facts are wanted).
 SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b(?:sk-ant-|ghp_|github_pat_|hf_|xox[abp]-)[A-Za-z0-9_\-]{16,}"),
-    re.compile(r"(?i)\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S{8,}"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:sk-ant-|sk-proj-|sk-|ghp_|gho_|github_pat_|glpat-|hf_|xox[abprs]-|AIza)[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),  # JWT
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{20,}"),
+    re.compile(r"(?i)\b(?:password|passwd|passphrase|secret|token|api[_\s-]?key)\b\s*(?:is|was|=|:)\s*"
+               r"[\"'`]?(?![/~$<\[{(])(?=[^\s\"'`]{6,})(?=[^\s\"'`]*[0-9!@#%^&*_+=-])[^\s\"'`]+"),
 ]
+# Long opaque blobs. No '/' in the class: paths are wanted facts, and far commoner than base64.
+HIGH_ENTROPY = re.compile(r"(?<![/\w.-])[A-Za-z0-9+_\-]{32,}(?![/\w.-])")
+UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 @dataclass
@@ -48,43 +60,68 @@ class ExtractResult:
 
 
 def looks_secret(text):
-    return any(p.search(text) for p in SECRET_PATTERNS)
+    if any(p.search(text) for p in SECRET_PATTERNS):
+        return True
+    # A long opaque blob with both letters and digits, and no path or URL around it.
+    # UUIDs (session and record ids) are identifiers, not secrets.
+    return any(re.search(r"[A-Za-z]", m) and re.search(r"\d", m) and not UUID.fullmatch(m)
+               for m in HIGH_ENTROPY.findall(text))
 
 
-def _strip_fence(text):
-    return re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+def load_json_object(text):
+    """The JSON object in a model reply, tolerating a ``` fence or prose around it.
 
-
-def parse_reply(text):
-    """Model reply -> (facts, dropped reasons). Raises ValueError if it is not the JSON asked for."""
-    body = _strip_fence(text)
+    Raises ValueError when there is none. Shared with facts_eval so 'unparseable'
+    there means exactly what the extractor rejects.
+    """
+    body = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip())
     try:
-        data = json.loads(body, strict=False)
+        return json.loads(body, strict=False)
     except json.JSONDecodeError:
         m = re.search(r"\{.*\}", body, re.S)
         if not m:
-            raise ValueError("no JSON object in the reply")
-        data = json.loads(m.group(0), strict=False)  # may raise: caller repairs
+            raise ValueError("no JSON object in the reply") from None
+        try:
+            return json.loads(m.group(0), strict=False)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"invalid JSON: {e}") from None
+
+
+def _str(value):
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def parse_reply(text):
+    """Model reply -> (facts, dropped reasons). Raises ValueError if it is not the JSON asked for.
+
+    Each item is checked on its own: a bad item is dropped with a reason, and never
+    costs the good facts beside it.
+    """
+    data = load_json_object(text)
     if not isinstance(data, dict) or not isinstance(data.get("memory"), list):
         raise ValueError('reply has no "memory" list')
     facts, dropped = [], []
     for item in data["memory"]:
-        text = (item.get("text") or "").strip() if isinstance(item, dict) else ""
-        if not text:
-            dropped.append("empty text")
+        if not isinstance(item, dict):
+            dropped.append("not an object")
             continue
-        if looks_secret(text):
+        fact_text = _str(item.get("text"))
+        if not fact_text:
+            dropped.append("no text")
+            continue
+        subject, attribute = _str(item.get("subject")), _str(item.get("attribute"))
+        if any(looks_secret(s) for s in (fact_text, subject or "", attribute or "")):
             dropped.append("looks like a credential")
             continue
         kind = item.get("kind")
-        until = item.get("expected_until")
+        until = _str(item.get("expected_until"))
         facts.append(Fact(
-            text=text,
+            text=fact_text,
             kind=kind if kind in KINDS else None,
-            subject=(item.get("subject") or None),
-            attribute=(item.get("attribute") or "").lower() or None,
-            temporary=bool(item.get("temporary")),
-            expected_until=until if isinstance(until, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", until) else None,
+            subject=subject,
+            attribute=attribute.lower() if attribute else None,
+            temporary=item.get("temporary") is True,
+            expected_until=until if until and re.fullmatch(r"\d{4}-\d{2}-\d{2}", until) else None,
         ))
     return facts, dropped
 
@@ -100,10 +137,10 @@ class Extractor:
         self.client, self.model, self.effort = client, model, effort
         self.version = f"{model}+{PROMPT_VERSION}"
 
-    def _call(self, messages, calls):
+    def _call(self, messages, calls, max_tokens=MAX_TOKENS):
         t = time.perf_counter()
         r = self.client.messages.create(
-            model=self.model, max_tokens=MAX_TOKENS,
+            model=self.model, max_tokens=max_tokens,
             system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
             messages=messages, output_config={"effort": self.effort})
         text = "".join(b.text for b in r.content if b.type == "text")
@@ -112,25 +149,48 @@ class Extractor:
                       "cache_write": u.cache_creation_input_tokens, "output_tokens": u.output_tokens,
                       "seconds": time.perf_counter() - t, "stop": r.stop_reason, "response": text,
                       "messages": messages})
-        return text
+        return text, r.stop_reason
 
     def extract(self, new_messages, observation_date, earlier_messages=(), already_extracted=()):
+        """One exchange -> ExtractResult. Never raises: failures are recorded in .error.
+
+        At most two calls. A refusal is recorded, not retried. A reply cut off at the
+        token cap, or an empty one, is retried fresh with twice the cap. A complete
+        reply that is not valid JSON gets one repair request.
+        """
         prompt = build_user_prompt(new_messages, observation_date, earlier_messages, already_extracted)
         messages = [{"role": "user", "content": prompt}]
         calls = []
         try:
-            reply = self._call(messages, calls)
+            reply, stop = self._call(messages, calls)
+            if stop == "refusal":
+                return ExtractResult([], calls, "refused")
+            if stop == "max_tokens" or not reply.strip():
+                reply, stop = self._call(messages, calls, max_tokens=2 * MAX_TOKENS)
+                facts, dropped = parse_reply(reply)
+                return ExtractResult(facts, calls, None, dropped)
             try:
                 facts, dropped = parse_reply(reply)
-            except (ValueError, json.JSONDecodeError) as e:
+            except ValueError as e:
                 messages = messages + [
                     {"role": "assistant", "content": reply},
                     {"role": "user", "content": f"That reply was not the JSON asked for ({e}). "
                                                 "Return only the corrected JSON object."}]
-                facts, dropped = parse_reply(self._call(messages, calls))
+                reply, stop = self._call(messages, calls)
+                facts, dropped = parse_reply(reply)
             return ExtractResult(facts, calls, None, dropped)
         except Exception as e:  # noqa: BLE001 - recorded, the caller decides
-            return ExtractResult([], calls, repr(e))
+            last = calls[-1]["stop"] if calls else None
+            return ExtractResult([], calls, f"{e!r} (last stop: {last})")
+
+
+def observation_date(when):
+    """A message time -> its London calendar date, 'YYYY-MM-DD'. Naive times are taken as UTC."""
+    if isinstance(when, datetime):
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return when.astimezone(TZ).date().isoformat()
+    return str(when or "")[:10]
 
 
 class HarnessAdapter:
@@ -145,7 +205,7 @@ class HarnessAdapter:
         earlier = [m for ex in session.exchanges[: index - 1] for m in ex][-EARLIER_MESSAGES:]
         times = getattr(session, "exchange_times", None) or []
         when = times[index - 1] if len(times) >= index and times[index - 1] else session.started_at
-        date = when.date().isoformat() if isinstance(when, datetime) else str(when or "")[:10]
+        date = observation_date(when)
         seen = self.by_session.setdefault(session.session_id, [])
         res = self.extractor.extract(exchange, date, earlier, seen[-ALREADY_EXTRACTED:])
         seen.extend(f.text for f in res.facts)

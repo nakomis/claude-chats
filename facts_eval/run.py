@@ -13,7 +13,7 @@ ignored/facts-eval/ in this repo, which git ignores): reference facts name hosts
 addresses and paths, and the runs hold transcript text and raw model replies, none
 of which belongs in a public repo. See facts_eval/README.md for the formats.
 
-Needs: CM's database (CM_DATABASE_URL or --db), AWS credentials for the Bedrock
+Needs: CM's database (--db, CM_DATABASE_URL, or the standard PG* variables), AWS credentials for the Bedrock
 judge (AWS_PROFILE / AWS_REGION), and whatever the extractor calls (an
 ANTHROPIC_API_KEY, Bedrock access, or a local Ollama).
 """
@@ -112,7 +112,7 @@ def main():
     ap.add_argument("--reference", help="reference set (default $FACTS_EVAL_DIR/reference.json)")
     ap.add_argument("--sessions", help="comma-separated session IDs: only these from the reference set")
     ap.add_argument("--label", help="suffix for the run's folder name")
-    ap.add_argument("--db", help="CM database DSN (default $CM_DATABASE_URL or Luke)")
+    ap.add_argument("--db", help="CM database DSN (default $CM_DATABASE_URL, else libpq's PG* variables)")
     ap.add_argument("--compare", action="store_true", help="print every stored run and exit")
     ap.add_argument("--export", nargs="+", metavar="SESSION_ID", help="print these sessions' exchanges and exit")
     args = ap.parse_args()
