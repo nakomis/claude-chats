@@ -196,6 +196,8 @@ def observation_date(when):
 class HarnessAdapter:
     """facts_eval's module: interface: add(session, index, exchange) per exchange, in order."""
 
+    parallel_sessions = True  # state is per session, so the harness may run sessions side by side
+
     def __init__(self, run_dir, extractor=None):
         self.extractor = extractor or Extractor()
         self.name = f"facts:{self.extractor.version}"

@@ -22,6 +22,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -55,10 +56,14 @@ def load_reference(path):
     return data["sessions"]
 
 
-def run_extractor(spec, sessions, out):
+def run_extractor(spec, sessions, out, workers=8):
+    """Exchanges run in order within a session. Sessions run side by side when the
+    extractor says it can (parallel_sessions = True); Mem0 shares one store, so it can't."""
     ex = extractors.make(spec, out)
-    rows = []
-    for s in sessions:
+    lock = threading.Lock()
+
+    def one_session(s):
+        rows = []
         for i, exchange in enumerate(s.exchanges, 1):
             t = time.perf_counter()
             res = ex.add(s, i, exchange)
@@ -67,11 +72,19 @@ def run_extractor(spec, sessions, out):
                    "calls": [{k: v for k, v in c.items() if k != "messages"} for c in res.calls]}
             row["parse_ok"] = [extractors.parses_as_json(c.get("response")) for c in res.calls]
             rows.append(row)
-            with open(out / "raw.jsonl", "a") as f:  # every prompt and reply, for reading failures back
-                f.write(json.dumps({**row, "prompts": [c.get("messages") for c in res.calls]}) + "\n")
-            print(f"  {s.name[:28]:28} #{i:<3} {row['seconds']:6.1f} s  facts {len(res.facts):2}"
-                  f"{'  ERROR ' + res.error[:60] if res.error else ''}", flush=True)
-    return rows
+            with lock:
+                with open(out / "raw.jsonl", "a") as f:  # every prompt and reply, for reading failures back
+                    f.write(json.dumps({**row, "prompts": [c.get("messages") for c in res.calls]}) + "\n")
+                print(f"  {s.name[:28]:28} #{i:<3} {row['seconds']:6.1f} s  facts {len(res.facts):2}"
+                      f"{'  ERROR ' + res.error[:60] if res.error else ''}", flush=True)
+        return rows
+
+    if getattr(ex, "parallel_sessions", False):
+        with ThreadPoolExecutor(workers) as pool:
+            per_session = list(pool.map(one_session, sessions))
+    else:
+        per_session = [one_session(s) for s in sessions]
+    return [r for rows in per_session for r in rows]
 
 
 def token_totals(rows):
