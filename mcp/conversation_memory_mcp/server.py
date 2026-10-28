@@ -26,6 +26,7 @@ DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@local
 # and an unreachable replica falls back to DB_URL rather than failing recall.
 READ_DB_URL = os.environ.get("CLAUDE_CHATS_READ_DB_URL") or None
 READ_CONNECT_TIMEOUT = 3  # seconds; a dead replica must not stall a recall
+READ_STATEMENT_TIMEOUT_MS = 5000  # nor must one that accepts the connection and then stalls
 
 CONTEXT_WINDOW = 2  # messages either side of a search hit
 
@@ -100,16 +101,35 @@ def _conn():
     return psycopg.connect(DB_URL)
 
 
-def _facts_conn() -> tuple[psycopg.Connection, str]:
-    """A connection for facts reads, and which side it is: "replica" when
-    CLAUDE_CHATS_READ_DB_URL is set and answers, otherwise "primary". A replica
-    that is down or refusing us is not an error: the primary has the same rows."""
+def _run_facts_query(dsn: str, options: str | None, vec: str | None,
+                     sql: str, params: list, **connect_kw) -> tuple[list, str | None]:
+    """Run the recall query on one database: connect, enable the HNSW iterative
+    scan when there is a vector half, execute. Returns (rows, iterative-scan
+    value in effect). Raises psycopg.Error on any failure, for the caller to
+    decide whether another database should be tried."""
+    with psycopg.connect(dsn, options=options, **connect_kw) as conn:
+        with conn.cursor() as cur:
+            scan = _enable_hnsw_iterative_scan(cur) if vec is not None else None
+            cur.execute(sql, params)
+            return cur.fetchall(), scan
+
+
+def _facts_rows(vec: str | None, sql: str, params: list) -> tuple[list, str | None, str]:
+    """(rows, iterative-scan value, side) for a facts read. Tries the replica
+    (CLAUDE_CHATS_READ_DB_URL) first when set, with connect and statement
+    timeouts; *any* failure there — down, stalled, lagging and missing the
+    tables — retries the whole query on the primary. A replica is an
+    optimisation, never a reason for recall to fail."""
     if READ_DB_URL:
         try:
-            return psycopg.connect(READ_DB_URL, connect_timeout=READ_CONNECT_TIMEOUT), "replica"
+            rows, scan = _run_facts_query(
+                READ_DB_URL, f"-c statement_timeout={READ_STATEMENT_TIMEOUT_MS}",
+                vec, sql, params, connect_timeout=READ_CONNECT_TIMEOUT)
+            return rows, scan, "replica"
         except psycopg.Error:
             pass
-    return psycopg.connect(DB_URL), "primary"
+    rows, scan = _run_facts_query(DB_URL, None, vec, sql, params)
+    return rows, scan, "primary"
 
 
 def _aware_utc(ts: datetime) -> datetime:
@@ -851,7 +871,9 @@ def recall_facts(
     search_memory when you need the conversation itself.
 
     Ranking: hybrid vector + full-text search fused with Reciprocal Rank
-    Fusion, then multiplied by 2^(-age / half_life), age counted from when the
+    Fusion (the full-text half uses websearch_to_tsquery, so every term must
+    match: a natural-language question is carried by the vector half), then
+    multiplied by 2^(-age / half_life), age counted from when the
     fact was last confirmed.  Half-lives: identity 10 years, config 9 months,
     situation 2 weeks; events never decay.  A superseded fact is hidden unless
     include_history=True.  No LLM is called.
@@ -923,16 +945,12 @@ def recall_facts(
     sql = _facts_sql(vec is not None, where)
     params = _facts_params(vec, query, where_params, candidates)
 
-    conn, read_from = _facts_conn()
-    with conn:
-        with conn.cursor() as cur:
-            if vec is not None and _enable_hnsw_iterative_scan(cur) != "relaxed_order":
-                warnings.append(
-                    "pgvector HNSW iterative scans are unavailable; with filters the "
-                    "vector half of this search can return fewer results than asked for."
-                )
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+    rows, scan, read_from = _facts_rows(vec, sql, params)
+    if vec is not None and scan != "relaxed_order":
+        warnings.append(
+            "pgvector HNSW iterative scans are unavailable; with filters the "
+            "vector half of this search can return fewer results than asked for."
+        )
 
     now = datetime.now(timezone.utc)
     results = [present_fact(r[:-1], r[-1], now) for r in rows]

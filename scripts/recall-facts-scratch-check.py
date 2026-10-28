@@ -7,7 +7,7 @@ applies the repo's init.sql to it, inserts a handful of conversations and facts
 its real code path, then drops the scratch database in a finally block. It never
 connects to claude_chats itself.
 
-    CLAUDE_CHATS_ADMIN_DSN=postgresql://claude:claude@luke.local:5432/postgres \\
+    CLAUDE_CHATS_ADMIN_DSN=postgresql://USER:PASSWORD@HOST:PORT/postgres \\
         uv run --project mcp python scripts/recall-facts-scratch-check.py
 
 The admin DSN's role needs CREATEDB. Exits non-zero if any check fails.
@@ -25,7 +25,7 @@ import psycopg
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "mcp"))
 
-ADMIN_DSN = os.environ.get("CLAUDE_CHATS_ADMIN_DSN", "postgresql://claude:claude@luke.local:5432/postgres")
+ADMIN_DSN = os.environ.get("CLAUDE_CHATS_ADMIN_DSN")
 NOW = datetime.now(timezone.utc)
 
 
@@ -38,21 +38,34 @@ def with_dbname(dsn: str, name: str) -> str:
     return urlunsplit(parts._replace(path="/" + name))
 
 
+def dead_port(dsn: str) -> str:
+    """The same DSN pointed at port 1, where nothing listens."""
+    parts = urlsplit(dsn)
+    userinfo = parts.netloc.rpartition("@")[0]
+    return urlunsplit(parts._replace(netloc=(userinfo + "@" if userinfo else "") + f"{parts.hostname}:1"))
+
+
 # (key, text, kind, subject, attribute, observed days ago, confirmed days ago,
 #  valid_to days ago | None, superseded by key | None, expected_until offset | None,
 #  conversation key | None, source, host, deleted)
 FACTS = [
-    ("ram_old", "Mace has 8 GB of RAM", "config", "Mace", "RAM", 200, 200, 30, "ram_new", None, "c1", None, "mu", False),
-    ("ram_new", "Mace has 32 GB of RAM since the upgrade", "config", "Mace", "RAM", 30, 30, None, None, None, "c1", None, "mu", False),
-    ("cat", "Tau is a black and white tuxedo cat who loves radiators", "identity", "Tau", "appearance", 900, 900, None, None, None, "c2", None, "luke", False),
-    ("away", "Martin is away on holiday in Cornwall", "situation", "Martin", "location", 40, 40, None, None, -20, "c2", None, "mu", False),
-    ("fix", "The Mace disk was replaced after the SMART failure", "event", "Mace", "disk", 1000, 1000, None, None, None, "c1", None, "mu", False),
-    ("doc", "Luke runs Postgres on port 5432 for conversation memory", "config", "Luke", "postgres port", 10, 10, None, None, None, None, "docs/hosts.md", None, False),
-    ("gone", "Mace has 64 GB of RAM", "config", "Mace", "RAM", 5, 5, None, None, None, "c1", None, "mu", True),
+    ("ram_old", "Mace has 8 GB of RAM", "config", "Mace", "RAM", 200, 200, 30, "ram_new", None, "c1", None, "host-a", False),
+    ("ram_new", "Mace has 32 GB of RAM since the upgrade", "config", "Mace", "RAM", 30, 30, None, None, None, "c1", None, "host-a", False),
+    ("cat", "Tau is a black and white tuxedo cat who loves radiators", "identity", "Tau", "appearance", 900, 900, None, None, None, "c2", None, "host-b", False),
+    ("away", "Martin is away on holiday in Cornwall", "situation", "Martin", "location", 40, 40, None, None, -20, "c2", None, "host-a", False),
+    ("fix", "The Mace disk was replaced after the SMART failure", "event", "Mace", "disk", 1000, 1000, None, None, None, "c1", None, "host-a", False),
+    ("doc", "Host Alpha runs Postgres on port 5432 for conversation memory", "config", "Alpha", "postgres port", 10, 10, None, None, None, None, "docs/hosts.md", None, False),
+    ("gone", "Mace has 64 GB of RAM", "config", "Mace", "RAM", 5, 5, None, None, None, "c1", None, "host-a", True),
 ]
 
 
 def main() -> int:
+    if not ADMIN_DSN:
+        print("usage: CLAUDE_CHATS_ADMIN_DSN=postgresql://USER:PASSWORD@HOST:PORT/postgres "
+              "uv run --project mcp python scripts/recall-facts-scratch-check.py\n"
+              "CLAUDE_CHATS_ADMIN_DSN is required: a role with CREATEDB on the server to test against.",
+              file=sys.stderr)
+        return 2
     from conversation_memory_mcp import server
     from conversation_memory_mcp.embed import get_embedding
 
@@ -74,8 +87,8 @@ def main() -> int:
         with psycopg.connect(dsn, autocommit=True) as db:
             db.execute((ROOT / "init.sql").read_text())
             convs = {}
-            for key, sess, proj, host in (("c1", "sess-mace", "/repos/mace", "mu"),
-                                          ("c2", "sess-cats", "/repos/cats", "luke")):
+            for key, sess, proj, host in (("c1", "sess-mace", "/repos/mace", "host-a"),
+                                          ("c2", "sess-cats", "/repos/cats", "host-b")):
                 convs[key] = db.execute(
                     "INSERT INTO conversations (session_id, project_path, ai_title, host) "
                     "VALUES (%s, %s, %s, %s) RETURNING id", (sess, proj, f"title of {sess}", host)
@@ -103,7 +116,7 @@ def main() -> int:
         # Point the MCP at the scratch database, with a dead replica DSN to
         # exercise the fallback as well.
         server.DB_URL = dsn
-        server.READ_DB_URL = with_dbname(ADMIN_DSN, scratch).replace("5432", "1")
+        server.READ_DB_URL = dead_port(dsn)
 
         def texts(res):
             return [r["text"] for r in res["results"]]
@@ -142,8 +155,8 @@ def main() -> int:
         ev = next((x for x in d["results"] if x["kind"] == "event"), None)
         check("event does not decay", ev is not None and ev["still_true_pct"] == 100)
 
-        doc = server.recall_facts("Postgres port on Luke")
-        dr = next((x for x in doc["results"] if "5432" in x["text"]), None)
+        doc = server.recall_facts("Postgres port on Alpha")
+        dr = next((x for x in doc["results"] if "Alpha" in x["text"]), None)
         check("doc fact reports its source", dr is not None and dr["source"] == {"source": "docs/hosts.md"}, str(dr))
 
         k = server.recall_facts("Mace", kind="event")
@@ -151,12 +164,12 @@ def main() -> int:
         p = server.recall_facts("Mace", project_path="/repos/cats")
         check("project_path filter excludes other projects and doc facts",
               all(x["source"].get("session_id") == "sess-cats" for x in p["results"]), str(texts(p)))
-        hs = server.recall_facts("Mace Luke Tau", host="luke")
-        check("host filter", hs["results"] and all(x["host"] == "luke" for x in hs["results"]), str(texts(hs)))
+        hs = server.recall_facts("Mace Alpha Tau", host="host-b")
+        check("host filter", hs["results"] and all(x["host"] == "host-b" for x in hs["results"]), str(texts(hs)))
         s = server.recall_facts("Mace", since="60 days")
         check("since filter drops facts last confirmed earlier",
               "The Mace disk was replaced after the SMART failure" not in texts(s) and texts(s), str(texts(s)))
-        check("limit honoured", len(server.recall_facts("Mace Luke Tau", limit=2)["results"]) == 2)
+        check("limit honoured", len(server.recall_facts("Mace Alpha Tau", limit=2)["results"]) == 2)
 
         # Embedder down: full-text fallback.
         orig = server.get_embedding

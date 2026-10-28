@@ -14,7 +14,6 @@ from conversation_memory_mcp import server
 from conversation_memory_mcp.server import (
     FACT_HALF_LIFE_DAYS,
     _fact_filters,
-    _facts_conn,
     _facts_params,
     _facts_sql,
     decay_factor,
@@ -208,22 +207,74 @@ def test_fulltext_only_sql_has_no_vector_half():
 
 
 # ---------------------------------------------------------------------------
-# Read DSN
+# Read DSN, and the replica fallback
 # ---------------------------------------------------------------------------
 
+class _FakeCursor:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.conn.executed.append(sql)
+        if self.conn.fail_on and self.conn.fail_on in sql:
+            raise server.psycopg.errors.QueryCanceled("statement timeout")
+        self._last = sql
+
+    def fetchone(self):
+        return ("relaxed_order",)
+
+    def fetchall(self):
+        return self.conn.rows
+
+
+class _FakeConn:
+    def __init__(self, dsn, rows, fail_on=None):
+        self.dsn, self.rows, self.fail_on, self.executed = dsn, rows, fail_on, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return _FakeCursor(self)
+
+    def rollback(self):
+        pass
+
+
 class _FakePsycopg:
-    def __init__(self, failing):
-        self.failing, self.calls = failing, []
+    """Stands in for psycopg.connect: per-DSN rows, connect failures, and
+    queries that fail (a stalled or lagging replica)."""
 
-    def connect(self, dsn, **kw):
-        self.calls.append(dsn)
-        if dsn in self.failing:
+    def __init__(self, rows=None, refuse=(), fail_query=()):
+        self.rows = rows or {}
+        self.refuse, self.fail_query = set(refuse), set(fail_query)
+        self.calls = []  # (dsn, options)
+        self.conns = []
+
+    def connect(self, dsn, options=None, **kw):
+        self.calls.append((dsn, options))
+        if dsn in self.refuse:
             raise server.psycopg.OperationalError("down")
-        return f"conn:{dsn}"
+        conn = _FakeConn(dsn, self.rows.get(dsn, []),
+                         fail_on="FROM   rrf" if dsn in self.fail_query else None)
+        self.conns.append(conn)
+        return conn
 
 
-def _patch(monkeypatch, read, failing=()):
-    fake = _FakePsycopg(failing)
+SQL = "SELECT 1 FROM   rrf r"
+
+
+def _patch(monkeypatch, read, **kw):
+    fake = _FakePsycopg(**kw)
     monkeypatch.setattr(server, "READ_DB_URL", read)
     monkeypatch.setattr(server, "DB_URL", "primary-dsn")
     monkeypatch.setattr(server.psycopg, "connect", fake.connect)
@@ -231,20 +282,81 @@ def _patch(monkeypatch, read, failing=()):
 
 
 def test_no_read_dsn_uses_primary(monkeypatch):
-    fake = _patch(monkeypatch, None)
-    assert _facts_conn() == ("conn:primary-dsn", "primary")
-    assert fake.calls == ["primary-dsn"]
+    fake = _patch(monkeypatch, None, rows={"primary-dsn": ["p"]})
+    rows, _, side = server._facts_rows("[1]", SQL, [])
+    assert (rows, side) == (["p"], "primary")
+    assert [c[0] for c in fake.calls] == ["primary-dsn"]
 
 
-def test_read_dsn_used_when_reachable(monkeypatch):
-    _patch(monkeypatch, "replica-dsn")
-    assert _facts_conn() == ("conn:replica-dsn", "replica")
+def test_read_dsn_used_when_it_answers_with_a_statement_timeout(monkeypatch):
+    fake = _patch(monkeypatch, "replica-dsn", rows={"replica-dsn": ["r"]})
+    rows, _, side = server._facts_rows("[1]", SQL, [])
+    assert (rows, side) == (["r"], "replica")
+    assert fake.calls == [("replica-dsn", f"-c statement_timeout={server.READ_STATEMENT_TIMEOUT_MS}")]
 
 
 def test_unreachable_replica_falls_back_to_primary(monkeypatch):
-    fake = _patch(monkeypatch, "replica-dsn", failing={"replica-dsn"})
-    assert _facts_conn() == ("conn:primary-dsn", "primary")
-    assert fake.calls == ["replica-dsn", "primary-dsn"]
+    fake = _patch(monkeypatch, "replica-dsn", refuse={"replica-dsn"}, rows={"primary-dsn": ["p"]})
+    rows, _, side = server._facts_rows("[1]", SQL, [])
+    assert (rows, side) == (["p"], "primary")
+    assert [c[0] for c in fake.calls] == ["replica-dsn", "primary-dsn"]
+
+
+def test_replica_query_error_retries_whole_query_on_primary(monkeypatch):
+    fake = _patch(monkeypatch, "replica-dsn", fail_query={"replica-dsn"},
+                  rows={"primary-dsn": ["p"]})
+    rows, _, side = server._facts_rows("[1]", SQL, [])
+    assert (rows, side) == (["p"], "primary")
+    assert [c[0] for c in fake.calls] == ["replica-dsn", "primary-dsn"]
+
+
+def test_primary_failure_is_not_swallowed(monkeypatch):
+    _patch(monkeypatch, "replica-dsn", fail_query={"replica-dsn", "primary-dsn"})
+    with pytest.raises(server.psycopg.Error):
+        server._facts_rows("[1]", SQL, [])
+
+
+# ---------------------------------------------------------------------------
+# Status paths (fake database)
+# ---------------------------------------------------------------------------
+
+def _recall(monkeypatch, rows, embed_ok=True, **kw):
+    _patch(monkeypatch, None, rows={"primary-dsn": rows})
+    if embed_ok:
+        monkeypatch.setattr(server, "get_embedding", lambda *a, **k: [0.1, 0.2])
+    else:
+        def boom(*a, **k):
+            raise RuntimeError("down")
+        monkeypatch.setattr(server, "get_embedding", boom)
+    return server.recall_facts("ram", **kw)
+
+
+def test_no_results_with_default_window_has_no_warning(monkeypatch):
+    out = _recall(monkeypatch, [])
+    assert out["status"] == "no_results" and out["results"] == [] and "warning" not in out
+
+
+def test_no_results_in_a_since_window_suggests_widening(monkeypatch):
+    out = _recall(monkeypatch, [], since="30d")
+    assert out["status"] == "no_results"
+    assert out["since_utc"] is not None and "since='all'" in out["warning"]
+
+
+def test_embedder_failure_falls_back_to_fulltext(monkeypatch):
+    row = _row() + (0.016,)
+    out = _recall(monkeypatch, [row], embed_ok=False)
+    assert out["status"] == "fallback" and out["mode_used"] == "fulltext"
+    assert "Embedding service unavailable" in out["warning"]
+    assert len(out["results"]) == 1
+    # Full-text only: the SQL sent has no vector half.
+    assert "<=>" not in server._facts_sql(False, "")
+
+
+def test_results_are_resorted_by_decayed_score_and_cut_to_limit(monkeypatch):
+    fresh = _row(text="fresh", kind="situation", last_confirmed=NOW - timedelta(days=1)) + (0.0150,)
+    stale = _row(text="stale", kind="situation", last_confirmed=NOW - timedelta(days=200)) + (0.0160,)
+    out = _recall(monkeypatch, [stale, fresh], limit=1)
+    assert [r["text"] for r in out["results"]] == ["fresh"]
 
 
 # ---------------------------------------------------------------------------

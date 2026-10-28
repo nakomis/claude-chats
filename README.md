@@ -142,7 +142,9 @@ Once installed, these tools are available inside Claude Code:
 
 `recall_facts` searches the `facts` table (CHATS-21) the same way `search_memory`
 searches messages: the query is embedded locally and fused with a full-text match
-by Reciprocal Rank Fusion. The fused relevance is then multiplied by
+by Reciprocal Rank Fusion. (The full-text half uses `websearch_to_tsquery`, so
+every term must match; a natural-language question is carried by the vector half.)
+The fused relevance is then multiplied by
 `2^(-age / half_life)`, with age counted from the fact's `last_confirmed`, so a
 fact someone keeps relying on stays fresh.
 
@@ -173,8 +175,9 @@ an identity fact may be years old. `project_path` matches the fact's
 conversation, so docs and playbook facts never match it.
 
 Set `CLAUDE_CHATS_READ_DB_URL` to read facts from a different database, such as
-the read replica (CHATS-29). Unset, or unreachable within three seconds, it
-falls back to `CLAUDE_CHATS_DB_URL`; the result's `read_from` says which one
+the read replica (CHATS-29). Unset, or the replica failing in any way
+(unreachable within three seconds, a query over five seconds, missing tables), the
+whole query is retried on `CLAUDE_CHATS_DB_URL`; the result's `read_from` says which one
 answered. Only `recall_facts` uses it.
 
 `scripts/recall-facts-scratch-check.py` exercises the tool end to end against a
