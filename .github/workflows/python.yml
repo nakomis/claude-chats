@@ -92,6 +92,14 @@ jobs:
         run: |
           bash -n localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/smoke-localhost.sh
           shellcheck -S error localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/smoke-localhost.sh
+      - name: The systemd units are valid
+        run: |
+          mkdir -p /tmp/units
+          sed -e "s|UV_PATH|$(command -v true)|" -e "s|REPO_PATH|${GITHUB_WORKSPACE}|" \
+              -e "s|CONFIG_PATH|/tmp/config.env|" localhost/systemd/claude-chats-drain.service \
+              > /tmp/units/claude-chats-drain.service
+          cp localhost/systemd/claude-chats-drain.timer /tmp/units/
+          systemd-analyze verify /tmp/units/claude-chats-drain.timer /tmp/units/claude-chats-drain.service
       - name: docker-compose.yml resolves the shared init.sql
         run: |
           docker compose -f localhost/docker-compose.yml config > /tmp/compose.yml

@@ -69,3 +69,25 @@ def test_nothing_imports_the_deleted_copies():
         text = p.read_text(errors="replace")
         hits += [f"{rel}: {s}" for s in stale if s in text]
     assert hits == []
+
+
+def _timer_settings():
+    settings = {}
+    for line in (LOCALHOST / "systemd" / "claude-chats-drain.timer").read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith(("#", "[")) and "=" in line:
+            key, value = line.split("=", 1)
+            settings[key.strip()] = value.strip()
+    return settings
+
+
+def test_the_drain_timer_starts_whenever_it_is_enabled():
+    """OnUnitActiveSec only repeats; something must fire first, measured from
+    a moment that has not already passed when install.sh runs `enable --now`.
+    OnBootSec alone fails that the moment the machine has been up a minute."""
+    timer = _timer_settings()
+    assert "OnUnitActiveSec" in timer
+    starters = {"OnActiveSec", "OnCalendar"} & set(timer)
+    assert starters, f"nothing starts the chain: {timer}"
+    if starters == {"OnCalendar"}:
+        assert timer.get("Persistent") == "true"
