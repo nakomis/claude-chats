@@ -4,7 +4,9 @@ Conversation Memory MCP server.
 Provides semantic search and retrieval over Claude Code conversations that
 have been recorded by the Stop hook.
 
-Embedding provider is configured via CLAUDE_CHATS_PROVIDER — see embed.py.
+Embedding provider is configured via CLAUDE_CHATS_PROVIDER — see
+hook/hook/embed.py, shared with the hook so that queries and messages are
+embedded by the same code.
 """
 
 import calendar
@@ -16,7 +18,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from mcp.server.fastmcp import FastMCP
 
-from conversation_memory_mcp.embed import get_embedding
+from hook.embed import get_embedding
 
 DB_URL = os.environ.get("CLAUDE_CHATS_DB_URL", "postgresql://claude:claude@localhost:5433/claude_chats")
 
