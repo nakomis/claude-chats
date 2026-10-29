@@ -1,0 +1,24 @@
+# A stand-in for the hook package that used to live here (CHATS-37). No code.
+#
+# Installs from before October 2026 run `uv run --project <checkout>/localhost/hook
+# record-conversation` from ~/.claude/settings.json, and their LaunchAgent runs
+# `drain-outbox` the same way. A `git pull` deletes that package, and until
+# ./install.sh is re-run those commands would fail with uv's exit status 2,
+# which Claude Code takes as "block": every prompt refused, every stop
+# overridden. This project resolves the same commands to the shared ../../hook
+# instead, so in that gap capture keeps working (into the outbox; nothing is
+# drained until the re-run, unless an old LaunchAgent does it).
+#
+# install.sh never points anything here. Delete this directory once no install
+# from before October 2026 can be left.
+[project]
+name = "claude-chats-localhost-hook-shim"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = ["claude-chats-hook"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+claude-chats-hook = { path = "../../hook", editable = true }
