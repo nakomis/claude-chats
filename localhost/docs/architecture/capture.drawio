@@ -1,17 +1,17 @@
 <mxfile host="app.diagrams.net" type="device">
-  <diagram name="durable capture" id="localhost-durable">
+  <diagram name="capture" id="localhost-capture">
     <mxGraphModel dx="1000" dy="780" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1000" pageHeight="760" background="#FFFFFF" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
-        <mxCell id="g1" value="Your machine — durable capture" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#6C8EBF;dashed=1;dashPattern=8 4;verticalAlign=top;align=left;spacingLeft=14;spacingTop=6;fontStyle=1;fontSize=13;fontColor=#3F5F8F;" vertex="1" parent="1">
+        <mxCell id="g1" value="Your machine — single-machine edition" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#6C8EBF;dashed=1;dashPattern=8 4;verticalAlign=top;align=left;spacingLeft=14;spacingTop=6;fontStyle=1;fontSize=13;fontColor=#3F5F8F;" vertex="1" parent="1">
           <mxGeometry x="40" y="40" width="900" height="660" as="geometry" />
         </mxCell>
 
         <mxCell id="n1" value="&lt;b&gt;Claude Code session&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;~/.claude/projects/**/*.jsonl&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="90" y="90" width="380" height="46" as="geometry" />
         </mxCell>
-        <mxCell id="n5" value="&lt;b&gt;MCP server&lt;/b&gt; — conversation-memory&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;search_memory · get_conversation · list_recent_sessions&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="n5" value="&lt;b&gt;MCP server&lt;/b&gt; — conversation-memory&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;search_memory · get_conversation · list_recent_sessions · recall_facts&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="540" y="90" width="340" height="68" as="geometry" />
         </mxCell>
         <mxCell id="n2" value="&lt;b&gt;hook&lt;/b&gt; — record-conversation&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;no network I/O · cannot fail&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
@@ -26,7 +26,7 @@
         <mxCell id="n9" value="&lt;b&gt;image archive&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;~/.claude-chats/images + sidecars&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=8;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="540" y="290" width="340" height="66" as="geometry" />
         </mxCell>
-        <mxCell id="n8" value="&lt;b&gt;drainer&lt;/b&gt; — drain-outbox&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;launchd · every 2 minutes&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="n8" value="&lt;b&gt;drainer&lt;/b&gt; — drain-outbox&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;started by the hook after each capture · launchd / systemd every 2 min as backstop&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="90" y="390" width="380" height="66" as="geometry" />
         </mxCell>
         <mxCell id="n6" value="&lt;b&gt;PostgreSQL + pgvector&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Docker · localhost:5433 · conversations · messages&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=12;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=12;" vertex="1" parent="1">
@@ -58,7 +58,7 @@
             <Array as="points"><mxPoint x="520" y="423" /><mxPoint x="520" y="231" /></Array>
           </mxGeometry>
         </mxCell>
-        <mxCell id="e7" value="INSERT (with vector)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;strokeColor=#D79B00;strokeWidth=2;fontSize=10;fontColor=#A67400;" edge="1" parent="1" source="n8" target="n6">
+        <mxCell id="e7" value="upsert (with vector)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;strokeColor=#D79B00;strokeWidth=2;fontSize=10;fontColor=#A67400;" edge="1" parent="1" source="n8" target="n6">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="e8" value="embed query" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#9673A6;fontSize=10;fontColor=#9673A6;" edge="1" parent="1" source="n5" target="n3">

@@ -20,45 +20,17 @@ Pick one embedding provider:
 - **Amazon Bedrock** — uses your existing AWS credentials. No extra software.
 - **OpenAI** — set `OPENAI_API_KEY`.
 
-On Linux everything works except the drainer's schedule, which uses launchd.
-See [Running the drainer on Linux](#running-the-drainer-on-linux).
+macOS and Linux are both supported. The drain's two-minute backstop is a
+LaunchAgent on macOS and a systemd user timer on Linux.
 
-## 2. Choose a capture mode
+## 2. Install
 
-The installer asks. If you would rather decide now:
-
-|  | **direct** | **durable** |
-|---|---|---|
-| The hook | embeds and writes to Postgres inline | appends to a local SQLite outbox |
-| Searchable | immediately | within ~2 minutes |
-| Moving parts | hook, Postgres, provider | hook, outbox, drainer, Postgres, provider |
-| If Postgres is down | message goes to a fallback file, needs `--replay-fallback` | message waits in the outbox, drains by itself |
-| If the provider is down | message stored, vector missing (fix with `--backfill`) | same |
-| Background process | none | a LaunchAgent every 2 minutes |
-
-**Pick `durable` if you are unsure.** It is the default, and it is what the
-distributed edition does, for the reason recorded in `hook/hook/record.py`: the
-original direct implementation failed *silently* whenever Docker was down, and a
-conversation you never notice losing is worse than one that arrives late.
-
-**Pick `direct` if** you want the fewest possible moving parts, you keep Docker
-running anyway, and you would rather see a message in the database the instant a
-session ends.
-
-You can change your mind at any time — see [Switching mode](#switching-mode).
-
-## 3. Install
+The installer lives in `localhost/`, and installs the hook and MCP server from
+the repository root (`../hook`, `../mcp`), so run it from a full checkout:
 
 ```bash
-cd localhost
+cd claude-chats/localhost
 ./install.sh
-```
-
-To skip the prompt, or to install non-interactively:
-
-```bash
-./install.sh --mode durable
-./install.sh --mode direct
 ```
 
 To pick a provider other than Ollama:
@@ -71,32 +43,47 @@ CLAUDE_CHATS_PROVIDER=openai OPENAI_API_KEY=sk-... ./install.sh
 The script:
 
 1. checks the prerequisites;
-2. starts the PostgreSQL container and applies `init.sql` (idempotent, so this
+2. starts the PostgreSQL container and applies `../init.sql` (idempotent, so this
    also picks up schema changes on an existing database);
 3. pulls the Ollama model, if that is your provider;
-4. creates the two virtualenvs;
-5. records your choices in `~/.claude-chats/config.env`;
+4. creates the two virtualenvs (`../hook/.venv`, `../mcp/.venv`);
+5. records your choices in `~/.claude-chats/config.env` (mode 600: it may hold
+   an API key);
 6. registers the `conversation-memory` MCP server with Claude Code;
-7. adds the `Stop` and `UserPromptSubmit` hooks to `~/.claude/settings.json`;
-8. in durable mode, installs the drain LaunchAgent.
+7. adds the `Stop`, `UserPromptSubmit` and `SessionEnd` hooks to
+   `~/.claude/settings.json`, with `CLAUDE_CHATS_DRAIN_AFTER_CAPTURE=1` so the
+   hook starts a drain after each capture;
+8. installs the drain schedule: a LaunchAgent on macOS, a systemd user timer on
+   Linux.
 
 Every step is idempotent. Re-run it as often as you like.
 
 **Restart Claude Code** afterwards so it picks up the new MCP server.
 
-## 4. Check it worked
+### What the hook command carries, and what it does not
 
-Send a message in any Claude Code session and stop the session. Then:
+The hook entry in `settings.json` looks like this:
+
+```
+CLAUDE_CHATS_DRAIN_AFTER_CAPTURE=1 uv run --project "/path/to/claude-chats/hook" record-conversation
+```
+
+No database URL, provider or API key: the hook only ever writes local files.
+The drain it starts reads those settings from `~/.claude-chats/config.env`, as
+the timer's drain does. Without `CLAUDE_CHATS_DRAIN_AFTER_CAPTURE` the hook
+never drains — that is how the distributed edition runs it, where a forwarder
+owns the outbox.
+
+## 3. Check it worked
+
+Send a message in any Claude Code session. Then:
 
 ```bash
-# durable mode: the message is in the outbox, and drains within ~2 minutes
+# should be 0 within a second or two: the hook's drain has delivered it
 sqlite3 ~/.claude-chats/outbox.db \
   'SELECT count(*) FROM outbox WHERE sent_at IS NULL'
 
-# force the drain rather than waiting
-./install.sh --drain
-
-# either mode: the message should now be in Postgres, with a vector
+# the message should be in Postgres, with a vector
 docker exec claude-chats-db psql -U claude -d claude_chats \
   -c 'SELECT count(*) AS messages, count(embedding) AS embedded FROM messages'
 ```
@@ -110,31 +97,37 @@ All of it hangs off the same script:
 
 | Command | What it does |
 |---|---|
-| `./install.sh --mode direct\|durable` | Install, or switch capture mode |
+| `./install.sh` | Install, upgrade, or pick up changed settings |
 | `./install.sh --drain` | Drain the outbox into Postgres right now |
 | `./install.sh --backfill` | Re-embed every message that has no vector, and rebuild the vector index |
 | `./install.sh --replay-fallback` | Recover messages from the fallback file, then drain |
 | `./install.sh --backup [path]` | `pg_dump` to a local file (default `~/.claude-chats/backups/`) |
 | `./install.sh --restore [file]` | Restore a dump, then backfill the vectors |
-| `./install.sh --uninstall` | Remove the hook, the MCP registration and the LaunchAgent |
+| `./install.sh --uninstall` | Remove the hook, the MCP registration and the drain schedule |
 
 Backups deliberately exclude the embedding vectors: they are incompressible, they
 dominate the dump, and they are fully regenerable from message content. That is
 why `--restore` runs a backfill at the end, and why it is the slow part.
+`--backup` and `--restore` run the repository's `scripts/backup.sh --local` and
+`scripts/restore.sh --local`, which can be run directly too.
 
-### Switching mode
+### Upgrading an older install
 
-```bash
-./install.sh --mode direct
-```
+Re-run `./install.sh` from an up-to-date checkout. It:
 
-Switching **durable → direct** drains the outbox first, because once direct mode
-is in force nothing else will. If the drain fails the switch is refused rather
-than stranding your messages — fix the problem (usually: Postgres is not
-running) and re-run.
+- rewrites the hook entries and the MCP registration, so nothing points at the
+  old `localhost/hook` or `localhost/mcp` copies any more (those directories no
+  longer exist);
+- moves an install that used the removed `direct` capture mode to the outbox,
+  and drops the database settings that mode put on the hook command line;
+- re-applies `../init.sql`, which adds the columns and tables the old schema
+  lacked (`author`, `tool_name`, `model`, the facts tables, …) without touching
+  existing rows. Messages recorded before the upgrade keep `author = 'unknown'`;
+- leaves the database volume, the outbox, the image archive and any fallback
+  file exactly as they were. If it finds `~/.claude-chats/outbox-fallback.ndjson`
+  it says so: run `./install.sh --replay-fallback`.
 
-Switching **direct → durable** needs nothing special. Run
-`./install.sh --replay-fallback` afterwards if a fallback file has accumulated.
+Restart Claude Code afterwards.
 
 ### Switching embedding provider
 
@@ -158,51 +151,21 @@ Note that `init.sql` declares `vector(1024)`. A provider whose output is a
 different width needs `CLAUDE_CHATS_DIMENSIONS` set to something it supports
 (Titan v2: 256/512/1024; OpenAI 3-series: arbitrary), or a schema change.
 
-### Running the drainer on Linux
-
-The installer schedules the drainer with launchd, which is macOS-only. On Linux,
-install it as a user timer instead:
-
-```ini
-# ~/.config/systemd/user/claude-chats-drain.service
-[Unit]
-Description=Drain the claude-chats outbox into PostgreSQL
-
-[Service]
-Type=oneshot
-EnvironmentFile=%h/.claude-chats/config.env
-ExecStart=/usr/bin/env uv run --project /path/to/claude-chats/localhost/hook drain-outbox
-```
-
-```ini
-# ~/.config/systemd/user/claude-chats-drain.timer
-[Unit]
-Description=Drain the claude-chats outbox every 2 minutes
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=2min
-
-[Install]
-WantedBy=timers.target
-```
-
-```bash
-systemctl --user enable --now claude-chats-drain.timer
-```
-
 ## Troubleshooting
 
 **Nothing is being recorded at all.**
 Check the hook is registered: `grep -c record-conversation ~/.claude/settings.json`
-should be 2 (one `Stop`, one `UserPromptSubmit`). Hooks are read when Claude Code
-starts, so restart it after an install.
+should be 3 (`Stop`, `UserPromptSubmit`, `SessionEnd`). Hooks are read when
+Claude Code starts, so restart it after an install.
 
 **Messages are in the outbox but never reach Postgres.**
-Read `/tmp/claude-chats-drain.log`. Then run `./install.sh --drain` by hand — it
-prints the real error. Check the agent is loaded with
-`launchctl list | grep claude-chats`. The most common cause is that Postgres is
-not running: `docker compose -f docker-compose.yml up -d`.
+Read `~/.claude-chats/drain.log` (the hook's drains) and
+`/tmp/claude-chats-drain.log` (the LaunchAgent's) or
+`journalctl --user -u claude-chats-drain` (the systemd timer's). Then run
+`./install.sh --drain` by hand — it prints the real error. The most common cause
+is that Postgres is not running: `docker compose -f docker-compose.yml up -d`.
+Each pending row also records its last error:
+`sqlite3 ~/.claude-chats/outbox.db 'SELECT attempts, last_error FROM outbox WHERE sent_at IS NULL LIMIT 5'`.
 
 **`~/.claude-chats/outbox-fallback.ndjson` exists.**
 Something broke on the capture path and this is the safety net catching it.
@@ -236,7 +199,7 @@ same port and container name. Run one or the other, not both.
 ./install.sh --uninstall
 ```
 
-That removes the hook entries, the MCP registration and the LaunchAgent, and
+That removes the hook entries, the MCP registration and the drain schedule, and
 deliberately leaves your data alone. To remove that too:
 
 ```bash
@@ -248,11 +211,15 @@ rm -rf ~/.claude-chats                          # outbox, images, config, backup
 
 | Path | What |
 |---|---|
-| `~/.claude-chats/outbox.db` | The SQLite outbox (durable mode) |
+| `~/.claude-chats/outbox.db` | The SQLite outbox |
+| `~/.claude-chats/outbox.db.drain.lock` | The lock concurrent drains take turns on |
+| `~/.claude-chats/drain.log` | Output of the drains the hook starts (rolled over at 1 MB) |
 | `~/.claude-chats/outbox-fallback.ndjson` | Last-resort capture when the outbox itself fails |
 | `~/.claude-chats/images/` | Archived images with JSON sidecars |
-| `~/.claude-chats/config.env` | What the installer recorded; read by the maintenance commands |
+| `~/.claude-chats/config.env` | What the installer recorded; read by every drain and the maintenance commands |
 | `~/.claude-chats/backups/` | Default destination for `--backup` |
 | `~/.claude/settings.json` | Where the hook is registered |
-| `/tmp/claude-chats-drain.log` | Drainer output |
+| `~/Library/LaunchAgents/com.nakomis.claude-chats-drain.plist` | The drain schedule (macOS) |
+| `~/.config/systemd/user/claude-chats-drain.{service,timer}` | The drain schedule (Linux) |
+| `/tmp/claude-chats-drain.log` | The LaunchAgent's drain output |
 | Docker volume `localhost_pgdata` | The database itself |

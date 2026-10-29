@@ -18,51 +18,98 @@ If you find this useful, please consider buying me a coffee:
 ## Install
 
 ```bash
-cd localhost
+git clone https://github.com/nakomis/claude-chats.git
+cd claude-chats/localhost
 ./install.sh
 ```
 
-It asks which capture mode you want, then does the rest. Full details, including
-the maintenance commands, are in **[INSTALL.md](INSTALL.md)**.
+It needs Docker, uv, Claude Code and an embedding provider (Ollama by default).
+Full details, including the maintenance commands, are in
+**[INSTALL.md](INSTALL.md)**. Installed from an older checkout? Re-run
+`./install.sh` — see [Upgrading](INSTALL.md#upgrading-an-older-install).
 
 ## How it works
 
+![Capture on a single machine](docs/architecture/capture.svg)
+
 A hook fires on every user message and again at session end. It reads the
-session transcript, works out which messages are new, and records them. The MCP
-server then searches them — semantically, by full text, or both.
+session transcript, works out which messages are new, and appends them to a
+local SQLite outbox. That is all it does in the foreground: no network I/O, no
+credentials, nothing that can be "down", so a stopped database or a dead
+embedding provider can delay a message but never lose it.
 
-There are two ways the recording half can work, chosen at install time.
+Then the hook starts `drain-outbox` as a detached background process and
+returns without waiting for it. The drain embeds the new messages and writes
+them to Postgres, usually within a second or two, and blanks each outbox row
+once Postgres has committed it. If anything is down, the rows stay in the
+outbox; a LaunchAgent (macOS) or systemd user timer (Linux) runs the same drain
+every two minutes as the backstop, so they are delivered as soon as it is back.
 
-### direct
+Two drains can be running at once — the hook's and the timer's, or two hooks'
+from two sessions — so they take turns on a lock file beside the outbox, and the
+one holding it keeps going until the outbox is empty. Writes are upserts keyed
+on each message's id as well, so even a drain that slipped past the lock would
+rewrite the same rows rather than duplicate them.
 
-The hook does everything inline: embed, then write.
+This is the same split the distributed edition uses, with its forwarder, SQS
+queue and remote consumer collapsed into one local process.
 
-![Direct capture](docs/architecture/capture-direct.svg)
+*Diagram source: [`docs/architecture/`](docs/architecture). The SVG is
+regenerated on commit by the repository's `githooks/pre-commit`.*
 
-Simplest, and a message is searchable the moment the session stops. The cost is that capture now depends on Docker, Postgres and the embedding provider all being up. When one of them is not, the message goes to an append-only fallback file and waits for `./install.sh --replay-fallback`.
+### Why there is no longer a `direct` mode
 
-### durable
+Earlier versions could also run the hook in `direct` mode, embedding and writing
+to Postgres from inside the hook. It was simpler and immediate, but it put
+Docker, Postgres and the embedding provider on the capture path — exactly the
+arrangement whose silent failures the outbox was invented to fix — and it meant
+maintaining a second write path that the distributed edition never used. The
+background drain makes the outbox just as immediate in practice, so `direct`
+was removed. Re-running `./install.sh` moves a `direct` install over; nothing
+already recorded is touched.
 
-Capture and delivery are split, and only capture has to be reliable.
+## What is shared, and what is not
 
-![Durable capture](docs/architecture/capture-durable.svg)
+This directory holds only what is specific to running on one machine. The code
+is the repository's own, the same code the distributed edition runs:
 
-The hook appends to a local SQLite file and does no network I/O at all, so a stopped database is a delay rather than a lost message — the outbox simply grows and drains later. The costs are one more moving part and a couple of minutes before a message becomes searchable.
+| Shared, at the repository root | |
+|---|---|
+| [`../hook`](../hook) | The capture hook, `drain-outbox`, `replay-fallback`, `backfill-embeddings`, and the one embedding helper |
+| [`../mcp`](../mcp) | The MCP server, which uses the hook's embedding helper |
+| [`../init.sql`](../init.sql) | The schema; `docker-compose.yml` mounts it, and `install.sh` re-applies it on every run |
+| [`../scripts/backup.sh`, `restore.sh`](../scripts) | Backups, with `--local` (used here) or `--s3` |
 
-This is the same split the distributed edition uses, with its forwarder, SQS queue and remote consumer collapsed into one local process.
+| Here, and why it stays separate | |
+|---|---|
+| `install.sh` | Starts Postgres in Docker, registers the hook with `CLAUDE_CHATS_DRAIN_AFTER_CAPTURE=1` and the MCP server, installs the drain schedule. The distributed edition is installed from two repositories and has none of these steps. |
+| `docker-compose.yml` | The local Postgres. It stays in this directory because Compose names the data volume after it (`localhost_pgdata`); moving it would orphan existing databases. |
+| `launchd/`, `systemd/` | The drain schedule. Only this edition drains locally: in the distributed edition the forwarder owns the outbox, and a local drain would compete with it. |
+| `README.md`, `INSTALL.md`, `docs/` | This edition's documentation. |
 
-*Diagram sources: [`docs/architecture/`](docs/architecture). The SVGs are regenerated on commit by the repository's `githooks/pre-commit`.*
+`tests/test_localhost_layout.py` fails if any `.py` or `.sql` file appears here
+again: the previous copies drifted months behind the originals within weeks.
 
 ## What you get
 
-Three MCP tools, available to Claude in any project once you restart Claude Code:
+MCP tools, available to Claude in any project once you restart Claude Code:
 
 | Tool | What it does |
 |---|---|
 | `search_memory` | Hybrid semantic + full-text search across every recorded message |
 | `get_conversation` | Fetch a full transcript by session id |
 | `list_recent_sessions` | Browse what has been recorded lately |
+| `recall_facts` | Durable facts extracted from conversations. Empty unless you also run the [facts extractor](../facts/README.md), which needs an Anthropic API key |
+
+Each message records who produced it — you, Claude or a tool (and which tool,
+or which model) — so what you typed can be told apart from command output.
 
 Images you paste into Claude are archived too, under `~/.claude-chats/images`,
 each with a JSON sidecar recording where it came from. A search hit that mentions
 an image can be resolved back to the actual picture by its sha256.
+
+## Support
+
+If you find this useful, please consider buying me a coffee:
+
+[![Donate with PayPal](https://www.paypalobjects.com/en_GB/i/btn/btn_donate_SM.gif)](https://www.paypal.com/donate?hosted_button_id=Q3BESC73EWVNN&custom=claude-chats)

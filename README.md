@@ -68,13 +68,14 @@ The `server/` directory — the ActiveMQ container, the Node STOMP worker, `serv
 
 | Path | What |
 |---|---|
-| `hook/` | The capture hook, embedding helper, backfill and image archiving |
-| `mcp/` | The MCP server — hybrid search, transcript retrieval, session listing |
-| `init.sql` | Source of truth for the Postgres schema |
-| `scripts/` | Backup/restore, LaunchAgent setup, embedding evaluation harnesses, and `cjump` (jump to a past conversation: raise its Terminal window, or `claude --resume` it) |
+| `hook/` | The capture hook, embedding helper (the only copy: `mcp/` depends on this package for it), backfill, image archiving, and `drain-outbox` / `replay-fallback` for the single-machine edition |
+| `mcp/` | The MCP server — hybrid search, transcript retrieval, session listing, fact recall |
+| `init.sql` | Source of truth for the Postgres schema, for both editions |
+| `scripts/` | Backup/restore (local or S3), LaunchAgent setup, the single-machine smoke test, embedding evaluation harnesses, and `cjump` (jump to a past conversation: raise its Terminal window, or `claude --resume` it) |
 | `facts/` | Claude Facts: durable facts extracted from each exchange by Claude Haiku (CHATS-21). **Apache-2.0**, adapted from Mem0 |
 | `facts_eval/` | Scores a fact extractor (Mem0, or our own) against a hand-checked reference set: [one command](facts_eval/README.md) (CHATS-22) |
-| `localhost/` | The self-contained [single-machine edition](localhost/README.md) |
+| `localhost/` | The [single-machine edition](localhost/README.md)'s installer, Docker Compose file, launchd/systemd units and docs. It runs the same `hook/`, `mcp/` and `init.sql` as everything else; `tests/test_localhost_layout.py` fails if code appears there |
+| `tests/` | Schema checksum, facts and facts_eval, the `localhost/` guard, `install.sh` against a throwaway HOME, and the old-schema upgrade. CI (`.github/workflows/python.yml`) runs these and the `hook/` and `mcp/` suites on every push, against a pgvector container |
 | `docs/architecture/` | The diagram above, as `.drawio` source and exported SVG |
 | `server/` | **Superseded** — the previous ActiveMQ/worker design, kept for reference |
 | `esp32-embedder/` | `mxbai-embed-large` running on a £6 ESP32-S3, weights streamed off an SD card; [matches Ollama to cos 0.9994](esp32-embedder/README.md) (spike, CHATS-1) |
@@ -224,7 +225,7 @@ psql -h luke.local -p 5433 -U claude claude_chats
 
 `init.sql` is the source of truth for the schema. It is vendored into `home-infra` for the deployed copy, and `tests/test_pg_schema.py` pins a checksum of the DDL so the two cannot silently drift.
 
-Backups are handled in `home-infra` alongside the rest of the estate. `scripts/backup.sh` and `scripts/restore.sh` here belong to the superseded `server/` stack.
+Backups are handled in `home-infra` alongside the rest of the estate. `scripts/backup.sh` and `scripts/restore.sh` here serve the single-machine edition (`--local`, the default, which is what `localhost/install.sh --backup` runs) and the superseded Mac-hosted database (`--s3`).
 
 ## Possible future enhancements
 
