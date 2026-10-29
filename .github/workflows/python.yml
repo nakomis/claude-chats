@@ -41,6 +41,7 @@ jobs:
   test:
     name: Tests (${{ matrix.suite }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +63,7 @@ jobs:
         with:
           # tests/test_localhost_upgrade.py installs the single-machine edition
           # from an old commit, then upgrades it.
-          fetch-depth: 0
+          fetch-depth: ${{ matrix.suite == 'root' && 0 || 1 }}
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -94,6 +95,7 @@ jobs:
   smoke:
     name: Single-machine smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -142,6 +144,7 @@ jobs:
   upgrade-docker:
     name: Single-machine upgrade (Docker Compose)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # The root suite runs tests/test_localhost_upgrade.py against the service
     # container; this runs it again with both installers' real `docker compose`
     # and container, unmodified (CHATS-37).

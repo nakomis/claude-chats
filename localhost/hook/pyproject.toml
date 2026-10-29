@@ -9,6 +9,13 @@
 # instead, so in that gap capture keeps working (into the outbox; nothing is
 # drained until the re-run, unless an old LaunchAgent does it).
 #
+# There is deliberately no uv.lock: uv resolves on the first such run (and
+# writes one, which .gitignore keeps out of git), so that first run wants the
+# network, as the pull just did. Committing a lock would not avoid that: uv
+# cannot pin a path dependency's dependencies to ../../hook/uv.lock, so it
+# would hold versions of its own, and go stale whenever hook/ changed. If the
+# resolve does fail, the old command fails as it would have without this.
+#
 # install.sh never points anything here. Delete this directory once no install
 # from before October 2026 can be left.
 [project]

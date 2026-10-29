@@ -42,11 +42,14 @@ environments they create and the DB_URL edit stay out of the working tree.
 import json
 import os
 import plistlib
+import queue
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -60,7 +63,9 @@ sys.path.insert(0, str(ROOT / "hook" / "tests"))
 from support import fake_ollama  # noqa: E402
 
 # The last commit before #54 (CHATS-36): localhost/ with its own hook, MCP
-# server, schema and capture modes.
+# server, schema and capture modes. It stays reachable from main because this
+# repository only allows merge commits (no squash, no rebase), so a full clone
+# always has it.
 OLD_COMMIT = "8b4d5cc96b79315959b8e718538e4a9d8adbab1e"
 COMPOSE_DB_URL = "postgresql://claude:claude@localhost:5433/claude_chats"
 DB_URL_LINE = f'DB_URL="{COMPOSE_DB_URL}"'
@@ -86,6 +91,7 @@ def _why_not() -> str | None:
         return "needs psql and uv on PATH"
     if not _old_commit_present():
         # CI fetches full history for this; a shallow clone elsewhere skips.
+        # (In CI a missing commit fails the module rather than skipping.)
         return f"old commit {OLD_COMMIT[:7]} not in this clone (shallow?)"
     return None
 
@@ -202,13 +208,37 @@ def world(tmp_path):
                                            text=True).stdout.strip(),
             "UV_PYTHON": sys.executable,
             "UV_PYTHON_DOWNLOADS": "never",
-            "CLAUDE_CHATS_PROVIDER": "ollama",
-            "OLLAMA_BASE_URL": ollama_url,
             "PGOPTIONS": "--client-min-messages=warning",
         }
         if DOCKER:
-            env["COMPOSE_PROJECT_NAME"] = os.environ["COMPOSE_PROJECT_NAME"]
-        yield World(tmp_path, home, env, dsn, admin_dsn)
+            env.update(_docker_env())
+        else:
+            # A safety net, not configuration: every process the test starts
+            # gets the scratch database through config.env, the registry or the
+            # hook command, and these are all asserted on. Should one ever miss
+            # it, it lands here rather than on the code's default, which is the
+            # real claude-chats-db's port. (The environment wins over
+            # config.env, and the two agree.)
+            env["CLAUDE_CHATS_DB_URL"] = dsn
+        # What the user had in their shell when they first installed. Only the
+        # old installer sees it: everything after has to get it from what
+        # that install recorded.
+        provider = {"CLAUDE_CHATS_PROVIDER": "ollama", "OLLAMA_BASE_URL": ollama_url}
+        w = World(tmp_path, home, env, dsn, admin_dsn, provider)
+        try:
+            yield w
+        finally:
+            w.settle()
+
+
+def _docker_env() -> dict:
+    """The Docker settings the installers' `docker` must share with this
+    process's, so the guards below look at the daemon compose will use."""
+    env = {k: os.environ[k] for k in ("DOCKER_HOST", "DOCKER_CONTEXT") if k in os.environ}
+    # HOME is a throwaway; the CLI's plugins and contexts are in the real one.
+    env["DOCKER_CONFIG"] = os.environ.get("DOCKER_CONFIG", os.path.expanduser("~/.docker"))
+    env["COMPOSE_PROJECT_NAME"] = os.environ["COMPOSE_PROJECT_NAME"]
+    return env
 
 
 @contextmanager
@@ -242,16 +272,30 @@ def _docker_database():
     if project in ("", "localhost"):
         pytest.fail("set COMPOSE_PROJECT_NAME to a throwaway name (see "
                     "scripts/upgrade-check-localhost.sh)")
+    denv = {**os.environ, **_docker_env()}
     existing = subprocess.run(["docker", "ps", "-aq", "--filter", "name=^claude-chats-db$"],
-                              capture_output=True, text=True, check=True).stdout.strip()
+                              env=denv, capture_output=True, text=True, check=True).stdout.strip()
     if existing:
         pytest.fail("a claude-chats-db container already exists; refusing to touch it")
+    for family, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        with socket.socket(family) as sock:
+            sock.settimeout(1)
+            if sock.connect_ex((addr, 5433)) == 0:
+                pytest.fail(f"something is listening on {addr} port 5433; refusing")
+
+    def remove():
+        subprocess.run(["docker", "rm", "-f", "claude-chats-db"], env=denv, capture_output=True)
+        subprocess.run(["docker", "volume", "rm", "-f", f"{project}_pgdata"], env=denv,
+                       capture_output=True)
+        subprocess.run(["docker", "network", "rm", f"{project}_default"], env=denv,
+                       capture_output=True)
+
+    remove()  # a volume left by an aborted run of our own project, not anyone else's
     try:
-        # The container does not exist until the old installer starts it.
+        # The container does not exist until the old compose file starts it.
         yield COMPOSE_DB_URL, COMPOSE_DB_URL.rsplit("/", 1)[0] + "/postgres"
     finally:
-        subprocess.run(["docker", "rm", "-f", "claude-chats-db"], capture_output=True)
-        subprocess.run(["docker", "volume", "rm", "-f", f"{project}_pgdata"], capture_output=True)
+        remove()
 
 
 def _url(dsn: str, dbname: str) -> str:
@@ -269,8 +313,9 @@ def _url(dsn: str, dbname: str) -> str:
 
 
 class World:
-    def __init__(self, tmp, home, env, dsn, admin_dsn):
+    def __init__(self, tmp, home, env, dsn, admin_dsn, provider):
         self.tmp, self.home, self.env, self.dsn, self.admin_dsn = tmp, home, env, dsn, admin_dsn
+        self.provider = provider
         self.state = home / ".claude-chats"
         self.checkout = tmp / "claude-chats"
 
@@ -301,6 +346,45 @@ class World:
         self._point_at_database(self.checkout / "localhost" / "install.sh")
         return self.checkout
 
+    def start_old_container(self, old: Path):
+        """Bring the old compose file's container up and wait until Postgres
+        takes TCP connections, which it only does once the image's first-boot
+        initialisation (the old init.sql included) is over. The old installer
+        waits on `pg_isready` over the container's socket instead, which can
+        answer during that initialisation; its own `up -d` is then a no-op."""
+        import psycopg
+
+        subprocess.run(["docker", "compose", "-f", str(old / "docker-compose.yml"), "up", "-d"],
+                       env=self.env, check=True, capture_output=True)
+        deadline, streak = time.monotonic() + 180, 0
+        while streak < 2:
+            assert time.monotonic() < deadline, "the old container never became ready"
+            try:
+                psycopg.connect(self.dsn, connect_timeout=3).close()
+                streak += 1
+            except psycopg.Error:
+                streak = 0
+            time.sleep(1)
+
+    def settle(self, timeout: float = 60.0):
+        """Wait for any drain the hook started in the background to finish,
+        before its database and directory are removed underneath it."""
+        import fcntl
+
+        lock = self.state / "outbox.db.drain.lock"
+        if not lock.exists():
+            return
+        deadline = time.monotonic() + timeout
+        with open(lock, "a") as fh:
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    if time.monotonic() > deadline:
+                        return
+                    time.sleep(0.2)
+
     def _point_at_database(self, script: Path):
         if DOCKER:
             return
@@ -310,8 +394,9 @@ class World:
 
     # -- running things ----------------------------------------------------
 
-    def install(self, script: Path, *args, uname="Darwin", check=True):
-        r = subprocess.run(["bash", str(script), *args], env={**self.env, "FAKE_UNAME": uname},
+    def install(self, script: Path, *args, uname="Darwin", check=True, old=False):
+        env = {**self.env, **(self.provider if old else {}), "FAKE_UNAME": uname}
+        r = subprocess.run(["bash", str(script), *args], env=env,
                            capture_output=True, text=True, timeout=600)
         if check:
             assert r.returncode == 0, f"{script} {args}\n{r.stdout}\n{r.stderr}"
@@ -347,11 +432,18 @@ class World:
             service = (self.systemd_dir / "claude-chats-drain.service").read_text()
             line = next(ln for ln in service.splitlines() if ln.startswith("ExecStart="))
             argv, extra = shlex.split(line[len("ExecStart="):]), {}
-        r = subprocess.run(argv, env={**self.env, **extra}, capture_output=True, text=True,
-                           timeout=300)
+        # launchd and systemd pass next to nothing; the drain must find the
+        # rest in config.env.
+        r = subprocess.run(argv, env={**self.minimal_env(), **extra}, capture_output=True,
+                           text=True, timeout=300)
         if check:
             assert r.returncode == 0, r.stdout + r.stderr
         return r
+
+    def minimal_env(self) -> dict:
+        keep = ("HOME", "PATH", "TERM", "UV_CACHE_DIR", "UV_PYTHON", "UV_PYTHON_DOWNLOADS",
+                "CLAUDE_CHATS_DB_URL")  # the last only ever the safety net above
+        return {k: v for k, v in self.env.items() if k in keep}
 
     @property
     def plist_path(self) -> Path:
@@ -417,10 +509,10 @@ def _schema(dsn: str) -> dict:
                          "WHERE schemaname = 'public'"),
             "constraints": q("SELECT conrelid::regclass::text, conname, pg_get_constraintdef(oid) "
                              "FROM pg_constraint WHERE connamespace = 'public'::regnamespace"),
-            "triggers": q("SELECT tgrelid::regclass::text, tgname FROM pg_trigger "
-                          "WHERE NOT tgisinternal"),
-            "functions": q("SELECT proname FROM pg_proc "
-                           "WHERE pronamespace = 'public'::regnamespace"),
+            "triggers": q("SELECT tgrelid::regclass::text, tgname, pg_get_triggerdef(oid) "
+                          "FROM pg_trigger WHERE NOT tgisinternal"),
+            "functions": q("SELECT proname, pg_get_functiondef(oid) FROM pg_proc "
+                           "WHERE pronamespace = 'public'::regnamespace AND prokind = 'f'"),
             "extensions": q("SELECT extname FROM pg_extension"),
         }
 
@@ -524,21 +616,29 @@ def _mcp(world: World, calls: list[tuple[str, dict]]) -> tuple[list[str], list[d
     """Start the registered conversation-memory server over stdio and make
     some tool calls. Returns (tool names, each call's result)."""
     reg = world.registry()["user:conversation-memory"]
-    env = {k: v for k, v in world.env.items()
-           if k in ("HOME", "PATH", "TERM", "UV_CACHE_DIR", "UV_PYTHON", "UV_PYTHON_DOWNLOADS")}
+    env = {k: v for k, v in world.minimal_env().items() if k != "CLAUDE_CHATS_DB_URL"}
     env.update(reg["env"])
-    proc = subprocess.Popen(reg["command"], env=env, stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    errlog = world.tmp / "mcp-stderr.log"
+    with open(errlog, "w") as err:
+        proc = subprocess.Popen(reg["command"], env=env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=err, text=True)
+    lines: queue.Queue = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(ln) for ln in proc.stdout] + [lines.put("")],
+                     daemon=True).start()
 
     def send(msg):
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", **msg}) + "\n")
         proc.stdin.flush()
 
-    def reply(msg_id):
+    def reply(msg_id, timeout=120):
+        deadline = time.monotonic() + timeout
         while True:
-            line = proc.stdout.readline()
+            try:
+                line = lines.get(timeout=max(0.1, deadline - time.monotonic()))
+            except queue.Empty:
+                raise AssertionError(f"no reply to {msg_id}: " + errlog.read_text()) from None
             if not line:
-                raise AssertionError("MCP server exited: " + proc.stderr.read())
+                raise AssertionError("MCP server exited: " + errlog.read_text())
             msg = json.loads(line)
             if msg.get("id") == msg_id:
                 assert "error" not in msg, msg
@@ -592,15 +692,17 @@ def _snapshot(world: World, uname: str) -> dict:
 ])
 def test_an_old_install_upgrades_in_place(world, old_mode, uname):
     old = world.old_tree()
+    if DOCKER:
+        world.start_old_container(old)
 
     # ── The old install, used for a while ───────────────────────────────────
     # Everyone started durable or direct; a direct install that had ever been
     # durable has an outbox of sent rows too, so that history is built first.
-    world.install(old / "install.sh", "--mode", "durable", uname=uname)
+    world.install(old / "install.sh", "--mode", "durable", uname=uname, old=True)
     world.capture("old-one", _old_session("first"))
-    world.install(old / "install.sh", "--drain", uname=uname)
+    world.install(old / "install.sh", "--drain", uname=uname, old=True)
     if old_mode == "direct":
-        world.install(old / "install.sh", "--mode", "direct", uname=uname)
+        world.install(old / "install.sh", "--mode", "direct", uname=uname, old=True)
         assert "CLAUDE_CHATS_CAPTURE_MODE=direct" in world.hook_command()
         world.capture("old-two", _old_session("second"))      # straight into Postgres
         with _database_closed(world):
@@ -640,6 +742,13 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
     # localhost/hook. Without the shim there it would exit 2, which Claude
     # Code takes as "block the prompt". With it, capture goes on, into the
     # outbox, whatever the old mode was.
+    shim = new / "localhost" / "hook" / "pyproject.toml"
+    shim.rename(shim.with_suffix(".away"))
+    try:
+        blocked = world.capture("gap", _old_session("gap"), check=False)
+        assert blocked.returncode == 2, blocked.stderr  # the status Claude Code blocks on
+    finally:
+        shim.with_suffix(".away").rename(shim)
     world.capture("gap", _old_session("gap"))
     assert world.outbox().get("gap-u1") is False
     if uname == "Darwin" and old_mode == "durable":
@@ -688,7 +797,10 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
             if ln and not ln.startswith("#")]
     assert keys == ["CLAUDE_CHATS_PROVIDER", "CLAUDE_CHATS_MODEL", "CLAUDE_CHATS_DIMENSIONS",
                     "CLAUDE_CHATS_DB_URL", "OLLAMA_BASE_URL"]
-    assert f"OLLAMA_BASE_URL={world.env['OLLAMA_BASE_URL']}" in config.read_text()
+    # Carried over from the old install's config.env: this run's environment
+    # had none of it.
+    assert f"OLLAMA_BASE_URL={world.provider['OLLAMA_BASE_URL']}" in config.read_text()
+    assert f"CLAUDE_CHATS_DB_URL={world.dsn}" in config.read_text()
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
 
     # The new drain schedule, pointing at the shared hook/ and the config file.
@@ -753,8 +865,9 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
                       "WHERE c.session_id = 'old-two' GROUP BY c.id")
     assert [n for _, n in convs] == [3]
     now = world.messages()
-    for uid in ("second-u1", "second-a1"):
-        assert now[uid][:4] == after.get(uid, now[uid])[:4]  # session, role, content, date
+    if old_mode == "direct":  # in Postgres since before the upgrade
+        for uid in ("second-u1", "second-a1"):
+            assert now[uid][:4] == after[uid][:4]  # session, role, content, date
     assert now["second-u1"][3] == datetime.fromisoformat(LONG_AGO.format(1))
 
     # And the MCP server Claude Code would start finds all of it.
@@ -770,6 +883,9 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
     assert recent["since"] == "3 months"
     assert everything["results"][0]["session_id"] == "old-one"
     assert all(r["session_id"] != "old-one" for r in old_only["results"])
-    # CHATS-15: probes were set and read back; a failure would be a warning.
+    # CHATS-15: the vector half ran (so did _set_probes), and the probes it
+    # read back were the ones it set; anything else would be a warning. (A
+    # pgvector older than 0.8 adds one about iterative scans, which is fine.)
     for out in (recent, everything, old_only):
+        assert out["mode_used"] == "hybrid", out
         assert "ivfflat.probes" not in (out.get("warning") or ""), out

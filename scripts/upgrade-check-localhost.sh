@@ -43,6 +43,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "Compose project ${COMPOSE_PROJECT_NAME}: its volume is ${COMPOSE_PROJECT_NAME}_pgdata;"
+echo "a real install's localhost_pgdata is not used."
 cd "$ROOT"
 CLAUDE_CHATS_UPGRADE_DOCKER=1 uv run --no-project --with pytest --with 'psycopg[binary]' \
     pytest tests/test_localhost_upgrade.py -v -rs

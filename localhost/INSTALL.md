@@ -134,7 +134,9 @@ that runs the shared hook instead: capture carries on into the outbox, and the
 old LaunchAgent's drains fail harmlessly until the schema is upgraded, leaving
 those messages pending for the new schedule. (Without that stand-in, the hook
 would fail with an exit status Claude Code takes as "block", refusing every
-prompt.) The old MCP server registration does not start in that gap.
+prompt.) The stand-in resolves its dependencies the first time it runs, so it
+wants the network then, as the pull did. The old MCP server registration does
+not start in that gap.
 
 The provider, model and their settings are kept from `~/.claude-chats/config.env`,
 so you do not need to repeat them. The installer:
@@ -162,7 +164,7 @@ Two things it points you at rather than doing itself:
 
 - **Anything still pending in the outbox** (a `durable` install) is delivered
   by the new drain schedule: the LaunchAgent drains as soon as it is loaded,
-  the systemd timer within a minute. To do it there and then, run
+  the systemd timer about a minute after it is enabled. To do it there and then, run
   `./install.sh --drain`.
 - **A fallback file.** If `~/.claude-chats/outbox-fallback.ndjson` exists, the
   installer says so: run `./install.sh --replay-fallback`.
