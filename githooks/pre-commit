@@ -5,8 +5,8 @@ FILES=$(git diff --cached --name-status)
 if [[ $FILES =~ .drawio ]]; then
     echo
     echo "--- Auto-generating SVG files for drawio diagrams ---"
-    # Both docs trees: localhost/ carries its own so the folder stays
-    # self-contained and can be copied out on its own.
+    # Both docs trees: the single-machine edition's diagrams live with its
+    # README under localhost/docs.
     find docs localhost/docs -name "*.drawio" 2>/dev/null | while read -r f; do
         svg="${f%.drawio}.svg"
         # -o, not a trailing positional: draw.io treats extra positionals as

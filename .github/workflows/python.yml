@@ -1,0 +1,131 @@
+name: python
+
+# Every Python package's tests, on pull requests and main/develop pushes (CHATS-36):
+#   hook/   the capture package (record, drain-outbox, replay-fallback, …)
+#   mcp/    the MCP server, which depends on hook/ for embedding
+#   tests/  facts, facts_eval, the schema checksum, the localhost/ layout guard
+#           and install.sh run against a throwaway HOME
+# plus a smoke test of the single-machine edition through its real commands.
+#
+# Postgres is a pgvector service container, so the database tests run here
+# instead of being skipped. Nothing needs a real embedder or model: embeddings
+# come from a fake Ollama, and the facts extractor's model is always a fake.
+# Anything that does need one skips itself when its credentials are absent.
+on:
+  pull_request:
+  # Pull requests cover feature branches. Pushes run on main and on the
+  # long-lived develop branches that feature PRs target.
+  push:
+    branches: [main, '*develop*']
+
+permissions:
+  contents: read
+
+# Explicitly bash, which GitHub then runs with -o pipefail: the test steps
+# pipe pytest through tee, and a failure must not be swallowed by it.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: python-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  # The service container below; tests create and drop their own databases.
+  CLAUDE_CHATS_TEST_ADMIN_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+  FACTS_TEST_ADMIN_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+
+jobs:
+  test:
+    name: Tests (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [hook, mcp, root]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v6
+      # One suite per job, and pytest without xdist: no parallel workers.
+      # -rs lists every skip with its reason; a database test skipping here,
+      # where the DSNs are set, means the gate is broken, so it fails the job.
+      - name: hook
+        if: matrix.suite == 'hook'
+        working-directory: hook
+        run: uv run --locked pytest tests -v -rs | tee "$RUNNER_TEMP/pytest.log"
+      - name: mcp
+        if: matrix.suite == 'mcp'
+        working-directory: mcp
+        run: uv run --locked pytest tests -v -rs | tee "$RUNNER_TEMP/pytest.log"
+      - name: root tests/
+        if: matrix.suite == 'root'
+        run: uv run --no-project --with pytest --with 'psycopg[binary]' pytest tests -v -rs | tee "$RUNNER_TEMP/pytest.log"
+      - name: No database test was skipped
+        run: |
+          if grep -E '^SKIPPED .*_DSN' "$RUNNER_TEMP/pytest.log"; then
+            echo "::error::database tests skipped although the test DSNs are set"
+            exit 1
+          fi
+
+  smoke:
+    name: Single-machine smoke test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the Postgres client
+        run: sudo apt-get update -q && sudo apt-get install -y -q postgresql-client
+      - name: Shell scripts parse
+        run: |
+          bash -n localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/smoke-localhost.sh
+          shellcheck -S error localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/smoke-localhost.sh
+      - name: The systemd units are valid
+        run: |
+          mkdir -p /tmp/units
+          sed -e "s|UV_PATH|$(command -v true)|" -e "s|REPO_PATH|${GITHUB_WORKSPACE}|" \
+              -e "s|CONFIG_PATH|/tmp/config.env|" localhost/systemd/claude-chats-drain.service \
+              > /tmp/units/claude-chats-drain.service
+          cp localhost/systemd/claude-chats-drain.timer /tmp/units/
+          systemd-analyze verify /tmp/units/claude-chats-drain.timer /tmp/units/claude-chats-drain.service
+      - name: docker-compose.yml resolves the shared init.sql
+        run: |
+          docker compose -f localhost/docker-compose.yml config > /tmp/compose.yml
+          grep -q "source: ${GITHUB_WORKSPACE}/init.sql" /tmp/compose.yml
+      - name: Sync the hook and the MCP server
+        run: |
+          uv sync --locked --project hook
+          uv sync --locked --project mcp
+      - name: Hook → outbox → drain → Postgres → MCP search
+        run: scripts/smoke-localhost.sh

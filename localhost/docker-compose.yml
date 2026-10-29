@@ -3,6 +3,13 @@
 # The distributed edition delivers messages through an SQS queue to a consumer on
 # another machine. Neither has a job here — the drainer runs locally, and
 # `install.sh --backup` writes to local disk.
+#
+# The schema is the repository's one init.sql, shared with the distributed
+# edition. It only runs here when the volume is first created; install.sh
+# re-applies it on every run, which is how an existing database is upgraded.
+#
+# Keep this file in localhost/: the compose project, and so the data volume
+# (localhost_pgdata), is named after the directory it lives in.
 services:
   postgres:
     image: pgvector/pgvector:pg17
@@ -15,7 +22,7 @@ services:
       POSTGRES_USER: claude
       POSTGRES_PASSWORD: claude
     volumes:
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ../init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U claude -d claude_chats"]

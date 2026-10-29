@@ -100,7 +100,7 @@ esac
 # ---------------------------------------------------------------------------
 # 3. Install Python dependencies
 # ---------------------------------------------------------------------------
-step "Installing hook dependencies (includes stomp.py for remote mode)"
+step "Installing hook dependencies"
 uv sync --project "${REPO_DIR}/hook"
 ok "hook deps installed"
 

@@ -1,0 +1,11 @@
+# Drains the claude-chats outbox into PostgreSQL: the backstop for the drain the
+# hook starts after every capture. See ../launchd/ for the macOS equivalent.
+#
+# REPO_PATH, UV_PATH and CONFIG_PATH are substituted by install.sh, which
+# installs this as a user unit under ~/.config/systemd/user/.
+[Unit]
+Description=Drain the claude-chats outbox into PostgreSQL
+
+[Service]
+Type=oneshot
+ExecStart="UV_PATH" run --project "REPO_PATH/hook" drain-outbox --env-file "CONFIG_PATH"

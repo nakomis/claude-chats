@@ -1,19 +1,16 @@
 """
 Replay the hook's fallback file back into the SQLite outbox.
 
-Both capture modes fall back to appending newline-delimited JSON when their
-primary write fails — a corrupt outbox, a full disk, a Postgres that is down in
-direct mode. That file is the last line of defence in a design whose whole point
-is that capture cannot fail.
+The hook falls back to appending newline-delimited JSON when it cannot write
+the outbox — a corrupt file, a full disk, a permissions mishap. That file is the
+last line of defence in a design whose whole point is that capture cannot fail.
 
-This drains it back into the outbox once the problem is fixed. It is idempotent:
-rows go in with INSERT OR IGNORE against the UNIQUE message_uuid, so replaying
-twice is harmless, and rows already drained are suppressed by their tombstones.
-
-The outbox is the destination in *both* modes, even direct — it is simply the
-staging table this recovery path already knows how to write. Run the drainer
-afterwards to land the rows in Postgres; `install.sh --replay-fallback` does
-both for you.
+This puts it back into the outbox once the problem is fixed, from where the
+forwarder (distributed edition) or drain-outbox (single-machine edition) takes
+it as usual; `localhost/install.sh --replay-fallback` runs both steps. It is
+idempotent: rows go in with INSERT OR IGNORE against the UNIQUE message_uuid,
+so replaying twice is harmless, and rows already delivered are suppressed by
+their tombstones.
 
     replay-fallback            # replay, then archive the file
     replay-fallback --dry-run  # just report what it would do
@@ -26,12 +23,21 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 
-from hook.record import FALLBACK_PATH, OUTBOX_PATH, SCHEMA
+from hook.record import FALLBACK_PATH, OUTBOX_PATH, SCHEMA, _migrate
 
 FIELDS = (
     "message_uuid", "session_id", "project_path", "git_branch",
     "conversation_name", "host", "role", "content", "sequence_num", "created_at",
 )
+# Written by later hooks, absent from older fallback files. Missing ones take
+# the outbox's own defaults, so an old line replays as an old outbox row would.
+OPTIONAL_FIELDS = {
+    "ai_title": None,
+    "author": "unknown",
+    "tool_name": None,
+    "model": None,
+}
+COLUMNS = FIELDS + tuple(OPTIONAL_FIELDS)
 
 
 def main() -> int:
@@ -58,7 +64,10 @@ def main() -> int:
             if not all(f in rec for f in FIELDS):
                 malformed += 1
                 continue
-            records.append({f: rec[f] for f in FIELDS})
+            row = {f: rec[f] for f in FIELDS}
+            for f, default in OPTIONAL_FIELDS.items():
+                row[f] = rec.get(f, default)
+            records.append(row)
 
     print(f"{len(records)} record(s) to replay from {args.fallback}")
     if malformed:
@@ -76,11 +85,13 @@ def main() -> int:
         # fallback — so create it before inserting.
         conn.executescript(SCHEMA)
         with conn:
+            _migrate(conn)
+        with conn:
             before = conn.total_changes
             conn.executemany(
                 f"""
-                INSERT OR IGNORE INTO outbox ({", ".join(FIELDS)})
-                VALUES ({", ".join(":" + f for f in FIELDS)})
+                INSERT OR IGNORE INTO outbox ({", ".join(COLUMNS)})
+                VALUES ({", ".join(":" + f for f in COLUMNS)})
                 """,
                 records,
             )

@@ -1,0 +1,18 @@
+# Runs claude-chats-drain.service a minute after the timer starts, then two
+# minutes after each run.
+#
+# Not OnBootSec: that is measured from boot, so a timer enabled later than a
+# minute after boot (install.sh's `enable --now`, any time) has already missed
+# it, and OnUnitActiveSec — measured from the service's last run — then never
+# has a run to count from. The timer would sit there and fire nothing.
+# OnActiveSec counts from the timer's own activation, which happens at
+# `enable --now` and at every login, so the chain always starts.
+[Unit]
+Description=Drain the claude-chats outbox every 2 minutes
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
