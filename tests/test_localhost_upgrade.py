@@ -148,9 +148,12 @@ fi
 # `--output-format json --json-schema` does.
 CLAUDE_STUB = '''#!{python}
 import json, os, sys
-with open(os.environ["STUB_LOG"], "a") as log:
+# The facts schedule runs this with launchd's near-empty environment, so it finds
+# its own directory rather than relying on STUB_DIR.
+stub_dir = os.environ.get("STUB_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+with open(os.environ.get("STUB_LOG") or os.path.join(stub_dir, "calls.log"), "a") as log:
     log.write("claude " + " ".join(sys.argv[1:]) + "\\n")
-path = os.path.join(os.environ["STUB_DIR"], "mcp-registry.json")
+path = os.path.join(stub_dir, "mcp-registry.json")
 reg = json.load(open(path)) if os.path.exists(path) else {{}}
 args = sys.argv[1:]
 if args[:2] == ["auth", "status"]:
@@ -158,7 +161,7 @@ if args[:2] == ["auth", "status"]:
     sys.exit(0)
 if args[:1] == ["-p"]:
     sys.stdin.read()
-    with open(os.path.join(os.environ["STUB_DIR"], "claude-p.log"), "a") as log:
+    with open(os.path.join(stub_dir, "claude-p.log"), "a") as log:
         log.write(json.dumps({{"argv": args, "api_key": os.environ.get("ANTHROPIC_API_KEY")}}) + "\\n")
     fact = {{"id": "0", "text": "The lathe tooling notes are in lathe-tooling.md in the workshop folder.",
              "kind": "config", "subject": "lathe tooling", "attribute": "notes"}}
