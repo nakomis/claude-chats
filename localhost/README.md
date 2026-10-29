@@ -100,7 +100,7 @@ MCP tools, available to Claude in any project once you restart Claude Code:
 | `search_memory` | Hybrid semantic + full-text search across every recorded message |
 | `get_conversation` | Fetch a full transcript by session id |
 | `list_recent_sessions` | Browse what has been recorded lately |
-| `recall_facts` | Durable facts extracted from conversations. Empty unless you also run the [facts extractor](../facts/README.md), which needs an Anthropic API key |
+| `recall_facts` | Durable facts extracted from your conversations ("the workshop lathe is a Myford ML7"), each dated and ranked by how recently it was confirmed. The tables are created on install, but nothing fills them on a single machine yet: extraction comes with CHATS-39, so until then it finds nothing. See [INSTALL.md](INSTALL.md#claude-facts-recall_facts) |
 
 Each message records who produced it — you, Claude or a tool (and which tool,
 or which model) — so what you typed can be told apart from command output.
