@@ -263,6 +263,21 @@ def test_everything_written_stays_inside_home(sandbox):
     assert outside == []
 
 
+def test_a_lock_timeout_applying_init_sql_is_retried(sandbox):
+    result = _run(sandbox, extra_env={"APPLY_FAILS": "1"})
+    _assert_installed(sandbox, result)
+    assert (sandbox[0] / "applies").read_text().count("apply") == 2
+    assert "retrying" in result.stdout
+
+
+def test_any_other_schema_error_stops_the_install(sandbox):
+    result = _run(sandbox, extra_env={"APPLY_FAILS": "9", "APPLY_ERROR": "syntax error"})
+    assert result.returncode != 0
+    assert "syntax error" in result.stderr
+    assert (sandbox[0] / "applies").read_text().count("apply") == 1
+    assert not (sandbox[1] / ".claude").exists()
+
+
 def test_invalid_settings_json_changes_nothing(sandbox):
     _, home, _ = sandbox
     (home / ".claude").mkdir()

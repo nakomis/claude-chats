@@ -459,8 +459,22 @@ done
 # init.sql only runs on a first-time volume create, so apply it every time —
 # it is written to be idempotent, and this is what picks up schema changes on
 # an existing database, including one created by an older checkout.
-docker exec -i claude-chats-db psql -q -v ON_ERROR_STOP=1 -U claude -d claude_chats \
-    < "${ROOT_DIR}/init.sql" >/dev/null
+#
+# init.sql gives up on a lock after 5 s (its lock_timeout), and a drain that is
+# writing at that moment holds one. Every statement in it is idempotent, so a
+# lock timeout is simply retried; any other error stops the install.
+for attempt in 1 2 3 4 5; do
+    if APPLY_ERR="$(docker exec -i claude-chats-db psql -q -v ON_ERROR_STOP=1 \
+            -U claude -d claude_chats < "${ROOT_DIR}/init.sql" 2>&1 >/dev/null)"; then
+        break
+    fi
+    if [[ "$APPLY_ERR" != *"lock timeout"* || $attempt -eq 5 ]]; then
+        echo "$APPLY_ERR" >&2
+        die "Applying init.sql failed."
+    fi
+    warn "init.sql waited too long for a lock (a drain is probably writing); retrying"
+    sleep 2
+done
 ok "Schema applied"
 
 # ---------------------------------------------------------------------------
