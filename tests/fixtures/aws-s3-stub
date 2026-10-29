@@ -4,7 +4,8 @@
 s3://bucket/key is the file $STUB_S3_ROOT/bucket/key. Every call is appended to
 $STUB_AWS_LOG with the AWS_PROFILE it ran under, so tests can assert which
 bucket, key, profile and storage class were used. Any `cp` whose destination
-contains $STUB_AWS_FAIL_CP (when set) fails, as an upload that never landed.
+contains $STUB_AWS_FAIL_CP (when set) fails, as an upload that never landed,
+and with $STUB_AWS_FAIL_LS set every listing fails, as with an expired login.
 """
 
 import datetime
@@ -28,6 +29,9 @@ def main(argv):
                   if not a.startswith("--") and not (i and argv[i - 1].startswith("--")
                                                     and argv[i - 1] not in ("--no-progress",))]
     if positional[:2] == ["s3", "ls"]:
+        if os.environ.get("STUB_AWS_FAIL_LS"):
+            print("An error occurred (ExpiredToken) when calling ListObjectsV2", file=sys.stderr)
+            return 255
         d = local(positional[2])
         if not d.is_dir():
             return 1

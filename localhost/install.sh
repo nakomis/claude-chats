@@ -877,11 +877,11 @@ case "$(uname -s)" in
         warn "No backup schedule for $(uname -s); run ./install.sh --backup to back up by hand."
         ;;
 esac
-# The retired Mac-to-S3 agent; scripts/backup.sh refuses to run while it is
-# installed, so say so here, where someone is watching.
+# The retired Mac-to-S3 agent. Its nightly run (backup.sh --s3) is refused now,
+# and every local backup warns about it; say so here, where someone is watching.
 if [[ -f "$OLD_BACKUP_PLIST" ]]; then
-    warn "${OLD_BACKUP_PLIST} is the retired Mac-to-S3 backup agent, and backups"
-    warn "refuse to run while it is installed. Remove it:"
+    warn "${OLD_BACKUP_PLIST} is the retired Mac-to-S3 backup agent; its runs are"
+    warn "refused now (offsite backups are the server's job). Remove it:"
     warn "  launchctl bootout gui/\$(id -u)/com.nakomis.claude-chats-backup; rm ${OLD_BACKUP_PLIST}"
 fi
 

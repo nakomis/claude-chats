@@ -233,15 +233,37 @@ def test_a_changed_month_is_recut_and_replaces_its_file(db):
 
 
 @needs_db
-def test_restore_refuses_a_truncated_month(db):
+def test_restore_refuses_a_truncated_month_before_wiping_anything(db):
     dsn, env, tmp = db
     backups = tmp / "backups"
     _ok(_run(env, "backup.sh", str(backups)))
     victim = sorted((backups / "archive" / "messages").iterdir())[0]
     victim.write_bytes(victim.read_bytes()[:1000])
+    before = _snapshot(dsn)
     r = _run(env, "restore.sh", str(backups), "--yes", "--no-backfill")
     assert r.returncode != 0
-    assert "truncated" in r.stderr
+    assert "missing" in r.stderr and "Nothing was changed" in r.stderr
+    assert _snapshot(dsn) == before  # refused before the wipe, not half-way through
+
+
+@needs_db
+def test_restore_refuses_a_missing_month_before_wiping_anything(db):
+    import psycopg
+    dsn, env, tmp = db
+    backups = tmp / "backups"
+    _ok(_run(env, "backup.sh", str(backups)))
+    with psycopg.connect(dsn) as conn:
+        gone = _months_ago(conn, 2)
+    for p in (backups / "archive" / "messages").glob(f"messages_{gone}.*"):
+        p.unlink()
+    before = _snapshot(dsn)
+    r = _run(env, "restore.sh", str(backups), "--yes", "--no-backfill")
+    assert r.returncode != 0 and gone in r.stderr
+    assert _snapshot(dsn) == before
+    # Asked for explicitly, it restores what there is.
+    out = _ok(_run(env, "restore.sh", str(backups), "--yes", "--no-backfill", "--allow-missing"))
+    assert "2 archived month(s)" in out
+    assert _snapshot(dsn)["messages"][0] == 15
 
 
 @needs_db
@@ -303,6 +325,54 @@ def test_s3_round_trip_in_lukes_layout(db, prefix):
     reads = [line for line in (tmp / "aws.log").read_text().splitlines()[len(log.splitlines()):]
              if "aws s3" in line and "taiga-backup" not in line]
     assert reads and all(line.startswith("AWS_PROFILE=nakom.is-admin ") for line in reads)
+
+
+@needs_db
+def test_s3_restore_uses_the_newest_intact_object_and_refuses_a_failed_listing(db):
+    import os as _os
+    import time
+    dsn, env, tmp = db
+    before = _snapshot(dsn)
+    _ok(_run(env, "convmem-archive.sh", "archive"))
+    key = "conversation-memory/" + _luke_nightly(env, tmp)
+    months = tmp / "s3" / "nakomis-convmem-archive" / "messages"
+    good = sorted(months.iterdir())[0]
+    # A newer object for the same month that never arrived whole: its size is
+    # not the `b` in its name. The older, intact one must be used instead.
+    bad = months / (good.name.split(".b")[0] + ".b999999.csv.gz")
+    bad.write_bytes(good.read_bytes()[:500])
+    later = time.time() + 120
+    _os.utime(bad, (later, later))
+
+    # An expired login: the archive's listing fails, which is not an empty
+    # archive. (The nightly is named, so its own listing is not needed.)
+    r = _run(env, "restore.sh", "--s3", key, "--yes", "--no-backfill", STUB_AWS_FAIL_LS="1")
+    assert r.returncode != 0 and "missing" in r.stderr
+    assert _snapshot(dsn) == before
+
+    r = _run(env, "restore.sh", "--s3", "--yes", "--no-backfill")
+    _ok(r)
+    assert f"skipping {bad.name}" in r.stderr
+    assert _snapshot(dsn) == before
+
+
+@needs_db
+def test_a_dump_whose_reader_goes_away_leaves_nothing_behind(db):
+    """The snapshot session must end however the dump does (Luke's upload dying)."""
+    import psycopg
+    dsn, env, tmp = db
+    r = subprocess.run(["bash", "-o", "pipefail", "-c", f'"{SCRIPTS}/convmem-archive.sh" dump | head -c 100 >/dev/null'],
+                       env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0
+    with psycopg.connect(dsn) as conn:
+        for _ in range(50):
+            left = conn.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                                "AND pid <> pg_backend_pid()").fetchone()[0]
+            if left == 0:
+                break
+            import time
+            time.sleep(0.1)
+        assert left == 0
 
 
 @needs_db
@@ -375,13 +445,15 @@ def test_the_retired_s3_flag_is_refused(nodb):
 
 
 def test_a_machine_still_carrying_the_old_agent_is_told_to_remove_it(nodb):
+    """Told, but still backed up locally: refusing would leave it with none."""
     agents = Path(nodb["HOME"]) / "Library" / "LaunchAgents"
     agents.mkdir(parents=True)
     (agents / "com.nakomis.claude-chats-backup.plist").write_text("<plist/>")
     r = _run(nodb, "backup.sh")
-    assert r.returncode == 3
-    assert "launchctl bootout" in r.stderr
-    assert not Path(nodb["STUB_LOG"]).exists()
+    assert "WARNING" in r.stderr and "launchctl bootout" in r.stderr
+    # It went on to try the backup (this stub's container is not running).
+    assert "docker ps" in Path(nodb["STUB_LOG"]).read_text()
+    assert r.returncode not in (0, 3)
 
 
 def test_a_stopped_container_fails_the_backup(nodb):
@@ -404,7 +476,7 @@ def test_the_old_mac_backup_files_are_gone():
 # scripts/luke/convmem-archive.sh, and its scripts/check-convmem-archive.sh pins
 # this same value. Change the script and both go red until the vendored copy and
 # both pins are updated together (the init.sql pattern, HOME-194).
-ARCHIVER_SHA256 = "11c21d83152b3dc3c10011eedf3ecebb3f0b492c400d94765d28663bcced768f"
+ARCHIVER_SHA256 = "a07e1844700e4714e83e758aba9be0ee27f4a155e28e89de55e93b3ffc177b65"
 
 
 def test_the_archiver_matches_the_checksum_home_infra_pins():

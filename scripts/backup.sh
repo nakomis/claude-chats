@@ -34,16 +34,20 @@ say() { echo "[backup] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 # The Mac-to-S3 LaunchAgent (scripts/setup-backup.sh, retired in CHATS-41) ran
 # `backup.sh --s3` every night. Luke backs conversation-memory up offsite now,
 # so that path is gone, but a machine still carrying the agent should hear
-# about it rather than quietly stop backing up: refuse, say why, and on a Mac
-# put it in Notification Centre too, since the agent's log is rarely read.
-retired() {
-    local msg="$1"
-    echo "[backup] REFUSED: ${msg}" >&2
+# about it rather than quietly stop backing up offsite: its `--s3` run is
+# refused with the reason, and every local backup on that machine still runs
+# but says the same, in Notification Centre too, since these logs are rarely
+# read. Refusing the local backup as well would leave such a Mac with none.
+notify() {
     if [[ "$(uname -s)" == "Darwin" && "${CLAUDE_CHATS_BACKUP_NOTIFY:-1}" != 0 ]] \
             && command -v osascript >/dev/null; then
-        osascript -e "display notification \"${msg//\"/}\" with title \"claude-chats backup\"" \
+        osascript -e "display notification \"${1//\"/}\" with title \"claude-chats backup\"" \
             >/dev/null 2>&1 || true
     fi
+}
+retired() {
+    echo "[backup] REFUSED: $1" >&2
+    notify "$1"
     exit 3
 }
 old_agent_message="the com.nakomis.claude-chats-backup LaunchAgent (Mac to S3) is retired: \
@@ -61,7 +65,10 @@ while [[ $# -gt 0 ]]; do
         *)         DIR="$1"; shift ;;
     esac
 done
-[[ -f "$OLD_AGENT" ]] && retired "$old_agent_message"
+if [[ -f "$OLD_AGENT" ]]; then
+    echo "[backup] WARNING: ${old_agent_message}" >&2
+    notify "$old_agent_message"
+fi
 [[ "$DIR" == *.sql.gz ]] && die "give a directory, not a file: backups are a directory of months and nightlies now"
 
 KEEP="${CLAUDE_CHATS_BACKUP_KEEP:-14}"

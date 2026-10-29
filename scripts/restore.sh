@@ -17,12 +17,15 @@
 #            backup identity cannot read objects, by design).
 #   --yes        do not ask before wiping the database
 #   --no-backfill  leave messages without a vector unembedded
+#   --allow-missing  restore even if archived months the nightly relies on
+#                  cannot be found (otherwise nothing is changed)
 #
 # Into the claude-chats-db container (CONVMEM_CONTAINER), through `docker exec`:
 # the host needs no Postgres client. The nightly says which month it covers
-# from (`-- messages from YYYY-MM-01`); months before that come from the
-# archive, each from its newest object, checked against the size and row count
-# its own name records.
+# from (`-- messages from YYYY-MM-01`) and which archived months it relies on;
+# those come from the archive, each from its newest intact object, and every
+# one is found, fetched and tested before the database is touched. Row counts
+# are checked against each name as it loads.
 #
 # WARNING: this drops and recreates the claude_chats database.
 #          Run backup.sh first if the current contents matter.
@@ -31,6 +34,7 @@ set -euo pipefail
 SRC="local"
 ARG=""
 YES=""
+ALLOW_MISSING=""
 BACKFILL="yes"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,7 +42,8 @@ while [[ $# -gt 0 ]]; do
         --s3)          SRC="s3"; shift ;;
         --yes|-y)      YES="yes"; shift ;;
         --no-backfill) BACKFILL=""; shift ;;
-        -h|--help)     sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --allow-missing) ALLOW_MISSING="yes"; shift ;;
+        -h|--help)     sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --*)           echo "[restore] unknown option '$1'" >&2; exit 2 ;;
         *)             ARG="$1"; shift ;;
     esac
@@ -119,14 +124,19 @@ fi
 gzip -t "$NIGHTLY" || die "${LABEL} is not a complete gzip stream"
 
 # `|| true`: head closing the pipe early is not a failure.
-CUTOFF="$( (gunzip -c "$NIGHTLY" || true) | head -5 \
-           | sed -n 's/^-- messages from \([0-9]\{4\}-[0-9]\{2\}\)-01;.*/\1/p' | head -1)"
+(gunzip -c "$NIGHTLY" || true) | head -6 >"${WORK}/header"
+CUTOFF="$(sed -n 's/^-- messages from \([0-9]\{4\}-[0-9]\{2\}\)-01;.*/\1/p' "${WORK}/header" | head -1)"
+# Nightlies since CHATS-41's review name every month they rely on the archive
+# for; older ones do not, and then only "none at all" can be caught.
+EXPECTED_MONTHS="$(sed -n 's/^-- archived months: *//p' "${WORK}/header" | head -1)"
+HAS_EXPECTED="$(grep -c '^-- archived months:' "${WORK}/header" || true)"
 
-# ── 2. Which archived months ────────────────────────────────────────────────
+# ── 2. Which archived months, all checked before anything is wiped ──────────
 #
-# Listed as "date time size name", newest last, so the last object seen for a
-# month is the one to use. A local archive keeps one file per month; S3 can hold
-# several, because a re-cut there cannot delete what it replaces.
+# Listed as "date time size name", oldest first. For each month the newest
+# INTACT object is used (its size equals the `b` in its name): a local archive
+# keeps one file per month, but S3 can hold several, because a re-cut there
+# cannot delete what it replaces, and a bad newest one must not hide a good one.
 
 listing() {
     if [[ "$SRC" == "local" ]]; then
@@ -138,21 +148,56 @@ listing() {
                 "$(wc -c <"$f" | tr -d ' ')" "$(basename "$f")"
         done
     else
-        s3 ls "s3://${ARCHIVE_BUCKET}/${ARCHIVE_PREFIX}" || true
+        s3 ls "s3://${ARCHIVE_BUCKET}/${ARCHIVE_PREFIX}"
     fi
 }
 
 : >"${WORK}/months"
 if [[ -n "$CUTOFF" ]]; then
-    listing | sort -k1,2 | awk -v cutoff="$CUTOFF" '
+    # A listing that fails is not an empty archive. (`aws s3 ls` also fails on
+    # a prefix with no objects, which is only fine if no month is needed.)
+    listing >"${WORK}/listing" 2>"${WORK}/listing.err" || LISTING_FAILED=1
+    sort -k1,2 "${WORK}/listing" | awk -v cutoff="$CUTOFF" '
         $4 ~ /^messages_[0-9][0-9][0-9][0-9]-[0-9][0-9]\..*\.csv\.gz$/ {
             m = substr($4, 10, 7)
-            if (m < cutoff) { newest[m] = $3 " " $4 }
+            if (m >= cutoff) next
+            claimed = $4; sub(/^.*\.b/, "", claimed); sub(/\.csv\.gz$/, "", claimed)
+            if (claimed == $3) { newest[m] = $3 " " $4 }
+            else { print "[restore] skipping " $4 ": " $3 " bytes, its name says " claimed > "/dev/stderr" }
         }
         END { for (m in newest) print m, newest[m] }
     ' | sort >"${WORK}/months"
+
+    found="$(awk '{ print $1 }' "${WORK}/months" | tr '\n' ' ')"
+    missing=""
+    if [[ "$HAS_EXPECTED" -gt 0 ]]; then
+        for m in $EXPECTED_MONTHS; do
+            [[ " $found " == *" $m "* ]] || missing="${missing} ${m}"
+        done
+    elif [[ -z "$found" ]]; then
+        missing=" (this nightly does not list its months, and none were found)"
+    fi
+    if [[ -n "$missing" ]]; then
+        [[ -n "${LISTING_FAILED:-}" ]] && cat "${WORK}/listing.err" >&2
+        msg="archived months before ${CUTOFF} are missing:${missing}"
+        [[ -n "$ALLOW_MISSING" ]] || die "${msg}. Nothing was changed. Check the listing (profile, prefix), or pass --allow-missing to restore without them."
+        echo "[restore] WARNING: ${msg}; restoring without them (--allow-missing)" >&2
+    fi
 fi
 MONTHS="$(wc -l <"${WORK}/months" | tr -d ' ')"
+
+# Fetch (S3) and test every month now, so a bad one stops the restore before
+# the database is touched rather than half-way through loading it.
+while read -r month size name <&3; do
+    if [[ "$SRC" == "local" ]]; then
+        file="${ARCHIVE_DIR%/}/messages/${name}"
+    else
+        file="${WORK}/${name}"
+        s3 cp "s3://${ARCHIVE_BUCKET}/${ARCHIVE_PREFIX}${name}" "$file" --no-progress >/dev/null
+        [[ "$(wc -c <"$file" | tr -d ' ')" == "$size" ]] || die "${name}: the download is not ${size} bytes"
+    fi
+    gzip -t "$file" || die "${name} is not a complete gzip stream. Nothing was changed."
+done 3<"${WORK}/months"
 
 echo
 echo "Restoring from: ${LABEL}"
@@ -186,17 +231,12 @@ fi
 # fd 3, so nothing in the loop can swallow the list from stdin.
 while read -r month size name <&3; do
     [[ -n "$month" ]] || continue
-    claimed="${name##*.b}"; claimed="${claimed%.csv.gz}"
     rows="${name#*.r}"; rows="${rows%%.*}"
-    [[ "$size" == "$claimed" ]] \
-        || die "${name} is ${size} bytes but its name says ${claimed}: truncated, not restoring it"
     if [[ "$SRC" == "local" ]]; then
         file="${ARCHIVE_DIR%/}/messages/${name}"
     else
-        file="${WORK}/${name}"
-        s3 cp "s3://${ARCHIVE_BUCKET}/${ARCHIVE_PREFIX}${name}" "$file" --no-progress >/dev/null
+        file="${WORK}/${name}"   # fetched and tested above
     fi
-    gzip -t "$file" || die "${name} is not a complete gzip stream"
     # The file's own header is the column list, so a month cut before a column
     # existed still loads; HEADER match makes Postgres check it line for line.
     cols="$( (gunzip -c "$file" || true) | head -1 | sed 's/,/, /g')"
@@ -226,7 +266,8 @@ psql_in -d "$DB_NAME" -q -v ON_ERROR_STOP=1 </dev/null \
             IF to_regclass('public.messages_embedding_idx') IS NOT NULL THEN
                 REINDEX INDEX public.messages_embedding_idx;
             END IF;
-        END \$\$" 2>/dev/null
+        END \$\$" >"${WORK}/reindex.log" 2>&1 \
+    || { cat "${WORK}/reindex.log" >&2; die "rebuilding messages_embedding_idx failed (the data is loaded)"; }
 
 say "row counts"
 psql_in -d "$DB_NAME" </dev/null -c "

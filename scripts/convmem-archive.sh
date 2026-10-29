@@ -138,6 +138,10 @@ DOCKER="${CONVMEM_DOCKER:-docker}"
 DB_NAME="${CONVMEM_DB_NAME:-claude_chats}"
 DB_USER="${CONVMEM_DB_USER:-claude}"
 
+# BACKUP_PREFIX separates an EC2 stand-in's S3 writes from the real ones; a
+# local archive has no such neighbour, and restore.sh reads it unprefixed.
+[ "$TARGET" = "local" ] && ARCHIVE_PREFIX="messages/"
+
 case "$TARGET" in
     s3)    ARCHIVE_LOCATION="s3://${ARCHIVE_BUCKET}/${ARCHIVE_PREFIX}" ;;
     local) ARCHIVE_LOCATION="${ARCHIVE_DIR%/}/${ARCHIVE_PREFIX}" ;;
@@ -394,6 +398,14 @@ archive_month() {
     # off at 90% still clears any sane floor.
     gzip -t "$staged" || fail "[${m}] staged export is not a complete gzip stream"
 
+    # The facts were read in a different session from the export, so a row
+    # that arrived in between would be in the file but not in the key, and a
+    # restore checking one against the other would refuse the month. Read them
+    # again: if they moved, this month is not archived tonight, which leaves it
+    # in the nightly (the cutoff only advances past verified months).
+    [ "$(facts_stem "$(month_facts "$m")")" = "$stem" ] \
+        || fail "[${m}] the month changed while it was being exported — leaving it for the next run"
+
     key="${ARCHIVE_PREFIX}messages_${m}.${stem}.b${sent}.csv.gz"
 
     if [ "$TARGET" = "local" ]; then
@@ -523,6 +535,11 @@ do_dump() {
     # before it come from the archive, everything from it on from this dump.
     echo "-- conversation-memory windowed backup (HOME-458)"
     echo "-- messages from ${cutoff}; everything older is in ${ARCHIVE_LOCATION}"
+    # Every month before the cutoff that has messages, all verified archived
+    # (that is what the cutoff means). restore.sh refuses to wipe a database
+    # unless it can find each of them, so a failed listing or a lost month
+    # cannot pass for a restore that merely had less history.
+    echo "-- archived months: $(months_with_data | awk -v c="${cutoff%-01}" '$0 < c' | tr '\n' ' ' | sed 's/ $//')"
     echo "-- restore: claude-chats scripts/restore.sh, or home-infra docs/runbooks/convmem-restore.md"
 
     "$DOCKER" exec "$CONTAINER" pg_dump -h /var/run/postgresql -U "$DB_USER" -s "$DB_NAME"
@@ -603,10 +620,18 @@ open_snapshot() {
         -q -At -v ON_ERROR_STOP=1 <"${SNAP_DIR}/in" >"${SNAP_DIR}/out" &
     SNAP_PID=$!
     exec 4>"${SNAP_DIR}/in"
-    printf 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSELECT pg_export_snapshot();\n' >&4
+    # SIGPIPE ignored around writes to the FIFO only, so a session that died
+    # early gives a message here rather than a silent exit 141.
+    trap '' PIPE
+    printf 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSELECT pg_export_snapshot();\n' >&4 \
+        || fail "the snapshot session ended before it started"
+    trap - PIPE
     for _ in $(seq 1 300); do
-        SNAPSHOT="$(head -1 "${SNAP_DIR}/out" 2>/dev/null || true)"
-        [[ "$SNAPSHOT" =~ ^[0-9A-Fa-f-]+$ ]] && return 0
+        # Only a whole line: a partial id would also match the pattern.
+        if [ "$(tail -c 1 "${SNAP_DIR}/out" 2>/dev/null | od -An -c | tr -d ' ')" = '\n' ]; then
+            SNAPSHOT="$(head -1 "${SNAP_DIR}/out")"
+            [[ "$SNAPSHOT" =~ ^[0-9A-Fa-f-]+$ ]] && return 0
+        fi
         kill -0 "$SNAP_PID" 2>/dev/null || break
         sleep 0.1
     done
@@ -614,7 +639,9 @@ open_snapshot() {
 }
 
 close_snapshot() {
-    printf 'COMMIT;\n' >&4
+    trap '' PIPE
+    printf 'COMMIT;\n' >&4 || fail "the snapshot session ended before the dump did"
+    trap - PIPE
     exec 4>&-
     wait "$SNAP_PID" || fail "the snapshot session did not end cleanly"
     SNAP_PID=""
