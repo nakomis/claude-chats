@@ -114,23 +114,72 @@ why `--restore` runs a backfill at the end, and why it is the slow part.
 `--backup` keeps the newest 14 dumps in its directory and deletes older ones;
 set `CLAUDE_CHATS_BACKUP_KEEP` to change that.
 
-### Upgrading an older install
+### Upgrading from before October 2026
 
-Re-run `./install.sh` from an up-to-date checkout. It:
+Until October 2026 the single-machine edition carried its own copies of the
+hook, the MCP server and the schema under `localhost/`, and offered two capture
+modes, `direct` and `durable`. Now it runs the repository's shared `../hook`,
+`../mcp` and `../init.sql`, and the outbox is the only capture mode. To upgrade,
+pull an up-to-date checkout and re-run the installer from `localhost/`, with no
+`--mode`:
+
+```bash
+cd claude-chats && git pull
+cd localhost && ./install.sh
+```
+
+Do both together. Between the pull and the re-run, the hook entries and the
+old LaunchAgent still name `localhost/hook`, which is now a stand-in with no code
+that runs the shared hook instead: capture carries on into the outbox, and the
+old LaunchAgent's drains fail harmlessly until the schema is upgraded, leaving
+those messages pending for the new schedule. (Without that stand-in, the hook
+would fail with an exit status Claude Code takes as "block", refusing every
+prompt.) The old MCP server registration does not start in that gap.
+
+The provider, model and their settings are kept from `~/.claude-chats/config.env`,
+so you do not need to repeat them. The installer:
 
 - rewrites the hook entries and the MCP registration, so nothing points at the
   old `localhost/hook` or `localhost/mcp` copies any more (those directories no
-  longer exist);
-- moves an install that used the removed `direct` capture mode to the outbox,
-  and drops the database settings that mode put on the hook command line;
-- re-applies `../init.sql`, which adds the columns and tables the old schema
-  lacked (`author`, `tool_name`, `model`, the facts tables, …) without touching
-  existing rows. Messages recorded before the upgrade keep `author = 'unknown'`;
+  longer exist). Hooks of your own, and the rest of `settings.json`, are left as
+  they were; the previous file is kept as `settings.json.bak`;
+- moves a `direct` install to the outbox, and drops the database and provider
+  settings that mode put on the hook command line. `--mode direct` is refused;
+- replaces the old LaunchAgent, which had the provider settings (an API key,
+  for OpenAI) written into the plist, with one that reads them from
+  `config.env`. On Linux, where the old edition scheduled nothing, it installs
+  the systemd user timer;
+- rewrites `config.env` without the old `CLAUDE_CHATS_CAPTURE_MODE` line, still
+  mode 600;
+- re-applies `../init.sql`, which brings the database to exactly the schema a new
+  install gets: the `author`, `tool_name`, `model` and provenance columns, the
+  BRIN index on `created_at`, and the facts tables. No row is changed. Messages
+  recorded before the upgrade keep `author = 'unknown'`, rather than a guess;
 - leaves the database volume, the outbox, the image archive and any fallback
-  file exactly as they were. If it finds `~/.claude-chats/outbox-fallback.ndjson`
-  it says so: run `./install.sh --replay-fallback`.
+  file exactly as they were.
 
-Restart Claude Code afterwards.
+Two things it points you at rather than doing itself:
+
+- **Anything still pending in the outbox** (a `durable` install) is delivered
+  by the new drain schedule: the LaunchAgent drains as soon as it is loaded,
+  the systemd timer within a minute. To do it there and then, run
+  `./install.sh --drain`.
+- **A fallback file.** If `~/.claude-chats/outbox-fallback.ndjson` exists, the
+  installer says so: run `./install.sh --replay-fallback`.
+
+Restart Claude Code afterwards. From then on you have everything the main
+edition has: messages typed while Claude is still working are captured
+(HOME-411), each message records who wrote it, which tool produced it and which
+model answered, `search_memory` takes a `since` window (3 months by default;
+`since="all"` searches everything), its vector search uses 20 ivfflat probes,
+and `recall_facts` is available. Sessions you started before the upgrade can be
+resumed: the new hook adds to the same conversation without duplicating what
+is already recorded.
+
+Re-running `./install.sh` afterwards changes nothing. This whole path, from an
+old install in each mode with real conversations in it, is tested by
+`tests/test_localhost_upgrade.py` (CI runs it against a Postgres service, and
+with real Docker Compose via `scripts/upgrade-check-localhost.sh`).
 
 ### Switching embedding provider
 
