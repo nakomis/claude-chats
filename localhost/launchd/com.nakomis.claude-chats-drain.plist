@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Drains the SQLite outbox into PostgreSQL: the backstop.
+
+    The hook appends to the outbox and does no network I/O, so capture cannot
+    fail. It also starts a drain in the background after every capture, which
+    is what makes a message searchable within seconds. This agent is for
+    everything that drain cannot cover: Docker being down at the time, Postgres
+    not yet accepting connections, an embedding provider that is not running,
+    a Mac that went to sleep mid-drain. When it fails the outbox simply grows
+    and drains on the next run.
+
+    REPO_PATH, UV_PATH and CONFIG_PATH are substituted at install time by
+    install.sh. The provider and database settings are read from CONFIG_PATH
+    (~/.claude-chats/config.env) at each run rather than copied in here, so a
+    re-install that changes them needs no reload, and an API key is not left
+    in a second file.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nakomis.claude-chats-drain</string>
+
+    <!-- Absolute path to uv, not `/usr/bin/env uv`: launchd runs with a minimal
+         PATH that does not include /opt/homebrew/bin, so env would not find it
+         and the agent would fail silently for ever. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>UV_PATH</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>REPO_PATH/hook</string>
+        <string>drain-outbox</string>
+        <string>--env-file</string>
+        <string>CONFIG_PATH</string>
+    </array>
+
+    <!-- Every two minutes. The drain started by the hook normally gets there
+         first, so this mostly finds nothing to do. -->
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <!-- Catch up on anything captured while the Mac was asleep or Postgres was
+         down. Safe: draining is idempotent, and concurrent drains take turns. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-chats-drain.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-chats-drain.log</string>
+</dict>
+</plist>

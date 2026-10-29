@@ -1,10 +1,7 @@
--- Schema for the single-machine edition. Kept identical to the distributed
--- edition's ../init.sql so a database can be moved between the two, and so a
--- backup taken under one restores under the other.
---
--- The `host` column is always the same value here, but it stays because the
--- distributed edition uses it to tell several machines' conversations apart
--- and the two schemas must not diverge.
+-- The single-machine edition's schema as it stood before CHATS-36 removed
+-- localhost/init.sql (last changed Sep 2026). Kept only so that
+-- tests/test_schema_upgrade.py can prove the shared init.sql upgrades a
+-- database created from it. Never applied anywhere else.
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 

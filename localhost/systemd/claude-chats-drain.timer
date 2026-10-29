@@ -1,0 +1,11 @@
+# Runs claude-chats-drain.service every two minutes, and soon after boot to
+# catch up on anything captured while Postgres was down.
+[Unit]
+Description=Drain the claude-chats outbox every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
