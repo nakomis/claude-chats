@@ -152,6 +152,10 @@ def _assert_installed(sandbox, result):
     add = [c for c in _calls(sandbox, "claude") if c.startswith("claude mcp add")][-1]
     assert add.endswith(f"-- uv run --project {ROOT / 'mcp'} conversation-memory-mcp")
     assert "localhost/mcp" not in add
+    # One database and no replica (CHATS-38): recall_facts reads the primary.
+    for written in (add, json.dumps(_settings(home)),
+                    (home / ".claude-chats" / "config.env").read_text()):
+        assert "READ_DB_URL" not in written
 
     config = home / ".claude-chats" / "config.env"
     assert "CAPTURE_MODE" not in config.read_text()
