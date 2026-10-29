@@ -26,7 +26,7 @@ cd claude-chats/localhost
 It needs Docker, uv, Claude Code and an embedding provider (Ollama by default).
 Full details, including the maintenance commands, are in
 **[INSTALL.md](INSTALL.md)**. Installed from an older checkout? Re-run
-`./install.sh` — see [Upgrading](INSTALL.md#upgrading-an-older-install).
+`./install.sh` — see [Upgrading](INSTALL.md#upgrading-from-before-october-2026).
 
 ## How it works
 
@@ -85,6 +85,7 @@ is the repository's own, the same code the distributed edition runs:
 | `install.sh` | Starts Postgres in Docker, registers the hook with `CLAUDE_CHATS_DRAIN_AFTER_CAPTURE=1` and the MCP server, installs the drain schedule. The distributed edition is installed from two repositories and has none of these steps. |
 | `docker-compose.yml` | The local Postgres. It stays in this directory because Compose names the data volume after it (`localhost_pgdata`); moving it would orphan existing databases. |
 | `launchd/`, `systemd/` | The drain schedule. Only this edition drains locally: in the distributed edition the forwarder owns the outbox, and a local drain would compete with it. |
+| `hook/pyproject.toml` | No code: a stand-in for the hook package that used to live here, resolving to `../../hook`. Installs from before October 2026 run their hook from this path until `install.sh` is re-run, and without it a `git pull` would leave them failing in a way Claude Code takes as "block the prompt". |
 | `README.md`, `INSTALL.md`, `docs/` | This edition's documentation. |
 
 `tests/test_localhost_layout.py` fails if any `.py` or `.sql` file appears here

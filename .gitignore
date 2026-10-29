@@ -5,3 +5,5 @@ __pycache__/
 .env
 PLAN.md
 scripts/backup.log
+# Written by uv the first time an old install runs the localhost/hook shim.
+localhost/hook/uv.lock

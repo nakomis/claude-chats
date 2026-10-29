@@ -30,8 +30,19 @@ def test_no_python_or_sql_under_localhost():
 
 def test_localhost_holds_only_install_files_and_docs():
     allowed_top = {"install.sh", "docker-compose.yml", "README.md", "INSTALL.md",
-                   "launchd", "systemd", "docs"}
+                   "launchd", "systemd", "docs", "hook"}
     assert {p.name for p in LOCALHOST.iterdir()} <= allowed_top
+
+
+def test_localhost_hook_is_only_the_upgrade_shim():
+    """localhost/hook is a pyproject with no code, pointing at ../../hook, for
+    installs from before October 2026 until install.sh is re-run (CHATS-37).
+    uv leaves a lock file and a .venv beside it; nothing else belongs there."""
+    shim = LOCALHOST / "hook"
+    assert {p.name for p in shim.iterdir()} - {"uv.lock", ".venv"} == {"pyproject.toml"}
+    text = (shim / "pyproject.toml").read_text()
+    assert 'claude-chats-hook = { path = "../../hook", editable = true }' in text
+    assert "package = false" in text
 
 
 def test_embed_py_exists_once():
