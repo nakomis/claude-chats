@@ -78,7 +78,7 @@ is the repository's own, the same code the distributed edition runs:
 | [`../hook`](../hook) | The capture hook, `drain-outbox`, `replay-fallback`, `backfill-embeddings`, and the one embedding helper |
 | [`../mcp`](../mcp) | The MCP server, which uses the hook's embedding helper |
 | [`../init.sql`](../init.sql) | The schema; `docker-compose.yml` mounts it, and `install.sh` re-applies it on every run |
-| [`../scripts/backup.sh`, `restore.sh`](../scripts) | Backups, with `--local` (used here) or `--s3` |
+| [`../scripts/backup.sh`, `restore.sh`](../scripts) | Backups. `--s3` is their default; `install.sh` always passes `--local`, which keeps the newest 14 dumps (`CLAUDE_CHATS_BACKUP_KEEP`) |
 
 | Here, and why it stays separate | |
 |---|---|

@@ -109,7 +109,10 @@ Backups deliberately exclude the embedding vectors: they are incompressible, the
 dominate the dump, and they are fully regenerable from message content. That is
 why `--restore` runs a backfill at the end, and why it is the slow part.
 `--backup` and `--restore` run the repository's `scripts/backup.sh --local` and
-`scripts/restore.sh --local`, which can be run directly too.
+`scripts/restore.sh --local`, which can be run directly too — but keep the
+`--local`: without it they default to S3, for the distributed edition's sake.
+`--backup` keeps the newest 14 dumps in its directory and deletes older ones;
+set `CLAUDE_CHATS_BACKUP_KEEP` to change that.
 
 ### Upgrading an older install
 

@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
 # Restore the claude_chats database from a backup made by backup.sh.
 #
-# Usage: scripts/restore.sh [--local] [file.sql.gz]
-#        scripts/restore.sh --s3 [s3-key]
+# Usage: scripts/restore.sh [--s3] [s3-key]
+#        scripts/restore.sh --local [file.sql.gz]
 #
-#   --local  (default) restore a file. Omit it to pick from
-#            $CLAUDE_CHATS_BACKUP_DIR (default ~/.claude-chats/backups/).
-#   --s3     download from s3://$CLAUDE_CHATS_BACKUP_BUCKET/ first. The key is
-#            the full object key, e.g.
-#            conversation-memory/claude_chats_20260508T030000Z.sql.gz;
+#   --s3     (default, as it always was) download from
+#            s3://$CLAUDE_CHATS_BACKUP_BUCKET/ first. The key is the full
+#            object key, e.g. conversation-memory/claude_chats_20260508T030000Z.sql.gz;
 #            omit it to pick from a listing.
+#   --local  restore a file. Omit it to pick from $CLAUDE_CHATS_BACKUP_DIR
+#            (default ~/.claude-chats/backups/). The single-machine edition's
+#            `install.sh --restore` always passes this.
 #
-# CLAUDE_CHATS_BACKUP_DEST=local|s3 sets the default when no flag is given.
+# CLAUDE_CHATS_BACKUP_DEST=local|s3 overrides the default when no flag is given.
 #
 # WARNING: this drops and recreates the claude_chats database.
 #          Run backup.sh first if the current contents matter.
 set -euo pipefail
 
-SRC="${CLAUDE_CHATS_BACKUP_DEST:-local}"
+SRC="${CLAUDE_CHATS_BACKUP_DEST:-s3}"
 ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --local) SRC="local"; shift ;;
         --s3)    SRC="s3"; shift ;;
-        -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --*)     echo "[restore] unknown option '$1'" >&2; exit 2 ;;
         *)       ARG="$1"; shift ;;
     esac

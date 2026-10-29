@@ -225,7 +225,7 @@ psql -h luke.local -p 5433 -U claude claude_chats
 
 `init.sql` is the source of truth for the schema. It is vendored into `home-infra` for the deployed copy, and `tests/test_pg_schema.py` pins a checksum of the DDL so the two cannot silently drift.
 
-Backups are handled in `home-infra` alongside the rest of the estate. `scripts/backup.sh` and `scripts/restore.sh` here serve the single-machine edition (`--local`, the default, which is what `localhost/install.sh --backup` runs) and the superseded Mac-hosted database (`--s3`).
+Backups are handled in `home-infra` alongside the rest of the estate. `scripts/backup.sh` and `scripts/restore.sh` here serve the superseded Mac-hosted database (`--s3`, the default, so installed LaunchAgents that run them with no arguments carry on uploading) and the single-machine edition (`--local`, which `localhost/install.sh` always passes; local dumps are pruned to the newest `CLAUDE_CHATS_BACKUP_KEEP`, default 14).
 
 ## Possible future enhancements
 

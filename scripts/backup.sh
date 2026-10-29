@@ -1,39 +1,43 @@
 #!/usr/bin/env bash
 # Dump the claude_chats database, excluding the embedding vectors.
 #
-# Usage: scripts/backup.sh [--local [file-or-directory] | --s3]
+# Usage: scripts/backup.sh [--s3 | --local [file-or-directory]]
 #
-#   --local  (default) write the dump to disk. Default destination:
-#            ~/.claude-chats/backups/. This is what the single-machine
-#            edition's `install.sh --backup` runs.
-#   --s3     upload the dump to s3://$CLAUDE_CHATS_BACKUP_BUCKET/$CLAUDE_CHATS_BACKUP_PREFIX/
-#            using the $BACKUP_AWS_PROFILE profile. The superseded
-#            Mac-hosted database's LaunchAgent (com.nakomis.claude-chats-backup)
-#            runs this; the live distributed database is backed up by home-infra.
+#   --s3     (default) upload the dump to s3://$CLAUDE_CHATS_BACKUP_BUCKET/$CLAUDE_CHATS_BACKUP_PREFIX/
+#            using the $BACKUP_AWS_PROFILE profile. The default because the
+#            installed com.nakomis.claude-chats-backup LaunchAgents run this
+#            script with no arguments, and must keep backing up offsite.
+#   --local  write the dump to disk, default ~/.claude-chats/backups/, and
+#            keep only the newest $CLAUDE_CHATS_BACKUP_KEEP (default 14)
+#            claude_chats_*.sql.gz there. The single-machine edition's
+#            `install.sh --backup` always passes this. A bare path with no
+#            flag also means --local.
 #
-# CLAUDE_CHATS_BACKUP_DEST=local|s3 sets the default when no flag is given.
+# CLAUDE_CHATS_BACKUP_DEST=local|s3 overrides the default when no flag is given.
 #
 # Safe to run while the database is live — pg_dump takes a consistent snapshot.
 # Dumps *through the container* (docker exec): the host need not have a
 # Postgres client at all, only the image does.
 set -euo pipefail
 
-DEST="${CLAUDE_CHATS_BACKUP_DEST:-local}"
+DEST="${CLAUDE_CHATS_BACKUP_DEST:-s3}"
 DEST_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --local) DEST="local"; shift
                  if [[ $# -gt 0 && "$1" != --* ]]; then DEST_ARG="$1"; shift; fi ;;
         --s3)    DEST="s3"; shift ;;
-        -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --*)     echo "[backup] unknown option '$1'" >&2; exit 2 ;;
-        *)       DEST_ARG="$1"; shift ;;   # a bare path, as install.sh used to pass
+        *)       DEST="local"; DEST_ARG="$1"; shift ;;   # a bare path, as install.sh used to pass
     esac
 done
 [[ "$DEST" == "local" || "$DEST" == "s3" ]] || {
     echo "[backup] CLAUDE_CHATS_BACKUP_DEST must be 'local' or 's3' (got '$DEST')" >&2; exit 2; }
 
 CONTAINER="${CLAUDE_CHATS_CONTAINER:-claude-chats-db}"
+KEEP="${CLAUDE_CHATS_BACKUP_KEEP:-14}"
+[[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || { echo "[backup] CLAUDE_CHATS_BACKUP_KEEP must be a positive integer" >&2; exit 2; }
 DB_NAME="claude_chats"
 DB_USER="claude"
 
@@ -50,11 +54,15 @@ AWS="$(command -v aws || echo /opt/homebrew/bin/aws)"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 FILENAME="claude_chats_${TIMESTAMP}.sql.gz"
 
+PRUNE_DIR=""
 if [[ "$DEST" == "local" ]]; then
     DEST_ARG="${DEST_ARG:-${HOME}/.claude-chats/backups}"
     if [[ -d "$DEST_ARG" || "$DEST_ARG" != *.sql.gz ]]; then
         mkdir -p "$DEST_ARG"
         OUTFILE="${DEST_ARG%/}/${FILENAME}"
+        # Only a directory of our own timestamped dumps is pruned; a dump
+        # written to a named file is the caller's to keep.
+        PRUNE_DIR="${DEST_ARG%/}"
     else
         mkdir -p "$(dirname "$DEST_ARG")"
         OUTFILE="$DEST_ARG"
@@ -124,6 +132,18 @@ SIZE="$(du -h "$OUTFILE" | cut -f1)"
 
 if [[ "$DEST" == "local" ]]; then
     echo "[backup] done: ${OUTFILE} (${SIZE})"
+    if [[ -n "$PRUNE_DIR" ]]; then
+        # Newest first by name (the timestamp sorts), so the one just written
+        # is always kept. No mapfile/xargs -d: macOS ships bash 3.2 and BSD xargs.
+        n=0
+        while IFS= read -r old; do
+            n=$((n + 1))
+            if [[ $n -gt $KEEP ]]; then
+                rm -f -- "$old"
+                echo "[backup] pruned $(basename "$old") (keeping the newest ${KEEP})"
+            fi
+        done < <(ls -1 "$PRUNE_DIR"/claude_chats_*.sql.gz 2>/dev/null | sort -r)
+    fi
     exit 0
 fi
 
