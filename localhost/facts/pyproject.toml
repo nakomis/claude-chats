@@ -1,0 +1,24 @@
+# The Python environment the single-machine edition runs Claude Facts in (CHATS-39). No code.
+#
+# The code is the repository's own ../../facts (and ../../facts_eval/export.py), the same
+# the distributed edition runs on Mace; the launchd agent and systemd unit run
+#   uv run --project <checkout>/localhost/facts python -m facts.single_machine --env-file …
+# from the checkout's root, which is what puts `facts` on the path. This project only
+# supplies the dependencies: the shared hook package (the database driver, and hook.embed,
+# so facts are embedded exactly as queries are) and the Anthropic SDK with its Bedrock
+# extra, for the anthropic and bedrock providers. The claude-code provider needs neither:
+# it runs the user's own `claude`.
+#
+# Not inside ../../facts: Mace builds its image from that folder, and a .venv beside it
+# would go into the image.
+[project]
+name = "claude-chats-localhost-facts"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = ["claude-chats-hook", "anthropic[bedrock]>=2.3,<3"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+claude-chats-hook = { path = "../../hook", editable = true }

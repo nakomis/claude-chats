@@ -8,6 +8,12 @@ transcripts through the old hook it installed, and only then runs the new
 install.sh over the same HOME and the same database. Then it checks that
 nothing was lost and that everything now runs from the shared hook/ and mcp/.
 
+The upgrade also adds Claude Facts (CHATS-39) with its default provider, the
+user's Claude Code login: the stubbed `claude` says it is logged in and answers
+`claude -p` as Claude Code does, and the facts schedule's own command is run to
+show a fact extracted from a conversation after the upgrade, and none from
+before it.
+
 Each old capture mode is covered: `direct` (the hook wrote Postgres itself) and
 `durable` (outbox plus a LaunchAgent), on macOS, and `durable` on Linux, where
 the old installer scheduled no drain at all.
@@ -137,14 +143,33 @@ if [[ "$1" == exec ]]; then
 fi
 """
 
-# Claude Code's MCP registry, as far as `claude mcp add/remove` go.
+# Claude Code's MCP registry, as far as `claude mcp add/remove` go; a logged-in
+# `claude auth status`; and `claude -p`, answering with one fact as
+# `--output-format json --json-schema` does.
 CLAUDE_STUB = '''#!{python}
 import json, os, sys
-with open(os.environ["STUB_LOG"], "a") as log:
+# The facts schedule runs this with launchd's near-empty environment, so it finds
+# its own directory rather than relying on STUB_DIR.
+stub_dir = os.environ.get("STUB_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+with open(os.environ.get("STUB_LOG") or os.path.join(stub_dir, "calls.log"), "a") as log:
     log.write("claude " + " ".join(sys.argv[1:]) + "\\n")
-path = os.path.join(os.environ["STUB_DIR"], "mcp-registry.json")
+path = os.path.join(stub_dir, "mcp-registry.json")
 reg = json.load(open(path)) if os.path.exists(path) else {{}}
 args = sys.argv[1:]
+if args[:2] == ["auth", "status"]:
+    print(json.dumps({{"loggedIn": True, "authMethod": "claude.ai"}}))
+    sys.exit(0)
+if args[:1] == ["-p"]:
+    sys.stdin.read()
+    with open(os.path.join(stub_dir, "claude-p.log"), "a") as log:
+        log.write(json.dumps({{"argv": args, "api_key": os.environ.get("ANTHROPIC_API_KEY")}}) + "\\n")
+    fact = {{"id": "0", "text": "The lathe tooling notes are in lathe-tooling.md in the workshop folder.",
+             "kind": "config", "subject": "lathe tooling", "attribute": "notes"}}
+    print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "stop_reason": "tool_use",
+                      "structured_output": {{"memory": [fact]}}, "result": "",
+                      "usage": {{"input_tokens": 3, "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 100, "output_tokens": 20}}}}))
+    sys.exit(0)
 if args[:2] == ["mcp", "remove"]:
     scope = args[args.index("--scope") + 1]
     if reg.pop(f"{{scope}}:{{args[2]}}", None) is None:
@@ -340,7 +365,7 @@ class World:
         for name in old_files:
             (self.checkout / name).unlink()
         ignore = shutil.ignore_patterns(".venv", "__pycache__", ".pytest_cache", "*.pyc")
-        for d in ("hook", "mcp", "localhost", "scripts"):
+        for d in ("hook", "mcp", "localhost", "scripts", "facts", "facts_eval"):
             shutil.copytree(ROOT / d, self.checkout / d, ignore=ignore, dirs_exist_ok=True)
         shutil.copy2(ROOT / "init.sql", self.checkout / "init.sql")
         self._point_at_database(self.checkout / "localhost" / "install.sh")
@@ -440,6 +465,21 @@ class World:
             assert r.returncode == 0, r.stdout + r.stderr
         return r
 
+    def run_scheduled_facts(self, uname: str):
+        """The Claude Facts schedule's command, read back from the installed unit, run
+        the way launchd or systemd would: from its working directory, with next to
+        nothing in the environment."""
+        if uname == "Darwin":
+            plist = plistlib.loads(self.facts_plist_path.read_bytes())
+            argv, cwd = plist["ProgramArguments"], plist["WorkingDirectory"]
+        else:
+            lines = (self.systemd_dir / "claude-chats-facts.service").read_text().splitlines()
+            argv = shlex.split(next(ln for ln in lines if ln.startswith("ExecStart="))[len("ExecStart="):])
+            cwd = next(ln for ln in lines if ln.startswith("WorkingDirectory="))[len("WorkingDirectory="):]
+        r = subprocess.run(argv, cwd=cwd, env=self.minimal_env(), capture_output=True, text=True, timeout=600)
+        assert r.returncode == 0, r.stdout + r.stderr
+        return r
+
     def minimal_env(self) -> dict:
         keep = ("HOME", "PATH", "TERM", "UV_CACHE_DIR", "UV_PYTHON", "UV_PYTHON_DOWNLOADS",
                 "CLAUDE_CHATS_DB_URL")  # the last only ever the safety net above
@@ -448,6 +488,10 @@ class World:
     @property
     def plist_path(self) -> Path:
         return self.home / "Library" / "LaunchAgents" / "com.nakomis.claude-chats-drain.plist"
+
+    @property
+    def facts_plist_path(self) -> Path:
+        return self.home / "Library" / "LaunchAgents" / "com.nakomis.claude-chats-facts.plist"
 
     @property
     def systemd_dir(self) -> Path:
@@ -673,9 +717,9 @@ def _mcp(world: World, calls: list[tuple[str, dict]]) -> tuple[list[str], list[d
 
 def _snapshot(world: World, uname: str) -> dict:
     files = [world.home / ".claude" / "settings.json", world.state / "config.env"]
-    files += ([world.plist_path] if uname == "Darwin" else
-              [world.systemd_dir / "claude-chats-drain.service",
-               world.systemd_dir / "claude-chats-drain.timer"])
+    files += ([world.plist_path, world.facts_plist_path] if uname == "Darwin" else
+              [world.systemd_dir / f"claude-chats-{unit}.{kind}"
+               for unit in ("drain", "facts") for kind in ("service", "timer")])
     return {
         "files": {str(p): p.read_bytes() for p in files},
         "registry": world.registry(),
@@ -796,7 +840,17 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
     keys = [ln.split("=", 1)[0] for ln in config.read_text().splitlines()
             if ln and not ln.startswith("#")]
     assert keys == ["CLAUDE_CHATS_PROVIDER", "CLAUDE_CHATS_MODEL", "CLAUDE_CHATS_DIMENSIONS",
-                    "CLAUDE_CHATS_DB_URL", "OLLAMA_BASE_URL"]
+                    "CLAUDE_CHATS_DB_URL", "OLLAMA_BASE_URL",
+                    "FACTS_PROVIDER", "FACTS_PROVIDER_REQUESTED", "FACTS_INSTALLED_AT", "FACTS_SINCE",
+                    "FACTS_MAX_EXCHANGES", "FACTS_CLAUDE_BIN"]
+    # Claude Facts was added with its default provider, for conversations from now on.
+    facts_config = dict(ln.split("=", 1) for ln in config.read_text().splitlines()
+                        if ln.startswith("FACTS_"))
+    assert facts_config["FACTS_PROVIDER"] == "claude-code"
+    assert facts_config["FACTS_CLAUDE_BIN"] == str(world.tmp / "bin" / "claude")
+    facts_since = datetime.fromisoformat(facts_config["FACTS_SINCE"])
+    assert facts_config["FACTS_INSTALLED_AT"] == facts_config["FACTS_SINCE"]
+    assert abs(datetime.now(timezone.utc) - facts_since) < timedelta(minutes=15)
     # Carried over from the old install's config.env: this run's environment
     # had none of it.
     assert f"OLLAMA_BASE_URL={world.provider['OLLAMA_BASE_URL']}" in config.read_text()
@@ -812,14 +866,24 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
         # The old plist had the provider settings (an API key, perhaps) baked in.
         assert "EnvironmentVariables" not in plist
         launchctl = world.calls("launchctl")
-        assert launchctl[-2].startswith("launchctl bootout gui/")
-        assert launchctl[-1] == f"launchctl bootstrap gui/{os.getuid()} {world.plist_path}"
+        assert launchctl[-4].startswith("launchctl bootout gui/")
+        assert launchctl[-3] == f"launchctl bootstrap gui/{os.getuid()} {world.plist_path}"
+        assert launchctl[-1] == f"launchctl bootstrap gui/{os.getuid()} {world.facts_plist_path}"
+        facts_plist = plistlib.loads(world.facts_plist_path.read_bytes())
+        assert facts_plist["ProgramArguments"][1:] == [
+            "run", "--project", str(new / "localhost" / "facts"), "python", "-m", "facts.single_machine",
+            "--env-file", str(config)]
+        assert facts_plist["WorkingDirectory"] == str(new)
     else:
         service = (world.systemd_dir / "claude-chats-drain.service").read_text()
         assert f'--project "{new / "hook"}" drain-outbox --env-file "{config}"' in service
         assert (world.systemd_dir / "claude-chats-drain.timer").exists()
         assert world.calls("systemctl")[-1] == \
-            "systemctl --user enable --now claude-chats-drain.timer"
+            "systemctl --user enable --now claude-chats-facts.timer"
+        assert "systemctl --user enable --now claude-chats-drain.timer" in world.calls("systemctl")
+        facts_unit = (world.systemd_dir / "claude-chats-facts.service").read_text()
+        assert f"WorkingDirectory={new}" in facts_unit
+        assert f'--project "{new / "localhost" / "facts"}" python -m facts.single_machine' in facts_unit
         assert not (world.home / "Library").exists()
 
     # Running it again changes nothing at all.
@@ -869,6 +933,23 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
         for uid in ("second-u1", "second-a1"):
             assert now[uid][:4] == after[uid][:4]  # session, role, content, date
     assert now["second-u1"][3] == datetime.fromisoformat(LONG_AGO.format(1))
+
+    # Claude Facts, as its schedule runs it: a conversation from after the upgrade
+    # gives a fact, embedded as queries are; nothing from before FACTS_SINCE is read.
+    now = datetime.now(timezone.utc)
+    world.capture("facts-one", [
+        _user("facts-u1", "Where are the lathe tooling notes?", (now + timedelta(seconds=1)).isoformat()),
+        _assistant("facts-a1", "In lathe-tooling.md in the workshop folder.", (now + timedelta(seconds=2)).isoformat()),
+        _user("facts-u2", "Thanks, and the chuck keys?", (now + timedelta(seconds=3)).isoformat()),
+    ])
+    world.wait_for("facts-u2")
+    world.run_scheduled_facts(uname)
+    facts = world.sql("SELECT c.session_id, f.embedder, f.embedding IS NOT NULL FROM facts f "
+                      "JOIN conversations c ON c.id = f.conversation_id")
+    assert ("facts-one", "ollama-mxbai-embed-large", True) in facts, facts
+    assert not any(sid.startswith(("old-", "gap")) for sid, *_ in facts), facts
+    calls = [json.loads(ln) for ln in (world.tmp / "claude-p.log").read_text().splitlines()]
+    assert calls and all(c["api_key"] is None and "--bare" not in c["argv"] for c in calls)
 
     # And the MCP server Claude Code would start finds all of it.
     tools, (recent, everything, old_only) = _mcp(world, [

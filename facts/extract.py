@@ -179,7 +179,7 @@ class Extractor:
         r = self.client.messages.create(
             model=self.model, max_tokens=max_tokens,
             system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            messages=messages, output_config={"effort": self.effort})
+            messages=messages, **({"output_config": {"effort": self.effort}} if self.effort else {}))
         text = "".join(b.text for b in r.content if b.type == "text")
         u = r.usage
         calls.append({"uncached_in": u.input_tokens, "cache_read": u.cache_read_input_tokens,

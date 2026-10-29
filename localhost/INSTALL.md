@@ -12,6 +12,7 @@ Docker pulling the PostgreSQL image and Ollama pulling an embedding model.
 | [Claude Code](https://claude.com/claude-code) | The thing being recorded | `claude --version` |
 | Python 3.11+ | The hook and MCP server | `python3 --version` |
 | An embedding provider | Turns messages into vectors | see below |
+| Optional: a model for Claude Facts | Extracts facts for `recall_facts` | your Claude Code login by default; see [Claude Facts](#claude-facts-recall_facts) |
 
 Pick one embedding provider:
 
@@ -54,7 +55,10 @@ The script:
    `~/.claude/settings.json`, with `CLAUDE_CHATS_DRAIN_AFTER_CAPTURE=1` so the
    hook starts a drain after each capture;
 8. installs the drain schedule: a LaunchAgent on macOS, a systemd user timer on
-   Linux.
+   Linux;
+9. sets up Claude Facts with the provider you chose (your Claude Code login by
+   default) and installs its 15-minute schedule, unless that provider is not
+   usable here, in which case facts are left off with a warning.
 
 Every step is idempotent. Re-run it as often as you like.
 
@@ -100,13 +104,117 @@ and by words, and discounts old ones at a rate that depends on the kind of fact.
 For the conversation a fact came from, use `get_conversation`.
 
 The `facts`, `fact_events` and `facts_progress` tables come from `../init.sql`,
-so every install and upgrade has them. Facts are written by extraction, which a
-model does by reading your conversations. The installer does not set that up
-yet (CHATS-39), so the table stays empty and `recall_facts` returns
-`no_results` until it does. That is expected, not a fault. The extractor can
-be run by hand meanwhile (see [`../facts/README.md`](../facts/README.md)); if
-you do, have it embed facts with the same model as your messages, or the
-vector half of `recall_facts` will not line up with your queries.
+so every install and upgrade has them. Facts are written by extraction: Claude
+Haiku reads each exchange of a conversation (your message and Claude's replies,
+not tool output) and writes down what is durably true. The installer sets that
+up as its own schedule, a LaunchAgent (`com.nakomis.claude-chats-facts`) on
+macOS or a systemd user timer (`claude-chats-facts`) on Linux, which runs
+`python -m facts.single_machine` every 15 minutes. It never runs from the hook
+or the drain, so capture stays as quick and as offline as it was. One run at a
+time: a run that is still going when the next is due makes that one skip. Facts
+are embedded with the same provider and model as your messages, so the vector
+half of `recall_facts` lines up with your queries.
+
+### Choosing how facts are extracted
+
+Chosen when you install, like the embedding provider, and remembered in
+`~/.claude-chats/config.env`:
+
+| `FACTS_PROVIDER` | Needs | Costs |
+|---|---|---|
+| `claude-code` (default) | Claude Code, logged in to your account (`claude auth status`) | No extra money: it uses your Claude subscription's usage allowance and rate limits (see below) |
+| `anthropic` | `ANTHROPIC_API_KEY` | Haiku API pricing, billed to that key |
+| `bedrock` | AWS credentials (`AWS_PROFILE`, `AWS_REGION`), and access to Claude Haiku in your Bedrock account | Bedrock's Haiku pricing, billed to your AWS account |
+| `off` | | Nothing; `recall_facts` finds nothing |
+
+```bash
+./install.sh                                     # claude-code
+FACTS_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-... ./install.sh
+FACTS_PROVIDER=bedrock AWS_PROFILE=me AWS_REGION=eu-west-2 ./install.sh
+FACTS_PROVIDER=off ./install.sh
+```
+
+If what a provider needs is missing (Claude Code not logged in, no API key, no
+AWS credentials), the installer says so, sets facts to `off` and carries on:
+capture and search do not depend on them. Fix it and re-run `./install.sh`; it
+remembers what you asked for, so a plain re-run turns facts back on. With
+`FACTS_PROVIDER=off` given explicitly, it stays off until you choose again.
+
+On Bedrock, Claude Haiku 5.5 is only reachable through an inference profile.
+The default, `global.anthropic.claude-haiku-5-5`, works from any region; to keep
+requests within one geography, set `FACTS_MODEL=eu.anthropic.claude-haiku-5-5`
+(or `us.`) when you install. Your account needs access to the model: a
+`403 ... is not available for this account` in the facts log means it does not.
+For a model that takes no effort setting (Haiku 4.5, say), add `FACTS_EFFORT=none`.
+A model you set belongs to that provider: switching provider drops it.
+
+There is no Ollama option. Extraction is a harder task than embedding, and in a
+comparison on 28 Oct 2026 local 7–8B models found 73% of the facts in a
+hand-checked reference set, against 100% for Haiku.
+
+### What `claude-code` runs, and what it uses up
+
+With the default provider, each extraction is your own Claude Code run
+headlessly, `claude -p`, as you, on your login. It is isolated from your normal
+setup: no tools, no MCP servers, no settings files, hooks disabled (so it cannot
+trigger claude-chats' own hook, or any of yours), no `CLAUDE.md` (it runs in an
+empty temporary directory), and the session is not saved. Its system prompt is
+the extraction prompt in [`../facts/prompts.py`](../facts/prompts.py), and the
+exchange is passed on standard input. `ANTHROPIC_API_KEY` and the variables
+that would send it to Bedrock or elsewhere are removed from its environment, so
+it always uses the login. It never uses `--bare`, which ignores the login.
+
+It counts towards your subscription's usage allowance, like any other use of
+Claude Code. Measured on 106 exchanges of real conversations (29 Oct 2026): each
+exchange is one Haiku call of about 7 seconds, with roughly 4,800 tokens read
+from the prompt cache, 4,600 written to it and 1,260 of output. That is about
+65% more output than the same prompt through the API, and the cache writes are
+not re-read. No rate limiting was seen. Anthropic's terms for automated use of
+a subscription login can change: check the current ones before relying on it,
+and use the `anthropic` or `bedrock` provider if they do not suit.
+
+### Older history (backfill)
+
+Only conversations started after facts were first installed are read. That
+moment is recorded as `FACTS_INSTALLED_AT` (and `FACTS_SINCE`) in `config.env`
+and is kept on every re-run, so upgrading never starts reading your whole
+history. A conversation that was already going at that moment is left for a
+backfill even if you carry on with it, so that when it is read, it is read from
+its first message rather than from the middle. Turning facts off and on again
+keeps the starting point: conversations from while they were off are read when
+they come back on. To extract from older conversations too:
+
+```bash
+./install.sh --facts-backfill                    # all of it
+./install.sh --facts-backfill --since 2026-06-01 # from a date
+./install.sh --facts-backfill-stop               # back to new conversations only
+```
+
+A backfill goes at the same pace as everything else: at most
+`FACTS_MAX_EXCHANGES` exchanges per 15-minute run, **10 by default**, so 40 an
+hour, and new conversations always go first. Progress is kept per conversation
+(`facts_progress`), so stopping, a full allowance, a reboot or a re-run loses
+nothing; it carries on where it was. A backfill of 1,000 exchanges takes about a
+day.
+
+Why 10: at the measured cost per exchange, 40 an hour on the `claude-code`
+provider is roughly 50,000 output tokens and 400,000 cached input tokens of
+Haiku an hour, and each run takes a little over a minute. Your own exchanges
+arrive far more slowly than that, so new conversations keep up even during a
+backfill, while a backfill cannot consume a subscription's allowance in an
+afternoon. On a Pro plan, or if you share the allowance with heavy interactive
+use, halve it; with the `anthropic` or `bedrock` provider, where it is only
+money, raise it:
+
+```bash
+FACTS_MAX_EXCHANGES=5 ./install.sh
+```
+
+Run one extraction now, rather than waiting for the schedule:
+
+```bash
+./install.sh --facts
+```
 
 On a single machine it reads the one local database. The distributed edition
 can point it at a read replica with `CLAUDE_CHATS_READ_DB_URL`; the installer
@@ -133,7 +241,10 @@ All of it hangs off the same script:
 | `./install.sh --replay-fallback` | Recover messages from the fallback file, then drain |
 | `./install.sh --backup [path]` | `pg_dump` to a local file (default `~/.claude-chats/backups/`) |
 | `./install.sh --restore [file]` | Restore a dump, then backfill the vectors |
-| `./install.sh --uninstall` | Remove the hook, the MCP registration and the drain schedule |
+| `./install.sh --uninstall` | Remove the hook, the MCP registration and the drain and facts schedules |
+| `./install.sh --facts` | Extract facts from new exchanges now |
+| `./install.sh --facts-backfill [--since DATE]` | Extract from older conversations too, at the same rate ([backfill](#older-history-backfill)) |
+| `./install.sh --facts-backfill-stop` | Back to conversations since install only |
 
 Backups deliberately exclude the embedding vectors: they are incompressible, they
 dominate the dump, and they are fully regenerable from message content. That is
@@ -207,6 +318,12 @@ model answered, `search_memory` takes a `since` window (3 months by default;
 and `recall_facts` is available. Sessions you started before the upgrade can be
 resumed: the new hook adds to the same conversation without duplicating what
 is already recorded.
+
+The re-run also sets up [Claude Facts](#claude-facts-recall_facts) with the
+default provider, your Claude Code login (or `off`, with a warning, if Claude
+Code is not logged in), for conversations from that moment on. Nothing from
+before the upgrade is read unless you ask for a backfill, and later re-runs keep
+that starting point.
 
 Re-running `./install.sh` afterwards changes nothing. This whole path, from an
 old install in each mode with real conversations in it, is tested by
@@ -283,8 +400,8 @@ same port and container name. Run one or the other, not both.
 ./install.sh --uninstall
 ```
 
-That removes the hook entries, the MCP registration and the drain schedule, and
-deliberately leaves your data alone. To remove that too:
+That removes the hook entries, the MCP registration and the drain and facts
+schedules, and deliberately leaves your data (facts included) alone. To remove that too:
 
 ```bash
 docker compose -f docker-compose.yml down -v   # drops the database volume
@@ -306,4 +423,9 @@ rm -rf ~/.claude-chats                          # outbox, images, config, backup
 | `~/Library/LaunchAgents/com.nakomis.claude-chats-drain.plist` | The drain schedule (macOS) |
 | `~/.config/systemd/user/claude-chats-drain.{service,timer}` | The drain schedule (Linux) |
 | `/tmp/claude-chats-drain.log` | The LaunchAgent's drain output |
+| `~/Library/LaunchAgents/com.nakomis.claude-chats-facts.plist` | The Claude Facts schedule (macOS) |
+| `~/.config/systemd/user/claude-chats-facts.{service,timer}` | The Claude Facts schedule (Linux; log: `journalctl --user -u claude-chats-facts`) |
+| `/tmp/claude-chats-facts.log` | The facts LaunchAgent's output: one `facts-run {...}` line per run |
+| `~/.claude-chats/facts.lock` | Held while a facts run is going |
+| `localhost/facts/` | The Python environment facts run in (the code is `../facts`) |
 | Docker volume `localhost_pgdata` | The database itself |
