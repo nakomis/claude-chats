@@ -62,9 +62,10 @@ class Config:
     # the whole history is processed only when it is explicitly "all" (paid calls for every exchange).
     since: str = ""
     max_systemic: int = 3              # consecutive transport/auth errors that stop the run
-    api_timeout: float = 120.0         # seconds, per Anthropic request
+    api_timeout: float = 120.0         # seconds, per Anthropic request or claude -p run
     statement_timeout_ms: int = 60000  # per SQL statement
     model: str = ""                    # blank = the Extractor's default
+    provider: str = "anthropic"        # or "claude-code": `claude -p` on the user's own login (CHATS-39)
 
     @classmethod
     def from_env(cls, env=None):
@@ -87,6 +88,7 @@ class Config:
             api_timeout=float(env.get("FACTS_API_TIMEOUT_SECONDS", d.api_timeout)),
             statement_timeout_ms=int(env.get("FACTS_STATEMENT_TIMEOUT_MS", d.statement_timeout_ms)),
             model=env.get("FACTS_MODEL", ""),
+            provider=env.get("FACTS_PROVIDER", d.provider).strip() or d.provider,
         )
 
 
@@ -155,6 +157,13 @@ def anthropic_api_key(env=None, ssm_client=None):
 
 
 def make_extractor(cfg, env=None):
+    if cfg.provider == "claude-code":
+        from facts.claude_code import ClaudeCodeExtractor
+
+        # No API key at all: the user's Claude Code login pays. api_timeout bounds each claude -p run.
+        return ClaudeCodeExtractor(timeout=cfg.api_timeout, env=env, **({"model": cfg.model} if cfg.model else {}))
+    if cfg.provider != "anthropic":
+        raise ConfigError(f"FACTS_PROVIDER={cfg.provider!r}: want anthropic or claude-code")
     import anthropic
 
     client = anthropic.Anthropic(api_key=anthropic_api_key(env), max_retries=6, timeout=cfg.api_timeout)
