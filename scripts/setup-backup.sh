@@ -75,9 +75,9 @@ echo "  Installed: ${PLIST_DEST}"
 # ── 3. Smoke test ─────────────────────────────────────────────────────────────
 echo "[3/3] Running a test backup..."
 chmod +x "${REPO}/scripts/backup.sh" "${REPO}/scripts/restore.sh"
-"${REPO}/scripts/backup.sh"
+"${REPO}/scripts/backup.sh" --s3
 
 echo
 echo "=== Setup complete ==="
 echo "Backups run daily at 03:00. Log: ${REPO}/scripts/backup.log"
-echo "To restore: ${REPO}/scripts/restore.sh"
+echo "To restore: ${REPO}/scripts/restore.sh --s3"
