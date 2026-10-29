@@ -17,12 +17,41 @@ the same licence so the boundary stays simple.
 |---|---|
 | `prompts.py` | The system prompt (fixed, cached) and the per-exchange user prompt |
 | `extract.py` | `Extractor.extract(...)`: one exchange in, a list of `Fact`s out; plus the adapter `facts_eval` uses |
+| `claude_code.py` | `ClaudeCodeExtractor`: the same contract, through `claude -p` on the user's own Claude Code login |
 | `service.py` | The extractor service: new exchanges to facts, then embeddings (see below) |
 
 Each fact carries `text`, `kind` (`identity` / `config` / `situation` / `event`),
 `subject`, `attribute`, and optionally `temporary` and `expected_until`. Bump
 `PROMPT_VERSION` in `prompts.py` whenever the prompt changes, because it is stored
 with every fact (`facts.extractor`).
+
+## Providers
+
+`FACTS_PROVIDER` chooses how Haiku is reached, for the service and for
+`module:facts.extract:make_extractor` in the eval harness:
+
+- `anthropic` (the default; the distributed service on Mace): the Anthropic API,
+  with `ANTHROPIC_API_KEY`.
+- `claude-code` (CHATS-39; the single-machine edition): `claude -p` on the user's
+  own Claude Code login, so no API key is needed and calls count against their
+  subscription. Each call is an isolated headless run: `--tools ""`,
+  `--strict-mcp-config`, `--no-session-persistence`, `--setting-sources ""`, hooks
+  disabled, the system prompt from a file and the exchange on stdin, in an empty
+  temporary directory so no `CLAUDE.md` is found. `ANTHROPIC_API_KEY` and
+  `ANTHROPIC_AUTH_TOKEN` are removed from the child's environment, otherwise Claude
+  Code would bill the key instead of the login. Never `--bare`: it ignores the login.
+  The reply is held to the prompt's output shape with `--json-schema`; the facts
+  still go through the same parsing and credential filter. A missing `claude`, a
+  login that has lapsed, a usage limit, an API error status of 401/402/403/429/5xx
+  or a call that outlives its timeout (`FACTS_API_TIMEOUT_SECONDS` in the service,
+  `FACTS_CLAUDE_TIMEOUT_SECONDS` in the harness, 120 s; the child is killed) are
+  systemic, so the service's circuit breaker treats them as an outage. Other
+  settings: `FACTS_CLAUDE_BIN` (default `claude` on `PATH`) and, in the harness,
+  `FACTS_CLAUDE_CODE_WORKERS` (sessions in parallel, default 3: each call is a
+  whole process).
+
+The facts are tagged with the same `facts.extractor` value either way
+(`<model>+<PROMPT_VERSION>`): same model, same prompt.
 
 ## The service
 
@@ -63,7 +92,8 @@ default `/conversation-memory/prod/facts/anthropic-api-key`), `FACTS_EMBED_URL`
 `FACTS_MAX_EXCHANGES` (40), `FACTS_IDLE_MINUTES` (30), `FACTS_MAX_ATTEMPTS` (3),
 `FACTS_MAX_RUNTIME_SECONDS` (780), `FACTS_EMBED_BATCH` (200),
 `FACTS_MAX_SYSTEMIC_ERRORS` (3), `FACTS_API_TIMEOUT_SECONDS` (120),
-`FACTS_STATEMENT_TIMEOUT_MS` (60000) and `FACTS_MODEL`.
+`FACTS_STATEMENT_TIMEOUT_MS` (60000), `FACTS_MODEL` and `FACTS_PROVIDER` (above;
+with `claude-code` no API key is read).
 
 **`FACTS_SINCE` is required for a real run.** It is an ISO date or time; messages
 before it are ignored. An empty or missing value is an error (the run refuses
@@ -80,6 +110,7 @@ run makes (and drops) a uniquely named scratch database.
 
 ```sh
 ANTHROPIC_API_KEY=... uv run facts_eval/run.py module:facts.extract:make_extractor
+uv run facts_eval/run.py module:facts.extract:make_claude_code_extractor   # on your Claude Code login
 ```
 
 See [`facts_eval/`](../facts_eval/README.md). Any prompt change should be scored

@@ -32,6 +32,14 @@ Each run prints one row per stored run:
 | `mem0:bedrock:<model-id>` | Mem0 2.x, its LLM calls sent to Bedrock's Converse API |
 | `mem0:ollama:<model>` | Mem0 2.x on a local Ollama model, its context window raised to 12k so Mem0's ~9k-token prompt is not cut |
 | `module:<module>:<factory>` | Our own extractor: `factory(run_dir)` returns an object whose `add(session, index, exchange)` returns `extractors.AddResult` |
+| `module:facts.extract:make_extractor` | The facts extractor, through the provider `$FACTS_PROVIDER` names (`anthropic`, the default, or `claude-code`) |
+| `module:facts.extract:make_anthropic_extractor` | The facts extractor through the Anthropic API. Needs `ANTHROPIC_API_KEY`. |
+| `module:facts.extract:make_claude_code_extractor` | The facts extractor through `claude -p` on your own Claude Code login (no API key; see [`facts/`](../facts/README.md#providers)) |
+
+Sessions run 8 at a time when the extractor allows it. An extractor can lower that
+with a `parallel_workers` attribute: the Claude Code one uses
+`FACTS_CLAUDE_CODE_WORKERS` (default 3), because each call is a whole `claude`
+process.
 
 Mem0's embedder is local Ollama (`FACTS_EVAL_EMBED_MODEL`, default `mxbai-q8`).
 
