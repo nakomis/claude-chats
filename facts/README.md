@@ -39,11 +39,14 @@ with every fact (`facts.extractor`).
   disabled, the system prompt from a file and the exchange on stdin, in an empty
   temporary directory so no `CLAUDE.md` is found. `ANTHROPIC_API_KEY` and
   `ANTHROPIC_AUTH_TOKEN` are removed from the child's environment, otherwise Claude
-  Code would bill the key instead of the login. Never `--bare`: it ignores the login.
+  Code would bill the key instead of the login, and so are the variables that would
+  route it to Bedrock, Vertex or Foundry, another base URL or another model
+  (`STRIPPED_ENV` in `claude_code.py`). Never `--bare`: it ignores the login.
   The reply is held to the prompt's output shape with `--json-schema`; the facts
   still go through the same parsing and credential filter. A missing `claude`, a
-  login that has lapsed, a usage limit, an API error status of 401/402/403/429/5xx
-  or a call that outlives its timeout (`FACTS_API_TIMEOUT_SECONDS` in the service,
+  CLI that rejects the options, a login that has lapsed, a usage limit, an API
+  error (status 401/402/403/404/408/429/5xx, or a 400 about billing or permissions,
+  or an error with no status), or a call that outlives its timeout (`FACTS_API_TIMEOUT_SECONDS` in the service,
   `FACTS_CLAUDE_TIMEOUT_SECONDS` in the harness, 120 s; the child is killed) are
   systemic, so the service's circuit breaker treats them as an outage. Other
   settings: `FACTS_CLAUDE_BIN` (default `claude` on `PATH`) and, in the harness,
@@ -93,7 +96,7 @@ default `/conversation-memory/prod/facts/anthropic-api-key`), `FACTS_EMBED_URL`
 `FACTS_MAX_RUNTIME_SECONDS` (780), `FACTS_EMBED_BATCH` (200),
 `FACTS_MAX_SYSTEMIC_ERRORS` (3), `FACTS_API_TIMEOUT_SECONDS` (120),
 `FACTS_STATEMENT_TIMEOUT_MS` (60000), `FACTS_MODEL` and `FACTS_PROVIDER` (above;
-with `claude-code` no API key is read).
+with `claude-code` no API key is used).
 
 **`FACTS_SINCE` is required for a real run.** It is an ISO date or time; messages
 before it are ignored. An empty or missing value is an error (the run refuses

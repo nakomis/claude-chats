@@ -27,7 +27,14 @@ from facts.prompts import KINDS, PROMPT_VERSION, SYSTEM_PROMPT
 
 DEFAULT_TIMEOUT = 120.0  # seconds per call; the child is killed after this
 DEFAULT_WORKERS = 3      # claude -p is a whole process: keep sessions in parallel low
-STRIPPED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+# Anything that would make Claude Code bill something other than the login (a key, Bedrock,
+# Vertex, Foundry) or send the call somewhere else or to another model. The login itself
+# (CLAUDE_CODE_OAUTH_TOKEN, when set instead of a stored login) is kept: it is what pays.
+STRIPPED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+                "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+                "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_FOUNDRY_API_KEY")
 
 # Mirrors the OUTPUT FORMAT section of the system prompt.
 OUTPUT_SCHEMA = {
@@ -51,9 +58,14 @@ OUTPUT_SCHEMA = {
 }
 
 # An error reply that is about the login or the service, not the exchange.
-SYSTEMIC_TEXT = re.compile(r"(?i)not logged in|/login|log ?in again|oauth|token (?:has )?expired|"
-                           r"invalid api key|authenticat|usage limit|hit your limit|rate.?limit|"
-                           r"overloaded|credit balance|quota|connection|network|timed? ?out")
+SYSTEMIC_TEXT = re.compile(r"(?i)not logged in|/login|log ?in again|oauth token|token (?:has )?expired|"
+                           r"invalid api key|authentication|usage limit|limit reached|hit your limit|"
+                           r"resets? (?:at )?\d|out of (?:extra )?usage|rate.?limit|overloaded|credit balance|"
+                           r"model.*(?:not found|not available|does not exist)|permission_error|"
+                           r"connection (?:error|refused|reset)|network error|request timed out")
+# Output from claude itself, not a reply: an option this version does not know, and the like.
+CLI_ERROR = re.compile(r"(?i)unknown option|unknown argument|invalid (?:value|argument)|error: option|not logged in")
+SYSTEMIC_STATUS_HERE = SYSTEMIC_STATUS | {404, 408}  # 404: the model is unknown or not available
 
 
 class ClaudeCodeError(Exception):
@@ -101,15 +113,18 @@ def flatten(messages):
 
 def _systemic_reply(out):
     status = out.get("api_error_status")
+    text = SYSTEMIC_TEXT.search(str(out.get("result") or ""))
     if isinstance(status, int):
-        return status in SYSTEMIC_STATUS or status >= 500
-    return out.get("terminal_reason") == "api_error" or bool(SYSTEMIC_TEXT.search(str(out.get("result") or "")))
+        # A 400 can be about billing or permissions too ("credit balance is too low").
+        return status in SYSTEMIC_STATUS_HERE or status >= 500 or bool(text)
+    return out.get("terminal_reason") == "api_error" or bool(text)
 
 
 class ClaudeCodeExtractor(Extractor):
     """Calls Haiku through `claude -p` on the user's Claude Code login. Same contract as Extractor."""
 
     def __init__(self, model="claude-haiku-5-5", effort="low", timeout=DEFAULT_TIMEOUT, binary=None, env=None):
+        """env: the whole environment for the child (default os.environ), before the stripping."""
         self.client, self.model, self.effort = None, model, effort
         self.timeout, self.env = timeout, env
         self.binary = binary or os.environ.get("FACTS_CLAUDE_BIN") or "claude"
@@ -131,20 +146,23 @@ class ClaudeCodeExtractor(Extractor):
             try:
                 stdout, stderr = proc.communicate(prompt.encode(), timeout=self.timeout)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)  # the whole group: claude may have children
-                except ProcessLookupError:
-                    pass
-                proc.communicate()
+                _kill(proc)
+                # Systemic, as an API timeout is: a hung service must not cost the exchange an attempt.
                 raise ClaudeCodeError(f"claude -p timed out after {self.timeout:g} s", systemic=True) from None
+            except BaseException:  # interrupted: never leave a claude running behind us
+                _kill(proc)
+                raise
         try:
             out = json.loads(stdout)
             if not isinstance(out, dict):
                 raise ValueError("not an object")
         except ValueError:
-            detail = (stderr or stdout).decode(errors="replace").strip()[:200]
-            raise ClaudeCodeError(f"claude -p exited {proc.returncode} without JSON output: {detail}",
-                                  systemic=True) from None
+            detail = (stderr or stdout).decode(errors="replace").strip()
+            # Not runnable (126/127), a CLI that rejects our options, or no login: the install is
+            # the problem. Any other crash may be this exchange's doing, so it counts as an attempt.
+            systemic = proc.returncode in (126, 127) or bool(CLI_ERROR.search(detail) or SYSTEMIC_TEXT.search(detail))
+            raise ClaudeCodeError(f"claude -p exited {proc.returncode} without JSON output: {detail[:200]}",
+                                  systemic=systemic) from None
         return out
 
     def _call(self, messages, calls, max_tokens=MAX_TOKENS):
@@ -170,11 +188,32 @@ class ClaudeCodeExtractor(Extractor):
         return text, stop
 
 
+def _kill(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # the whole group: claude may have children
+    except ProcessLookupError:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass  # a descendant that left the group still holds the pipes; give up on them
+
+
+def _positive(env, name, default, cast):
+    raw = (os.environ if env is None else env).get(name)
+    if not raw:
+        return default
+    value = cast(raw)
+    if value <= 0:
+        raise ValueError(f"{name}={raw!r}: must be greater than 0")
+    return value
+
+
 def workers(env=None):
-    env = os.environ if env is None else env
-    return int(env.get("FACTS_CLAUDE_CODE_WORKERS") or DEFAULT_WORKERS)
+    """Sessions the eval harness may run side by side: $FACTS_CLAUDE_CODE_WORKERS, default 3."""
+    return _positive(env, "FACTS_CLAUDE_CODE_WORKERS", DEFAULT_WORKERS, int)
 
 
 def timeout(env=None):
-    env = os.environ if env is None else env
-    return float(env.get("FACTS_CLAUDE_TIMEOUT_SECONDS") or DEFAULT_TIMEOUT)
+    """Seconds per claude -p call: $FACTS_CLAUDE_TIMEOUT_SECONDS, default 120."""
+    return _positive(env, "FACTS_CLAUDE_TIMEOUT_SECONDS", DEFAULT_TIMEOUT, float)

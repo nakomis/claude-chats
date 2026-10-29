@@ -182,7 +182,14 @@ def test_invalid_json_gets_one_repair_call_carrying_the_bad_reply(fake):
     error("Not logged in · Please run /login"),
     error("Claude AI usage limit reached"),
     error("API Error: 529 overloaded", api_error_status=529),
-    {"stdout": "", "stderr": "unknown option '--json-schema'", "exit": 2},
+    error("API Error: 429", api_error_status=429),
+    error("API Error: 401", api_error_status=401),
+    error("Your credit balance is too low", api_error_status=400),
+    error("model claude-haiku-9 not found", api_error_status=404),
+    error("5-hour limit reached ∙ resets 3pm", terminal_reason="completed"),
+    error("Weekly limit reached", terminal_reason="completed"),
+    {"stdout": "", "stderr": "error: unknown option '--json-schema'", "exit": 1},
+    {"stdout": "", "stderr": "sh: claude: command not found", "exit": 127},
 ])
 def test_login_limit_and_cli_failures_are_systemic_and_not_retried(fake, reply):
     queue, calls = fake
@@ -196,6 +203,57 @@ def test_a_bad_request_is_not_systemic(fake):
     bad = error("API Error: 400 prompt is too long", api_error_status=400)
     queue(bad, bad)
     assert run().systemic is False
+
+
+def test_a_crash_without_output_counts_as_an_attempt(fake):
+    queue, calls = fake
+    crash = {"stdout": "", "stderr": "Segmentation fault", "exit": 139}
+    queue(crash, crash)
+    res = run()
+    assert res.systemic is False and "without JSON output" in res.error and len(calls()) == 1
+
+
+def test_a_truncated_or_empty_reply_is_retried(fake):
+    queue, calls = fake
+    queue(ok(structured=False, stop_reason="max_tokens", result='{"memory": [{"id": "0"'), ok([FACT]))
+    res = run()
+    assert res.error is None and len(res.facts) == 1 and len(calls()) == 2
+
+
+
+def test_an_empty_reply_is_retried(fake):
+    queue, calls = fake
+    queue(ok(structured=False, result=""), ok([FACT]))
+    assert run().error is None and len(calls()) == 2
+
+
+def test_missing_usage_does_not_break_the_call(fake):
+    queue, _ = fake
+    queue(ok([FACT], usage=None))
+    res = run()
+    assert res.error is None and res.calls[0]["uncached_in"] is None
+
+
+def test_routing_and_model_variables_never_reach_the_child(fake, monkeypatch):
+    queue, calls = fake
+    for name in ("CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "AWS_BEARER_TOKEN_BEDROCK"):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "the-login")
+    queue(ok())
+    run()
+    env = calls()[0]["env"]
+    assert not set(claude_code.STRIPPED_ENV) & set(env)
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "the-login"  # the login is what pays
+
+
+def test_worker_and_timeout_settings_are_validated():
+    assert claude_code.workers({}) == 3 and claude_code.workers({"FACTS_CLAUDE_CODE_WORKERS": "2"}) == 2
+    assert claude_code.timeout({"FACTS_CLAUDE_TIMEOUT_SECONDS": "30"}) == 30
+    for bad in ("0", "-1"):
+        with pytest.raises(ValueError):
+            claude_code.workers({"FACTS_CLAUDE_CODE_WORKERS": bad})
+        with pytest.raises(ValueError):
+            claude_code.timeout({"FACTS_CLAUDE_TIMEOUT_SECONDS": bad})
 
 
 def test_a_missing_binary_is_systemic(fake):

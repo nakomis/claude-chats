@@ -62,7 +62,7 @@ class Config:
     # the whole history is processed only when it is explicitly "all" (paid calls for every exchange).
     since: str = ""
     max_systemic: int = 3              # consecutive transport/auth errors that stop the run
-    api_timeout: float = 120.0         # seconds, per Anthropic request
+    api_timeout: float = 120.0         # seconds, per Anthropic request or claude -p run
     statement_timeout_ms: int = 60000  # per SQL statement
     model: str = ""                    # blank = the Extractor's default
     provider: str = "anthropic"        # or "claude-code": `claude -p` on the user's own login (CHATS-39)
