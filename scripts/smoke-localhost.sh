@@ -15,6 +15,10 @@
 # CI runs this against a pgvector service container. Needs uv and psql.
 set -euo pipefail
 
+# Nothing from the caller's shell decides which provider, database or replica
+# the hook, the drain and the MCP server use: only what this script sets.
+while IFS= read -r var; do unset "$var"; done < <(compgen -e | grep '^CLAUDE_CHATS_' | grep -v '^CLAUDE_CHATS_TEST_ADMIN_DSN$')
+
 : "${CLAUDE_CHATS_TEST_ADMIN_DSN:?set it to a Postgres (with pgvector) where the role can CREATE DATABASE}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
@@ -114,7 +118,7 @@ step "Recalling a seeded fact through the MCP server (one database, no replica)"
 # single machine, so this seeds one, from the conversation captured above, the
 # way the extractor would. The MCP server is started without
 # CLAUDE_CHATS_READ_DB_URL, as install.sh registers it.
-env -u CLAUDE_CHATS_READ_DB_URL CLAUDE_CHATS_DB_URL="$DSN" OLLAMA_BASE_URL="$OLLAMA_URL" \
+CLAUDE_CHATS_DB_URL="$DSN" OLLAMA_BASE_URL="$OLLAMA_URL" \
     uv run --project "${ROOT}/mcp" python -c '
 import os
 import psycopg
@@ -130,7 +134,9 @@ with psycopg.connect(os.environ["CLAUDE_CHATS_DB_URL"], autocommit=True) as conn
         "SELECT %s, %s, %s, %s, now(), now(), id, 0, 1, host, %s, %s::vector "
         "FROM conversations WHERE session_id = %s",
         (text, "config", "espresso machine", "descaling", "smoke", vec, "smoke-session"))
-out = recall_facts("how is the espresso machine descaled")
+# "garage" is in no fact and full-text needs every word: only the vector
+# half can find it, so this proves the embedded fact is searchable.
+out = recall_facts("how is the espresso machine descaled in the garage")
 print(out["status"], out["read_from"], [r["text"] for r in out["results"]])
 assert out["read_from"] == "primary", out
 assert out["results"] and out["results"][0]["text"] == text, out

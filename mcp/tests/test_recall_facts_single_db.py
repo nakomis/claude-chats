@@ -37,8 +37,11 @@ print(json.dumps([server.recall_facts(**args) for args in calls], default=str))
 
 
 def _recall(dsn: str, ollama_url: str, *calls: dict) -> list[dict]:
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("CLAUDE_CHATS_", "OLLAMA_"))}
+    # An allowlist, not the developer's shell: a CLAUDE_CHATS_*, a proxy or a
+    # PG* variable there would change what is being tested.
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG", "VIRTUAL_ENV")
+           if k in os.environ}
+    env["NO_PROXY"] = "127.0.0.1,localhost"
     # What localhost/install.sh registers, and nothing else.
     env.update({"CLAUDE_CHATS_DB_URL": dsn, "CLAUDE_CHATS_PROVIDER": "ollama",
                 "CLAUDE_CHATS_MODEL": "mxbai-embed-large", "CLAUDE_CHATS_DIMENSIONS": "1024",
@@ -85,16 +88,24 @@ def test_a_seeded_fact_comes_back_from_the_one_database():
                     (text, kind, subject, attr, now - timedelta(days=3), now - timedelta(days=1),
                      cid, _vec(text) if emb else None))
 
-        lathe, drill, other_host = _recall(
+        lathe, by_vector, drill, this_host, other_host = _recall(
             dsn, url,
             {"query": "which lathe is in the workshop"},
+            # "garage" is in no fact, and full-text needs every word, so only
+            # the vector half can find anything here.
+            {"query": "which lathe is in the workshop garage"},
             {"query": "pillar drill belt"},
+            {"query": "which lathe is in the workshop", "host": "workbench"},
             {"query": "which lathe is in the workshop", "host": "elsewhere"})
 
     assert lathe["read_from"] == "primary"
     assert lathe["mode_used"] == "hybrid"
-    # "ok", or "fallback" on a pgvector without HNSW iterative scans (< 0.8).
-    assert lathe["status"] in ("ok", "fallback"), lathe
+    # "ok", or "fallback" for exactly one reason: a pgvector without HNSW
+    # iterative scans (before 0.8), as on some developers' local servers.
+    if lathe["status"] == "fallback":
+        assert lathe["warning"].startswith("pgvector HNSW iterative scans are unavailable")
+    else:
+        assert lathe["status"] == "ok", lathe
     top = lathe["results"][0]
     assert top["text"] == "The workshop lathe is a Myford ML7"
     assert top["kind"] == "identity" and top["host"] == "workbench"
@@ -104,4 +115,7 @@ def test_a_seeded_fact_comes_back_from_the_one_database():
     # Unembedded, so only the full-text half finds it; how it ranks against
     # the vector half's matches is decay's business, not this test's.
     assert "The pillar drill needs a new belt" in [r["text"] for r in drill["results"]]
+
+    assert by_vector["results"][0]["text"] == "The workshop lathe is a Myford ML7"
+    assert this_host["results"][0]["text"] == "The workshop lathe is a Myford ML7"
     assert other_host["results"] == []

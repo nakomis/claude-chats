@@ -101,15 +101,18 @@ For the conversation a fact came from, use `get_conversation`.
 
 The `facts`, `fact_events` and `facts_progress` tables come from `../init.sql`,
 so every install and upgrade has them. Facts are written by extraction, which a
-model does by reading your conversations. That is not part of the
-single-machine edition yet (it comes with CHATS-39), so the table stays empty
-and `recall_facts` returns `no_results` until then. That is expected, not a
-fault.
+model does by reading your conversations. The installer does not set that up
+yet (CHATS-39), so the table stays empty and `recall_facts` returns
+`no_results` until it does. That is expected, not a fault. The extractor can
+be run by hand meanwhile (see [`../facts/README.md`](../facts/README.md)); if
+you do, have it embed facts with the same model as your messages, or the
+vector half of `recall_facts` will not line up with your queries.
 
 On a single machine it reads the one local database. The distributed edition
 can point it at a read replica with `CLAUDE_CHATS_READ_DB_URL`; the installer
 never sets that here, and with it unset every read goes to the primary
-(`read_from: "primary"` in the result).
+(`read_from: "primary"` in the result). Don't export it in your shell either:
+Claude Code passes its own environment on to MCP servers.
 
 To see how many facts you have:
 
