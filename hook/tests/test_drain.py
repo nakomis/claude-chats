@@ -81,6 +81,14 @@ def _insert(path, rows):
     conn.close()
 
 
+def _rows(path):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM outbox ORDER BY id").fetchall()
+    conn.close()
+    return rows
+
+
 def _fetch(path, sql):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -142,7 +150,7 @@ class TestTombstones:
     def test_marking_sent_blanks_content_but_keeps_the_row(self, outbox):
         _insert(outbox, [_row("a")])
         conn = sqlite3.connect(outbox)
-        dr._mark_sent(conn, [1])
+        assert dr._mark_sent(conn, _rows(outbox)) == 1
         conn.close()
         rows = _fetch(outbox, "SELECT * FROM outbox")
         assert len(rows) == 1
@@ -153,10 +161,23 @@ class TestTombstones:
         """The reason tombstones are kept rather than deleted."""
         _insert(outbox, [_row("a")])
         conn = sqlite3.connect(outbox)
-        dr._mark_sent(conn, [1])
+        dr._mark_sent(conn, _rows(outbox))
         conn.close()
         _insert(outbox, [_row("a")])   # what the next Stop hook does
         assert len(_fetch(outbox, "SELECT * FROM outbox WHERE sent_at IS NULL")) == 0
+
+    def test_a_row_the_hook_changed_after_the_write_is_not_tombstoned(self, outbox):
+        """A late /rename lands between the Postgres commit and the tombstone:
+        marking the row sent anyway would lose the new name for good."""
+        _insert(outbox, [_row("a")])
+        as_written = _rows(outbox)
+        conn = sqlite3.connect(outbox)
+        with conn:
+            conn.execute("UPDATE outbox SET conversation_name = 'Late name'")
+        assert dr._mark_sent(conn, as_written) == 0
+        conn.close()
+        (row,) = _rows(outbox)
+        assert row["sent_at"] is None and row["content"] == "hello"
 
     def test_failure_records_the_error_and_leaves_the_row_pending(self, outbox):
         _insert(outbox, [_row("a")])
@@ -248,8 +269,10 @@ class TestWriteSession:
         assert "COALESCE(EXCLUDED.model, messages.model)" in sql
 
 
-def _fake_psycopg(monkeypatch, written):
-    """A psycopg whose connections record every message upsert in ``written``."""
+def _fake_psycopg(monkeypatch, written, on_commit=None, fail_sessions=(), names=None):
+    """A psycopg whose connections record every message upsert in ``written``,
+    and every conversation name in ``names``. Sessions in ``fail_sessions``
+    fail their write; ``on_commit`` runs at each commit."""
     lock = threading.Lock()
 
     class Cursor(FakeCursor):
@@ -257,13 +280,19 @@ def _fake_psycopg(monkeypatch, written):
             if sql is dr._UPSERT_MESSAGE:
                 with lock:
                     written.append(params[1])
+            elif "INSERT INTO conversations" in sql:
+                if params[0] in fail_sessions:
+                    raise RuntimeError("poisoned conversation")
+                if names is not None:
+                    names.append(params[4])
 
     class Conn:
         def cursor(self):
             return Cursor()
 
         def commit(self):
-            pass
+            if on_commit:
+                on_commit()
 
         def rollback(self):
             pass
@@ -345,6 +374,51 @@ class TestDrain:
         finally:
             dr._release_lock(held)
         assert len(_fetch(outbox, "SELECT * FROM outbox WHERE sent_at IS NULL")) == 1
+
+
+class TestPassOrdering:
+    def test_failing_rows_at_the_head_do_not_starve_the_rest(self, outbox, monkeypatch):
+        """A full batch of rows that always fail used to fill every batch from
+        the front, so nothing captured after them was ever delivered."""
+        monkeypatch.setattr(dr, "BATCH_SIZE", 2)
+        _insert(outbox, [_row("p1", session="poison"), _row("p2", session="poison", seq=1)]
+                + [_row(f"f{i}", session="fine", seq=i) for i in range(3)])
+        written = []
+        _fake_psycopg(monkeypatch, written, fail_sessions={"poison"})
+        import hook.embed
+        monkeypatch.setattr(hook.embed, "get_embedding", lambda t: [1.0])
+
+        assert dr.drain() == (0, 2)       # the first batch is all poison
+        dr.drain()                        # …but now it sorts behind the rest
+        assert sorted(written) == ["f0", "f1", "f2"]
+        pending = _fetch(outbox, "SELECT message_uuid, attempts FROM outbox WHERE sent_at IS NULL")
+        assert sorted(r[0] for r in pending) == ["p1", "p2"]
+        assert all(r[1] >= 2 for r in pending)  # still retried, just not first
+
+    def test_a_row_renamed_mid_drain_is_delivered_again_with_its_new_name(self, outbox, monkeypatch):
+        _insert(outbox, [_row("a")])
+        written, names = [], []
+
+        def rename_once():
+            if not names or names[-1] is None:
+                c = sqlite3.connect(outbox)
+                with c:
+                    c.execute("UPDATE outbox SET conversation_name = 'Late name' WHERE sent_at IS NULL")
+                c.close()
+
+        _fake_psycopg(monkeypatch, written, on_commit=rename_once, names=names)
+        import hook.embed
+        monkeypatch.setattr(hook.embed, "get_embedding", lambda t: [1.0])
+        assert dr.drain() == (1, 0)
+        assert names == [None, "Late name"]
+        assert not _fetch(outbox, "SELECT * FROM outbox WHERE sent_at IS NULL")
+
+    def test_nothing_pending_returns_before_the_lock(self, outbox, monkeypatch):
+        """The hook starts a drain after every capture; most find nothing."""
+        def no(*_a, **_kw):
+            raise AssertionError("took the lock with nothing to do")
+        monkeypatch.setattr(dr, "_acquire_lock", no)
+        assert dr.drain() == (0, 0)
 
 
 class TestEnvFile:

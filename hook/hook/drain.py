@@ -46,6 +46,9 @@ BATCH_SIZE = int(os.environ.get("CLAUDE_CHATS_DRAIN_BATCH", "500"))
 # one. The drain holding the lock keeps going until the outbox is empty, rows
 # appended while it runs included, so a waiter only matters in the moment
 # between its last look and its exit.
+# After this many failed attempts a row is called out on every run. It is
+# still retried (behind everything else); a human should look at last_error.
+STUCK_AFTER = 10
 LOCK_TIMEOUT = float(os.environ.get("CLAUDE_CHATS_DRAIN_LOCK_TIMEOUT", "60"))
 
 
@@ -75,6 +78,16 @@ def _vec(embedding: list[float]) -> str:
 
 
 def _pending(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The next batch, rows that have failed least first.
+
+    Not plain outbox order: a run of rows that fail every time (a poisoned
+    conversation, content Postgres rejects) would then fill every batch from
+    the front and starve everything captured after it, for ever. Ordered by
+    attempts, each failure sends a row behind everything that has not failed
+    as often, so new messages keep flowing and the failures are still retried.
+    Within a session, sequence_num travels with each row, so the order rows
+    are written in does not matter.
+    """
     cur = conn.execute(
         """
         SELECT id, message_uuid, session_id, project_path, git_branch,
@@ -82,7 +95,7 @@ def _pending(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                content, sequence_num, created_at
         FROM outbox
         WHERE sent_at IS NULL
-        ORDER BY id
+        ORDER BY attempts, id
         LIMIT ?
         """,
         (BATCH_SIZE,),
@@ -98,17 +111,29 @@ def _group_by_session(rows: list[sqlite3.Row]) -> "OrderedDict[str, list[sqlite3
     return grouped
 
 
-def _mark_sent(conn: sqlite3.Connection, ids: list[int]) -> None:
+def _mark_sent(conn: sqlite3.Connection, rows: list) -> int:
+    """Tombstone rows exactly as they were written; returns how many.
+
+    Guarded on what was written: the hook can change a pending row between
+    the Postgres commit and this update — a late /rename refreshes the titles
+    of every pending row in its session — and tombstoning the changed row
+    would drop that change for good. A row that no longer matches is left
+    pending, and the next pass delivers it again.
+    """
     now = datetime.now(timezone.utc).isoformat()
     with conn:
         # Content is blanked, not deleted: the row still has to exist to keep
         # suppressing re-inserts, but the text is already safe in Postgres and
         # there is no reason to keep two copies of every conversation on disk.
+        before = conn.total_changes
         conn.executemany(
             "UPDATE outbox SET sent_at = ?, content = '', last_error = NULL "
-            "WHERE id = ?",
-            [(now, i) for i in ids],
+            "WHERE id = ? AND sent_at IS NULL AND content = ? "
+            "AND conversation_name IS ? AND ai_title IS ?",
+            [(now, r["id"], r["content"], r["conversation_name"], r["ai_title"])
+             for r in rows],
         )
+        return conn.total_changes - before
 
 
 def _mark_failed(conn: sqlite3.Connection, ids: list[int], error: str) -> None:
@@ -229,8 +254,9 @@ def _release_lock(fd) -> None:
     os.close(fd)
 
 
-def _drain_pass(conn: sqlite3.Connection, pg, rows, get_embedding) -> tuple[int, int]:
-    written = failed = 0
+def _drain_pass(conn: sqlite3.Connection, pg, rows, get_embedding) -> tuple[int, int, int]:
+    """(tombstoned, failed, changed-under-us) message counts for one batch."""
+    written = failed = changed = 0
     # Per session, so one poisoned conversation cannot block the rest.
     for session_id, session_rows in _group_by_session(rows).items():
         ids = [r["id"] for r in session_rows]
@@ -246,14 +272,33 @@ def _drain_pass(conn: sqlite3.Connection, pg, rows, get_embedding) -> tuple[int,
             continue
         # Only after the Postgres commit — a tombstone written before the data
         # landed would lose the message for good.
-        _mark_sent(conn, ids)
-        written += len(ids)
-    return written, failed
+        # Counted by what was tombstoned: a row the hook changed meanwhile
+        # stays pending and is counted when the next pass delivers it.
+        marked = _mark_sent(conn, session_rows)
+        written += marked
+        changed += len(ids) - marked
+    return written, failed, changed
+
+
+def _anything_pending() -> bool:
+    """A cheap look before taking the lock or importing psycopg and the
+    embedding providers: the hook starts a drain after every capture, and most
+    of them find the work already done."""
+    try:
+        conn = sqlite3.connect(OUTBOX_PATH, timeout=5)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM outbox WHERE sent_at IS NULL LIMIT 1"
+            ).fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return True  # no table yet, or locked: let the full path decide
 
 
 def drain() -> tuple[int, int]:
     """Returns (written, failed) message counts."""
-    if not os.path.exists(OUTBOX_PATH):
+    if not os.path.exists(OUTBOX_PATH) or not _anything_pending():
         return 0, 0
 
     lock = _acquire_lock(OUTBOX_PATH + ".drain.lock", LOCK_TIMEOUT)
@@ -300,15 +345,24 @@ def _drain_locked() -> tuple[int, int]:
         with pg:
             # Keep going until the outbox is empty, so rows the hook appends
             # while this runs are taken too — that is what lets a drain that
-            # found the lock taken simply leave. Stop at the first failure:
-            # the failed rows are still pending and would only fail again.
+            # found the lock taken simply leave.
             while rows:
-                w, f = _drain_pass(conn, pg, rows, get_embedding)
+                w, f, c = _drain_pass(conn, pg, rows, get_embedding)
                 written += w
                 failed += f
-                if f or not w:
+                # Failed rows sort behind the rest, so carry on while anything
+                # is getting through (or was changed by the hook mid-write, and
+                # needs writing again); stop once a pass delivers nothing.
+                if not w and not c:
                     break
                 rows = _pending(conn)
+        stuck = conn.execute(
+            "SELECT count(*) FROM outbox WHERE sent_at IS NULL AND attempts >= ?",
+            (STUCK_AFTER,),
+        ).fetchone()[0]
+        if stuck:
+            print(f"claude-chats: {stuck} message(s) have failed {STUCK_AFTER}+ times "
+                  "and are still pending; see last_error in the outbox", file=sys.stderr)
         return written, failed
     finally:
         conn.close()
