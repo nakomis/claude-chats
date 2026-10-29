@@ -84,10 +84,14 @@ jobs:
         run: uv run --locked pytest tests -v -rs | tee "$RUNNER_TEMP/pytest.log"
       - name: root tests/
         if: matrix.suite == 'root'
+        env:
+          # tests/test_convmem_backup.py: the backup scripts `docker exec` into
+          # the service container, as they do into claude-chats-db (CHATS-41).
+          CONVMEM_TEST_CONTAINER: ${{ job.services.postgres.id }}
         run: uv run --no-project --with pytest --with 'psycopg[binary]' pytest tests -v -rs | tee "$RUNNER_TEMP/pytest.log"
       - name: No database test was skipped
         run: |
-          if grep -E '^SKIPPED .*_DSN' "$RUNNER_TEMP/pytest.log"; then
+          if grep -E '^SKIPPED .*(_DSN|CONVMEM_TEST_)' "$RUNNER_TEMP/pytest.log"; then
             echo "::error::database tests skipped although the test DSNs are set"
             exit 1
           fi
@@ -118,14 +122,15 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q postgresql-client
       - name: Shell scripts parse
         run: |
-          bash -n localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/smoke-localhost.sh \
-              scripts/upgrade-check-localhost.sh
+          bash -n localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/convmem-archive.sh \
+              scripts/smoke-localhost.sh scripts/upgrade-check-localhost.sh tests/fixtures/docker-pg-stub
           shellcheck -S error localhost/install.sh scripts/backup.sh scripts/restore.sh \
-              scripts/smoke-localhost.sh scripts/upgrade-check-localhost.sh
+              scripts/convmem-archive.sh scripts/smoke-localhost.sh scripts/upgrade-check-localhost.sh \
+              tests/fixtures/docker-pg-stub
       - name: The systemd units are valid
         run: |
           mkdir -p /tmp/units
-          for unit in claude-chats-drain claude-chats-facts; do
+          for unit in claude-chats-drain claude-chats-facts claude-chats-nightly-backup; do
             sed -e "s|UV_PATH|$(command -v true)|" -e "s|REPO_PATH|${GITHUB_WORKSPACE}|" \
                 -e "s|CONFIG_PATH|/tmp/config.env|" "localhost/systemd/${unit}.service" \
                 > "/tmp/units/${unit}.service"

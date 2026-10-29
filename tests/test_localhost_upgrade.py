@@ -494,6 +494,10 @@ class World:
         return self.home / "Library" / "LaunchAgents" / "com.nakomis.claude-chats-facts.plist"
 
     @property
+    def backup_plist_path(self) -> Path:
+        return self.home / "Library" / "LaunchAgents" / "com.nakomis.claude-chats-nightly-backup.plist"
+
+    @property
     def systemd_dir(self) -> Path:
         return self.home / ".config" / "systemd" / "user"
 
@@ -866,9 +870,13 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
         # The old plist had the provider settings (an API key, perhaps) baked in.
         assert "EnvironmentVariables" not in plist
         launchctl = world.calls("launchctl")
-        assert launchctl[-4].startswith("launchctl bootout gui/")
-        assert launchctl[-3] == f"launchctl bootstrap gui/{os.getuid()} {world.plist_path}"
-        assert launchctl[-1] == f"launchctl bootstrap gui/{os.getuid()} {world.facts_plist_path}"
+        assert launchctl[-6].startswith("launchctl bootout gui/")
+        assert launchctl[-5] == f"launchctl bootstrap gui/{os.getuid()} {world.plist_path}"
+        assert launchctl[-3] == f"launchctl bootstrap gui/{os.getuid()} {world.facts_plist_path}"
+        # The nightly backup (CHATS-41), which the old install never had.
+        assert launchctl[-1] == f"launchctl bootstrap gui/{os.getuid()} {world.backup_plist_path}"
+        backup_plist = plistlib.loads(world.backup_plist_path.read_bytes())
+        assert backup_plist["ProgramArguments"] == ["/bin/bash", str(new / "scripts" / "backup.sh")]
         facts_plist = plistlib.loads(world.facts_plist_path.read_bytes())
         assert facts_plist["ProgramArguments"][1:] == [
             "run", "--project", str(new / "localhost" / "facts"), "python", "-m", "facts.single_machine",
@@ -879,7 +887,10 @@ def test_an_old_install_upgrades_in_place(world, old_mode, uname):
         assert f'--project "{new / "hook"}" drain-outbox --env-file "{config}"' in service
         assert (world.systemd_dir / "claude-chats-drain.timer").exists()
         assert world.calls("systemctl")[-1] == \
-            "systemctl --user enable --now claude-chats-facts.timer"
+            "systemctl --user enable --now claude-chats-nightly-backup.timer"
+        assert "systemctl --user enable --now claude-chats-facts.timer" in world.calls("systemctl")
+        backup_unit = (world.systemd_dir / "claude-chats-nightly-backup.service").read_text()
+        assert f'ExecStart=/bin/bash "{new / "scripts" / "backup.sh"}"' in backup_unit
         assert "systemctl --user enable --now claude-chats-drain.timer" in world.calls("systemctl")
         facts_unit = (world.systemd_dir / "claude-chats-facts.service").read_text()
         assert f"WorkingDirectory={new}" in facts_unit

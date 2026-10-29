@@ -1,0 +1,15 @@
+# The nightly backup (CHATS-41): scripts/backup.sh archives each newly complete
+# month once into ~/.claude-chats/backups/archive/ (never pruned) and writes a
+# dump of everything not yet archived to ~/.claude-chats/backups/nightly/ (the
+# newest 14 kept). Fired by claude-chats-nightly-backup.timer; see ../launchd/
+# for the macOS equivalent. Restore with ./install.sh --restore.
+#
+# REPO_PATH is substituted by install.sh, which installs this as a user unit
+# under ~/.config/systemd/user/.
+[Unit]
+Description=Back up the claude-chats database to ~/.claude-chats/backups
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash "REPO_PATH/scripts/backup.sh"
+Nice=10

@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""A stand-in for the `aws` CLI's `s3 ls` and `s3 cp`, backed by a directory.
+
+s3://bucket/key is the file $STUB_S3_ROOT/bucket/key. Every call is appended to
+$STUB_AWS_LOG with the AWS_PROFILE it ran under, so tests can assert which
+bucket, key, profile and storage class were used. Any `cp` whose destination
+contains $STUB_AWS_FAIL_CP (when set) fails, as an upload that never landed,
+and with $STUB_AWS_FAIL_LS set every listing fails, as with an expired login.
+"""
+
+import datetime
+import os
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ["STUB_S3_ROOT"])
+
+
+def local(url):
+    assert url.startswith("s3://"), url
+    return ROOT / url[len("s3://"):]
+
+
+def main(argv):
+    with open(os.environ["STUB_AWS_LOG"], "a") as log:
+        log.write(f"AWS_PROFILE={os.environ.get('AWS_PROFILE', '')} aws {' '.join(argv)}\n")
+    positional = [a for i, a in enumerate(argv)
+                  if not a.startswith("--") and not (i and argv[i - 1].startswith("--")
+                                                    and argv[i - 1] not in ("--no-progress",))]
+    if positional[:2] == ["s3", "ls"]:
+        if os.environ.get("STUB_AWS_FAIL_LS"):
+            print("An error occurred (ExpiredToken) when calling ListObjectsV2", file=sys.stderr)
+            return 255
+        d = local(positional[2])
+        if not d.is_dir():
+            return 1
+        for f in sorted(d.iterdir()):
+            if f.is_file():
+                ts = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"{ts} {f.stat().st_size:>10} {f.name}")
+        return 0
+    if positional[:2] == ["s3", "cp"]:
+        src, dst = positional[2], positional[3]
+        fail = os.environ.get("STUB_AWS_FAIL_CP")
+        if fail and fail in dst:
+            print(f"upload failed: {dst}", file=sys.stderr)
+            return 1
+        if src.startswith("s3://"):
+            if dst == "-":
+                with open(local(src), "rb") as f:
+                    shutil.copyfileobj(f, sys.stdout.buffer)
+            else:
+                shutil.copyfile(local(src), dst)
+            return 0
+        out = local(dst)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if src == "-":
+            with open(out, "wb") as f:
+                shutil.copyfileobj(sys.stdin.buffer, f)
+        else:
+            shutil.copyfile(src, out)
+        return 0
+    print(f"aws-s3-stub: unsupported: {argv}", file=sys.stderr)
+    return 2
+
+
+sys.exit(main(sys.argv[1:]))

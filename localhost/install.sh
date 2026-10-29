@@ -54,6 +54,15 @@
 #   Older history is opt-in: ./install.sh --facts-backfill [--since DATE].
 #   FACTS_MAX_EXCHANGES  exchanges per 15-minute run (default: 10)
 #
+# ── Backups ───────────────────────────────────────────────────────────────────
+#
+#   Every night at 03:30 a third LaunchAgent / systemd timer runs
+#   ../scripts/backup.sh into ~/.claude-chats/backups/: each complete month is
+#   archived once (never pruned), and a nightly dump carries everything not yet
+#   archived (the newest CLAUDE_CHATS_BACKUP_KEEP, default 14, are kept). The
+#   same monthly-archive scheme the distributed edition runs on its server.
+#   ./install.sh --backup takes one now; ./install.sh --restore puts it back.
+#
 # Re-running is safe — every step is idempotent. Re-running also upgrades an
 # install made from an older checkout: the hook command and MCP registration are
 # rewritten to point at ../hook and ../mcp, whatever they pointed at before.
@@ -73,6 +82,10 @@ FACTS_LABEL="com.nakomis.claude-chats-facts"
 FACTS_PLIST_DEST="${HOME}/Library/LaunchAgents/${FACTS_LABEL}.plist"
 FACTS_UNIT="claude-chats-facts"
 FACTS_DIR="${ROOT_DIR}/localhost/facts"
+BACKUP_LABEL="com.nakomis.claude-chats-nightly-backup"
+BACKUP_PLIST_DEST="${HOME}/Library/LaunchAgents/${BACKUP_LABEL}.plist"
+BACKUP_UNIT="claude-chats-nightly-backup"
+OLD_BACKUP_PLIST="${HOME}/Library/LaunchAgents/com.nakomis.claude-chats-backup.plist"
 DEFAULT_FACTS_MAX_EXCHANGES=10
 PLIST_SRC="${LOCALHOST_DIR}/launchd/${LABEL}.plist"
 PLIST_DEST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
@@ -100,9 +113,13 @@ Maintenance:
   ./install.sh --drain             drain the outbox into Postgres now
   ./install.sh --backfill          re-embed messages that have no vector
   ./install.sh --replay-fallback   recover messages from the fallback file
-  ./install.sh --backup [path]     dump the database to a local file
-  ./install.sh --restore [file]    restore from a dump, then backfill
-  ./install.sh --uninstall         remove the hook, MCP, drain and facts schedules
+  ./install.sh --backup [dir]      back up now, as the nightly schedule does
+                                   (default dir: ~/.claude-chats/backups)
+  ./install.sh --restore [dir|file]
+                                   restore the newest nightly and every archived
+                                   month before it (or a named nightly)
+  ./install.sh --uninstall         remove the hook, MCP, drain, facts and backup
+                                   schedules
 
 Claude Facts:
   ./install.sh --facts             run one fact extraction now
@@ -320,6 +337,7 @@ remove_one_schedule() {
 remove_schedule() {
     remove_one_schedule "$LABEL" "$SYSTEMD_UNIT"
     remove_one_schedule "$FACTS_LABEL" "$FACTS_UNIT"
+    remove_one_schedule "$BACKUP_LABEL" "$BACKUP_UNIT"
 }
 
 # Is `claude` logged in to an account (not just holding an API key)? Asked the
@@ -405,7 +423,7 @@ case "$ACTION" in
         exit $?
         ;;
     backup)
-        exec "${ROOT_DIR}/scripts/backup.sh" --local ${EXTRA_ARG:+"$EXTRA_ARG"}
+        exec "${ROOT_DIR}/scripts/backup.sh" ${EXTRA_ARG:+"$EXTRA_ARG"}
         ;;
     restore)
         # The backfill at the end of a restore embeds with the installed provider.
@@ -443,7 +461,7 @@ case "$ACTION" in
         exit 0
         ;;
     uninstall)
-        step "Removing the drain and facts schedules"
+        step "Removing the drain, facts and backup schedules"
         remove_schedule
         ok "Schedules removed"
 
@@ -831,6 +849,43 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 10. The nightly backup — local disk, monthly archive + nightly dump (CHATS-41)
+# ---------------------------------------------------------------------------
+case "$(uname -s)" in
+    Darwin)
+        step "Installing the nightly backup LaunchAgent"
+        render_template "${LOCALHOST_DIR}/launchd/${BACKUP_LABEL}.plist" "$BACKUP_PLIST_DEST"
+        plutil -lint "$BACKUP_PLIST_DEST" >/dev/null
+        launchctl bootout "gui/$(id -u)/${BACKUP_LABEL}" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$BACKUP_PLIST_DEST"
+        ok "Backed up nightly at 03:30 to ${STATE_DIR}/backups (log: /tmp/claude-chats-backup.log)"
+        ;;
+    Linux)
+        step "Installing the nightly backup systemd user timer"
+        mkdir -p "$SYSTEMD_DEST"
+        render_template "${SYSTEMD_SRC}/${BACKUP_UNIT}.service" "${SYSTEMD_DEST}/${BACKUP_UNIT}.service"
+        cp "${SYSTEMD_SRC}/${BACKUP_UNIT}.timer" "${SYSTEMD_DEST}/${BACKUP_UNIT}.timer"
+        if command -v systemctl &>/dev/null && systemctl --user daemon-reload 2>/dev/null; then
+            systemctl --user enable --now "${BACKUP_UNIT}.timer"
+            ok "Backed up nightly at 03:30 to ${STATE_DIR}/backups (log: journalctl --user -u ${BACKUP_UNIT})"
+        else
+            warn "No systemd user session; the backup units are in ${SYSTEMD_DEST} but not enabled."
+            warn "Run ./install.sh --backup to back up by hand."
+        fi
+        ;;
+    *)
+        warn "No backup schedule for $(uname -s); run ./install.sh --backup to back up by hand."
+        ;;
+esac
+# The retired Mac-to-S3 agent. Its nightly run (backup.sh --s3) is refused now,
+# and every local backup warns about it; say so here, where someone is watching.
+if [[ -f "$OLD_BACKUP_PLIST" ]]; then
+    warn "${OLD_BACKUP_PLIST} is the retired Mac-to-S3 backup agent; its runs are"
+    warn "refused now (offsite backups are the server's job). Remove it:"
+    warn "  launchctl bootout gui/\$(id -u)/com.nakomis.claude-chats-backup; rm ${OLD_BACKUP_PLIST}"
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 echo ""
@@ -840,6 +895,7 @@ echo "  Provider     : ${PROVIDER}"
 echo "  Model        : ${MODEL}"
 echo "  Dimensions   : ${DIMENSIONS}"
 echo "  Database     : ${DB_URL}"
+echo "  Backups      : ${STATE_DIR}/backups, nightly at 03:30"
 echo "  Claude Facts : ${FACTS_PROVIDER}${FACTS_SINCE:+ (conversations since ${FACTS_SINCE}, ${FACTS_MAX_EXCHANGES} exchanges per run)}"
 echo "  MCP tools    : search_memory · get_conversation · list_recent_sessions · recall_facts"
 echo ""

@@ -58,7 +58,9 @@ The script:
    Linux;
 9. sets up Claude Facts with the provider you chose (your Claude Code login by
    default) and installs its 15-minute schedule, unless that provider is not
-   usable here, in which case facts are left off with a warning.
+   usable here, in which case facts are left off with a warning;
+10. installs the nightly backup: a LaunchAgent on macOS, a systemd user timer on
+    Linux, at 03:30 ([backups](#backups)).
 
 Every step is idempotent. Re-run it as often as you like.
 
@@ -239,21 +241,45 @@ All of it hangs off the same script:
 | `./install.sh --drain` | Drain the outbox into Postgres right now |
 | `./install.sh --backfill` | Re-embed every message that has no vector, and rebuild the vector index |
 | `./install.sh --replay-fallback` | Recover messages from the fallback file, then drain |
-| `./install.sh --backup [path]` | `pg_dump` to a local file (default `~/.claude-chats/backups/`) |
-| `./install.sh --restore [file]` | Restore a dump, then backfill the vectors |
-| `./install.sh --uninstall` | Remove the hook, the MCP registration and the drain and facts schedules |
+| `./install.sh --backup [dir]` | Back up now, exactly as the nightly schedule does (default `~/.claude-chats/backups/`) |
+| `./install.sh --restore [dir\|file]` | Restore the newest nightly and every archived month before it, or a named nightly |
+| `./install.sh --uninstall` | Remove the hook, the MCP registration and the drain, facts and backup schedules |
 | `./install.sh --facts` | Extract facts from new exchanges now |
 | `./install.sh --facts-backfill [--since DATE]` | Extract from older conversations too, at the same rate ([backfill](#older-history-backfill)) |
 | `./install.sh --facts-backfill-stop` | Back to conversations since install only |
 
-Backups deliberately exclude the embedding vectors: they are incompressible, they
-dominate the dump, and they are fully regenerable from message content. That is
-why `--restore` runs a backfill at the end, and why it is the slow part.
-`--backup` and `--restore` run the repository's `scripts/backup.sh --local` and
-`scripts/restore.sh --local`, which can be run directly too — but keep the
-`--local`: without it they default to S3, for the distributed edition's sake.
-`--backup` keeps the newest 14 dumps in its directory and deletes older ones;
-set `CLAUDE_CHATS_BACKUP_KEEP` to change that.
+### Backups
+
+Every night at 03:30 a schedule of its own (`com.nakomis.claude-chats-nightly-backup`
+on macOS, `claude-chats-nightly-backup` on Linux) runs the repository's
+`scripts/backup.sh`, which writes two things under `~/.claude-chats/backups/`:
+
+| | What | Kept |
+|---|---|---|
+| `archive/messages/` | One file per complete month of messages, written once | For ever: never pruned |
+| `nightly/` | Everything else: the schema, every conversation, every Claude Fact, and the messages not yet archived | The newest 14 (`CLAUDE_CHATS_BACKUP_KEEP`) |
+
+It is the distributed edition's backup (`scripts/convmem-archive.sh`), aimed at a
+directory instead of S3. Old months stop changing, so they are written once rather
+than every night, and each nightly carries only the current month. Each archived
+file's name records its row count, a fingerprint of its contents and its size;
+the nightly re-checks them against the database, so a month whose messages
+changed later (a backfill, a re-embed) is archived again, and one that failed to
+archive stays in the nightly. A failed archive makes the nightly bigger, never
+leaves a month in neither place.
+
+The embedding vectors are included, so a restore needs no re-embedding.
+
+`--restore` loads the newest nightly, then every archived month before the month
+it starts from, checking each against the size and row count in its name, then
+rebuilds the vector index. Give it a nightly file to restore an older one. Dumps
+made before October 2026 (whole-database files directly in `backups/`, without
+vectors) still restore, followed by a backfill of the vectors, which is the slow
+part.
+
+Docker has to be running at 03:30 for the backup; macOS runs a missed one when
+the Mac wakes, and Linux at the next boot or login (`Persistent=true`). Check on
+it in `/tmp/claude-chats-backup.log` or `journalctl --user -u claude-chats-nightly-backup`.
 
 ### Upgrading from before October 2026
 
@@ -292,6 +318,7 @@ so you do not need to repeat them. The installer:
   for OpenAI) written into the plist, with one that reads them from
   `config.env`. On Linux, where the old edition scheduled nothing, it installs
   the systemd user timer;
+- adds the nightly backup schedule, which earlier versions did not have;
 - rewrites `config.env` without the old `CLAUDE_CHATS_CAPTURE_MODE` line, still
   mode 600;
 - re-applies `../init.sql`, which brings the database to exactly the schema a new
@@ -400,8 +427,9 @@ same port and container name. Run one or the other, not both.
 ./install.sh --uninstall
 ```
 
-That removes the hook entries, the MCP registration and the drain and facts
-schedules, and deliberately leaves your data (facts included) alone. To remove that too:
+That removes the hook entries, the MCP registration and the drain, facts and
+backup schedules, and deliberately leaves your data (facts and backups
+included) alone. To remove that too:
 
 ```bash
 docker compose -f docker-compose.yml down -v   # drops the database volume
@@ -418,7 +446,11 @@ rm -rf ~/.claude-chats                          # outbox, images, config, backup
 | `~/.claude-chats/outbox-fallback.ndjson` | Last-resort capture when the outbox itself fails |
 | `~/.claude-chats/images/` | Archived images with JSON sidecars |
 | `~/.claude-chats/config.env` | What the installer recorded; read by every drain and the maintenance commands |
-| `~/.claude-chats/backups/` | Default destination for `--backup` |
+| `~/.claude-chats/backups/archive/` | Archived months, written once, never pruned |
+| `~/.claude-chats/backups/nightly/` | Nightly dumps; the newest 14 are kept |
+| `~/Library/LaunchAgents/com.nakomis.claude-chats-nightly-backup.plist` | The backup schedule (macOS) |
+| `~/.config/systemd/user/claude-chats-nightly-backup.{service,timer}` | The backup schedule (Linux; log: `journalctl --user -u claude-chats-nightly-backup`) |
+| `/tmp/claude-chats-backup.log` | The backup LaunchAgent's output |
 | `~/.claude/settings.json` | Where the hook is registered |
 | `~/Library/LaunchAgents/com.nakomis.claude-chats-drain.plist` | The drain schedule (macOS) |
 | `~/.config/systemd/user/claude-chats-drain.{service,timer}` | The drain schedule (Linux) |
