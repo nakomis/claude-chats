@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Claude Facts (CHATS-39): extracts durable facts from new conversations every
+    15 minutes. Separate from the drain on purpose: extraction makes model calls
+    (with the claude-code provider, each is a `claude -p` process on your own
+    login), so it never runs from the hook or the drain.
+
+    One run at a time: facts.single_machine takes a lock (~/.claude-chats/facts.lock)
+    and the service a database lock as well, so a run that outlasts the interval
+    makes the next one skip rather than overlap. launchd itself never starts a
+    second copy of a job that is still running.
+
+    REPO_PATH, UV_PATH and CONFIG_PATH are substituted at install time by
+    install.sh. Everything else, including FACTS_PROVIDER and the absolute path to
+    `claude` (launchd's PATH would not find it), is read from CONFIG_PATH at each run.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nakomis.claude-chats-facts</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>UV_PATH</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>REPO_PATH/localhost/facts</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>facts.single_machine</string>
+        <string>--env-file</string>
+        <string>CONFIG_PATH</string>
+    </array>
+
+    <!-- `python -m facts…` finds the package in the working directory. -->
+    <key>WorkingDirectory</key>
+    <string>REPO_PATH</string>
+
+    <!-- Every 15 minutes. Not RunAtLoad: a login should not start model calls
+         before the session it is about has even begun. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- Model calls are background work. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-chats-facts.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-chats-facts.log</string>
+</dict>
+</plist>

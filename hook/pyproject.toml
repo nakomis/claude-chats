@@ -5,20 +5,27 @@ build-backend = "hatchling.build"
 [project]
 name = "claude-chats-hook"
 version = "0.1.0"
-description = "Claude Code Stop hook — records conversation messages to PostgreSQL with Ollama embeddings"
+description = "Claude Code hook — captures conversation messages to a local SQLite outbox, and drains it into PostgreSQL on a single machine"
 requires-python = ">=3.11"
+# stomp.py used to be here for the ActiveMQ era (server/, install-client.sh's
+# remote mode). Nothing has imported it since the outbox replaced that, so it
+# is gone rather than optional.
 dependencies = [
     "httpx>=0.27.0",
     "psycopg[binary]>=3.1.0",
     "boto3>=1.35.0",
     "openai>=1.0.0",
-    "stomp.py>=8.1.0",
 ]
 
 [project.scripts]
 record-conversation = "hook.record:main"
+drain-outbox = "hook.drain:main"
+replay-fallback = "hook.replay_fallback:main"
 backfill-embeddings = "hook.backfill:main"
 flush-images = "hook.images:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["hook"]

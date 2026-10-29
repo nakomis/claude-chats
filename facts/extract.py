@@ -9,6 +9,7 @@ Anything shaped like a credential is dropped even if the model returns it.
 """
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -71,8 +72,11 @@ def is_systemic(error):
 
     Authentication, permission, billing, rate limits, 5xx (including 529 overloaded, after the
     SDK's own retries) and anything that never got an answer. Matched by attribute and class
-    name so this module does not import anthropic.
+    name so this module does not import anthropic. An error that says for itself (a
+    `systemic` attribute, as facts.claude_code's errors do) is taken at its word.
     """
+    if isinstance(getattr(error, "systemic", None), bool):
+        return error.systemic
     status = getattr(error, "status_code", None)
     if isinstance(status, int):
         return status in SYSTEMIC_STATUS or status >= 500
@@ -175,7 +179,7 @@ class Extractor:
         r = self.client.messages.create(
             model=self.model, max_tokens=max_tokens,
             system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            messages=messages, output_config={"effort": self.effort})
+            messages=messages, **({"output_config": {"effort": self.effort}} if self.effort else {}))
         text = "".join(b.text for b in r.content if b.type == "text")
         u = r.usage
         calls.append({"uncached_in": u.input_tokens, "cache_read": u.cache_read_input_tokens,
@@ -248,5 +252,26 @@ class HarnessAdapter:
         return res
 
 
-def make_extractor(run_dir):
+def make_anthropic_extractor(run_dir):
+    """facts_eval factory: Haiku through the Anthropic API (needs ANTHROPIC_API_KEY)."""
     return HarnessAdapter(run_dir)
+
+
+def make_claude_code_extractor(run_dir):
+    """facts_eval factory: Haiku through `claude -p` on the user's Claude Code login."""
+    from facts import claude_code
+
+    adapter = HarnessAdapter(run_dir, claude_code.ClaudeCodeExtractor(timeout=claude_code.timeout()))
+    adapter.name = f"facts:claude-code:{adapter.extractor.version}"
+    adapter.parallel_workers = claude_code.workers()
+    return adapter
+
+
+def make_extractor(run_dir):
+    """facts_eval factory chosen by $FACTS_PROVIDER: anthropic (the default) or claude-code."""
+    provider = os.environ.get("FACTS_PROVIDER", "anthropic")
+    if provider == "claude-code":
+        return make_claude_code_extractor(run_dir)
+    if provider != "anthropic":
+        raise ValueError(f"FACTS_PROVIDER={provider!r}: want anthropic or claude-code")
+    return make_anthropic_extractor(run_dir)

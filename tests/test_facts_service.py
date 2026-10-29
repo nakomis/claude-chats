@@ -446,3 +446,43 @@ def test_the_connection_has_a_statement_timeout_and_keepalives(dsn):
     with service.connect(service.Config(dsn=dsn, statement_timeout_ms=1234)) as c:
         assert c.execute("SHOW statement_timeout").fetchone()[0] == "1234ms"
         assert c.execute("SHOW tcp_keepalives_idle").fetchone() is not None   # server side exists; client params accepted
+
+
+@needs_db
+def test_new_conversations_go_before_a_backfill(conn):
+    """FACTS_PRIORITY_SINCE (the single machine's install time) puts conversations with newer
+    messages first, so a backfill of old history never holds up new ones. Empty: oldest first."""
+    seed(conn, "old", [("martin", "old m1", 0), ("claude", "old c1", 1), ("martin", "old m2", 5)])
+    seed(conn, "new", [("martin", "new m1", 600), ("claude", "new c1", 601), ("martin", "new m2", 605)])
+    ex = FakeExtractor()
+    service.run(conn, CFG, ex, fake_embed, limit=1)
+    assert [c.messages[0]["content"] for c in ex.calls] == ["old m1"]  # the distributed default
+
+    conn.execute("TRUNCATE facts_progress, fact_events, facts CASCADE")
+    ex = FakeExtractor()
+    cfg = service.Config(embed_url="x", since="all", priority_since=(T0 + timedelta(minutes=300)).isoformat())
+    service.run(conn, cfg, ex, fake_embed, limit=1)
+    assert [c.messages[0]["content"] for c in ex.calls] == ["new m1"]
+
+
+@needs_db
+def test_a_conversation_scoped_since_reads_whole_conversations(conn):
+    """The single machine (FACTS_SINCE_SCOPE=conversation): a conversation going on at install
+    time is left alone, and a backfill later reads it from its first message, not its middle."""
+    cid = seed(conn, "straddles", [("martin", "before m1", 0), ("claude", "before c1", 1),
+                                   ("martin", "after m2", 120), ("claude", "after c2", 121),
+                                   ("martin", "after m3", 125)])
+    # As the drain records it: when the first message was sent.
+    conn.execute("UPDATE conversations SET started_at = %s WHERE id = %s", (T0, cid))
+    install = (T0 + timedelta(minutes=60)).isoformat()
+    ex = FakeExtractor()
+    service.run(conn, service.Config(embed_url="x", since=install, since_scope="conversation"), ex, fake_embed)
+    assert ex.calls == []
+    # The message-scoped default would have started in the middle.
+    ex = FakeExtractor()
+    service.run(conn, service.Config(embed_url="x", since=install), ex, fake_embed, dry_run=True, out=lambda *_: None)
+    assert [c.messages[0]["content"] for c in ex.calls] == ["after m2"]
+
+    ex = FakeExtractor()  # --facts-backfill: everything
+    service.run(conn, service.Config(embed_url="x", since="all", since_scope="conversation"), ex, fake_embed)
+    assert [c.messages[0]["content"] for c in ex.calls] == ["before m1", "after m2"]

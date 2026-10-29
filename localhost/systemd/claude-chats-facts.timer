@@ -1,0 +1,13 @@
+# Runs claude-chats-facts.service five minutes after the timer starts, then
+# fifteen minutes after each run. OnActiveSec rather than OnBootSec for the
+# reason given in claude-chats-drain.timer: it counts from the timer's own
+# activation, so the chain starts whenever install.sh enables it.
+[Unit]
+Description=Extract Claude Facts every 15 minutes
+
+[Timer]
+OnActiveSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

@@ -58,8 +58,10 @@ def load_reference(path):
 
 def run_extractor(spec, sessions, out, workers=8):
     """Exchanges run in order within a session. Sessions run side by side when the
-    extractor says it can (parallel_sessions = True); Mem0 shares one store, so it can't."""
+    extractor says it can (parallel_sessions = True); Mem0 shares one store, so it can't.
+    An extractor may cap the parallelism itself (parallel_workers): claude -p is a whole process."""
     ex = extractors.make(spec, out)
+    workers = min(workers, getattr(ex, "parallel_workers", None) or workers)
     lock = threading.Lock()
 
     def one_session(s):

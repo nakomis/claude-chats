@@ -8,12 +8,24 @@ version = "0.1.0"
 description = "MCP server — semantic search and retrieval of recorded Claude Code conversations"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.0.0",
-    "httpx>=0.27.0",
+    # Upper bound is load-bearing: mcp 2.x moved mcp.server.fastmcp, which
+    # server.py imports.
+    "mcp[cli]>=1.0.0,<2",
     "psycopg[binary]>=3.1.0",
-    "boto3>=1.35.0",
-    "openai>=1.0.0",
+    # The embedding helper (hook.embed), so a query is embedded by exactly the
+    # code that embedded the messages it is compared with. The provider SDKs
+    # (httpx, boto3, openai) come with it.
+    "claude-chats-hook",
 ]
 
 [project.scripts]
 conversation-memory-mcp = "conversation_memory_mcp.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+# A path source rather than a published package: the two always ship from the
+# same checkout. Editable, so a change to hook.embed reaches the MCP server
+# without a re-sync.
+[tool.uv.sources]
+claude-chats-hook = { path = "../hook", editable = true }

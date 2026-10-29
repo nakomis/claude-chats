@@ -1,28 +1,31 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
+# A stand-in for the hook package that used to live here (CHATS-37). No code.
+#
+# Installs from before October 2026 run `uv run --project <checkout>/localhost/hook
+# record-conversation` from ~/.claude/settings.json, and their LaunchAgent runs
+# `drain-outbox` the same way. A `git pull` deletes that package, and until
+# ./install.sh is re-run those commands would fail with uv's exit status 2,
+# which Claude Code takes as "block": every prompt refused, every stop
+# overridden. This project resolves the same commands to the shared ../../hook
+# instead, so in that gap capture keeps working (into the outbox; nothing is
+# drained until the re-run, unless an old LaunchAgent does it).
+#
+# There is deliberately no uv.lock: uv resolves on the first such run (and
+# writes one, which .gitignore keeps out of git), so that first run wants the
+# network, as the pull just did. Committing a lock would not avoid that: uv
+# cannot pin a path dependency's dependencies to ../../hook/uv.lock, so it
+# would hold versions of its own, and go stale whenever hook/ changed. If the
+# resolve does fail, the old command fails as it would have without this.
+#
+# install.sh never points anything here. Delete this directory once no install
+# from before October 2026 can be left.
 [project]
-name = "claude-chats-hook-localhost"
-version = "0.1.0"
-description = "Claude Code hook — records conversation messages to a local PostgreSQL (single-machine edition)"
+name = "claude-chats-localhost-hook-shim"
+version = "0.0.0"
 requires-python = ">=3.11"
-# No stomp.py: nothing here talks to a queue.
-dependencies = [
-    "httpx>=0.27.0",
-    "psycopg[binary]>=3.1.0",
-    "boto3>=1.35.0",
-    "openai>=1.0.0",
-]
+dependencies = ["claude-chats-hook"]
 
-[project.scripts]
-record-conversation = "hook.record:main"
-drain-outbox = "hook.drain:main"
-backfill-embeddings = "hook.backfill:main"
-replay-fallback = "hook.replay_fallback:main"
+[tool.uv]
+package = false
 
-[dependency-groups]
-dev = ["pytest>=8.0"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["hook"]
+[tool.uv.sources]
+claude-chats-hook = { path = "../../hook", editable = true }

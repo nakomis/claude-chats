@@ -9,6 +9,7 @@
     <array>
         <string>/bin/bash</string>
         <string>REPO_PATH/scripts/backup.sh</string>
+        <string>--s3</string>
     </array>
 
     <!-- Run daily at 03:00 local time -->
