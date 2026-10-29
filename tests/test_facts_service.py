@@ -11,6 +11,7 @@ afterwards. Without the variable those tests are skipped.
 import os
 import sys
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -398,6 +399,23 @@ def test_a_bad_fact_does_not_hold_up_embedding_the_rest(conn):
     stats = service.Stats()
     service.embed_pending(conn, CFG, picky, stats)
     assert (stats.embedded, stats.embed_errors) == (3, 3)   # three bad ones first, and the rest still done
+
+
+@needs_db
+def test_every_unembedded_fact_is_embedded_not_just_one_batch(conn):
+    seed(conn, "s-18", SCRIPT)
+    service.run(conn, CFG, FakeExtractor(facts_per=2), None, limit=3)  # six facts, none embedded
+    small = replace(CFG, embed_batch=2)
+
+    def picky(text):
+        if text == "m1 fact 0":
+            raise ValueError("embedding has 3 dimensions, expected 1024")
+        return fake_embed(text)
+
+    stats = service.Stats()
+    service.embed_pending(conn, small, picky, stats)
+    assert (stats.embedded, stats.embed_errors) == (5, 1)  # three batches' worth, the bad one tried once
+    assert conn.execute("SELECT count(*) FROM facts WHERE embedding IS NULL").fetchone()[0] == 1
 
 
 @needs_db

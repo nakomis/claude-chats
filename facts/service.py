@@ -455,29 +455,41 @@ def embed_failure_is_systemic(e):
 
 
 def embed_pending(conn, cfg, embed, stats):
-    rows = conn.execute(
-        "SELECT id, text FROM facts WHERE embedding IS NULL AND deleted_at IS NULL ORDER BY created_at LIMIT %s",
-        (cfg.embed_batch,)).fetchall()
+    """Embed every unembedded fact, embed_batch at a time.
+
+    All of them, not one batch: a fact without a vector is invisible to recall_facts' semantic
+    search, and a busy run extracts more than one batch (29 Oct 2026: 269 facts against a
+    batch of 200). A fact that fails is not tried again this run, so the loop always ends.
+    """
+    tried = []  # ids that failed this run; the next batch skips them
     streak = 0  # consecutive failures that point at Cal, not at the fact
-    for fact_id, text in rows:
-        try:
-            vec = embed(text)
-        except Exception as e:  # noqa: BLE001 - retried next run
-            stats.embed_errors += 1
-            log(f"fact {fact_id}: embedding failed: {type(e).__name__}")
-            # A fact Cal rejects is skipped, so a few permanently bad ones cannot hold up the rest;
-            # only an unreachable or failing Cal stops the batch.
-            streak = streak + 1 if embed_failure_is_systemic(e) else 0
-            if streak >= cfg.max_systemic:
-                log(f"{streak} embedding failures in a row; leaving the rest for the next run")
-                break
-            continue
-        streak = 0
-        conn.execute(
-            "UPDATE facts SET embedding = %s::vector, embedder = %s, embedder_board = NULL, embedder_fw = NULL, "
-            "updated_at = now() WHERE id = %s AND embedding IS NULL",
-            ("[" + ",".join(repr(float(x)) for x in vec) + "]", cfg.embed_tag, fact_id))
-        stats.embedded += 1
+    while True:
+        rows = conn.execute(
+            "SELECT id, text FROM facts WHERE embedding IS NULL AND deleted_at IS NULL AND NOT (id = ANY(%s)) "
+            "ORDER BY created_at LIMIT %s",
+            (tried, cfg.embed_batch)).fetchall()
+        if not rows:
+            return
+        for fact_id, text in rows:
+            try:
+                vec = embed(text)
+            except Exception as e:  # noqa: BLE001 - retried next run
+                stats.embed_errors += 1
+                tried.append(fact_id)
+                log(f"fact {fact_id}: embedding failed: {type(e).__name__}")
+                # A fact Cal rejects is skipped, so a few permanently bad ones cannot hold up the rest;
+                # only an unreachable or failing Cal stops the run's embedding.
+                streak = streak + 1 if embed_failure_is_systemic(e) else 0
+                if streak >= cfg.max_systemic:
+                    log(f"{streak} embedding failures in a row; leaving the rest for the next run")
+                    return
+                continue
+            streak = 0
+            conn.execute(
+                "UPDATE facts SET embedding = %s::vector, embedder = %s, embedder_board = NULL, embedder_fw = NULL, "
+                "updated_at = now() WHERE id = %s AND embedding IS NULL",
+                ("[" + ",".join(repr(float(x)) for x in vec) + "]", cfg.embed_tag, fact_id))
+            stats.embedded += 1
 
 
 def run(conn, cfg, extractor, embed, limit=None, dry_run=False, out=print):
