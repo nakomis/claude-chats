@@ -1,0 +1,18 @@
+# Claude Facts (CHATS-39): extracts durable facts from new conversations. Fired
+# by claude-chats-facts.timer; see ../launchd/ for the macOS equivalent. Never
+# run from the hook or the drain: extraction makes model calls.
+#
+# One run at a time: facts.single_machine holds ~/.claude-chats/facts.lock (and
+# the service a database lock), and systemd does not start a oneshot that is
+# still running. The service stops starting new exchanges after 13 minutes.
+#
+# REPO_PATH, UV_PATH and CONFIG_PATH are substituted by install.sh, which
+# installs this as a user unit under ~/.config/systemd/user/.
+[Unit]
+Description=Extract Claude Facts from new claude-chats conversations
+
+[Service]
+Type=oneshot
+WorkingDirectory=REPO_PATH
+ExecStart="UV_PATH" run --project "REPO_PATH/localhost/facts" python -m facts.single_machine --env-file "CONFIG_PATH"
+Nice=10

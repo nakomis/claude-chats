@@ -100,7 +100,7 @@ MCP tools, available to Claude in any project once you restart Claude Code:
 | `search_memory` | Hybrid semantic + full-text search across every recorded message |
 | `get_conversation` | Fetch a full transcript by session id |
 | `list_recent_sessions` | Browse what has been recorded lately |
-| `recall_facts` | Durable facts extracted from your conversations ("the workshop lathe is a Myford ML7"), each dated, ranked by relevance and discounted by age since it was last confirmed. The tables are created on install, but the installer does not set up extraction yet, so until it does (or you run the extractor by hand) it finds nothing. See [INSTALL.md](INSTALL.md#claude-facts-recall_facts) |
+| `recall_facts` | Durable facts extracted from your conversations ("the workshop lathe is a Myford ML7"), each dated, ranked by relevance and discounted by age since it was last confirmed. Extracted every 15 minutes by Claude Haiku, through your own Claude Code login by default, from conversations since you installed (older ones on request). See [INSTALL.md](INSTALL.md#claude-facts-recall_facts) |
 
 Each message records who produced it — you, Claude or a tool (and which tool,
 or which model) — so what you typed can be told apart from command output.

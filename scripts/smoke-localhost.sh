@@ -7,9 +7,11 @@
 # hook's `record-conversation` on a fixture transcript under a throwaway HOME
 # (set up as localhost/install.sh would leave it, with the drain-after-capture
 # switch on), runs `drain-outbox` as the timer would, checks the rows in
-# Postgres, then asks the MCP server's search_memory to find them, and its
-# recall_facts to find a fact seeded from that conversation. Embeddings
-# come from a fake Ollama (hook/tests/support.py), so no model and no network.
+# Postgres, then asks the MCP server's search_memory to find them. Then it runs
+# one Claude Facts extraction as the facts timer would (CHATS-39), with a fake
+# `claude` that answers as `claude -p --json-schema` does, and asks recall_facts
+# for the fact it extracted. Embeddings come from a fake Ollama
+# (hook/tests/support.py), so no model and no network.
 # The scratch database is dropped at the end, pass or fail.
 #
 # CI runs this against a pgvector service container. Needs uv and psql.
@@ -66,11 +68,34 @@ OLLAMA_URL="$(cat "${WORK}/ollama-url")"
 FAKE_HOME="${WORK}/home"
 STATE="${FAKE_HOME}/.claude-chats"
 mkdir -p "$STATE"
+# A fake Claude Code for the facts extractor: records how it was run, and
+# answers as `claude -p --output-format json --json-schema` does.
+mkdir -p "${WORK}/bin"
+cat > "${WORK}/bin/claude" <<'FAKE'
+#!/usr/bin/env bash
+{ echo "argv: $*"; echo "api-key: ${ANTHROPIC_API_KEY:-absent}"; echo "cwd: $PWD"; } >> "${FAKE_CLAUDE_LOG}"
+cat > /dev/null
+cat <<'JSON'
+{"type": "result", "subtype": "success", "is_error": false, "stop_reason": "tool_use",
+ "terminal_reason": "completed", "api_error_status": null, "num_turns": 2, "result": "",
+ "structured_output": {"memory": [{"id": "0", "text": "The workshop espresso machine is descaled with citric acid",
+   "kind": "config", "subject": "espresso machine", "attribute": "descaling"}]},
+ "usage": {"input_tokens": 3, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 4600, "output_tokens": 60}}
+JSON
+FAKE
+chmod +x "${WORK}/bin/claude"
+
 cat > "${STATE}/config.env" <<EOF
 CLAUDE_CHATS_PROVIDER=ollama
 CLAUDE_CHATS_MODEL=mxbai-embed-large
 CLAUDE_CHATS_DB_URL=${DSN}
 OLLAMA_BASE_URL=${OLLAMA_URL}
+FACTS_PROVIDER=claude-code
+FACTS_PROVIDER_REQUESTED=claude-code
+FACTS_INSTALLED_AT=2026-10-01T00:00:00+00:00
+FACTS_SINCE=2026-10-01T00:00:00+00:00
+FACTS_MAX_EXCHANGES=10
+FACTS_CLAUDE_BIN=${WORK}/bin/claude
 EOF
 
 cat > "${WORK}/transcript.jsonl" <<'EOF'
@@ -113,29 +138,35 @@ assert out["results"] and out["results"][0]["session_id"] == "smoke-session", ou
 assert out["results"][0]["name"] == "Espresso descaling", out
 '
 
-step "Recalling a seeded fact through the MCP server (one database, no replica)"
-# Facts are written by extraction (CHATS-39); until then the table is empty on a
-# single machine, so this seeds one, from the conversation captured above, the
-# way the extractor would. The MCP server is started without
-# CLAUDE_CHATS_READ_DB_URL, as install.sh registers it.
+step "Extracting facts as the facts timer would (fake claude -p)"
+# The unit's command, from the checkout's root, with next to nothing in the
+# environment but an API key that must never reach claude.
+(cd "$ROOT" && env -i HOME="$FAKE_HOME" PATH="$PATH" ANTHROPIC_API_KEY=must-not-be-used \
+    FAKE_CLAUDE_LOG="${WORK}/claude.log" UV_CACHE_DIR="$(uv cache dir)" \
+    uv run --project "${ROOT}/localhost/facts" python -m facts.single_machine --env-file "${STATE}/config.env")
+cat "${WORK}/claude.log"
+grep -q "^api-key: absent$" "${WORK}/claude.log" || { echo "claude -p saw an API key" >&2; exit 1; }
+for flag in "-p" "--strict-mcp-config" "--no-session-persistence" "--json-schema" "disableAllHooks"; do
+    grep -q -- "$flag" "${WORK}/claude.log" || { echo "claude -p was run without ${flag}" >&2; exit 1; }
+done
+if grep -q -- "--bare" "${WORK}/claude.log"; then echo "claude -p was run with --bare" >&2; exit 1; fi
+psql "$DSN" -c "SELECT text, kind, embedder, embedding IS NOT NULL AS embedded, extractor FROM facts"
+FACT="$(psql "$DSN" -At -c "SELECT embedder || '|' || (embedding IS NOT NULL) FROM facts")"
+[[ "$FACT" == "ollama-mxbai-embed-large|true" ]] \
+    || { echo "expected one fact, embedded by the hook's provider; got ${FACT}" >&2; exit 1; }
+DONE="$(psql "$DSN" -At -c "SELECT p.last_seq FROM facts_progress p
+    JOIN conversations c ON c.id = p.conversation_id WHERE c.session_id = 'smoke-session'")"
+[[ -n "$DONE" ]] || { echo "facts_progress did not advance" >&2; exit 1; }
+
+step "Recalling the extracted fact through the MCP server (one database, no replica)"
+# Started without CLAUDE_CHATS_READ_DB_URL, as install.sh registers it.
 CLAUDE_CHATS_DB_URL="$DSN" OLLAMA_BASE_URL="$OLLAMA_URL" \
     uv run --project "${ROOT}/mcp" python -c '
-import os
-import psycopg
-from hook.embed import get_embedding
 from conversation_memory_mcp.server import READ_DB_URL, recall_facts
 assert READ_DB_URL is None, READ_DB_URL
 text = "The workshop espresso machine is descaled with citric acid"
-vec = "[" + ",".join(map(str, get_embedding(text))) + "]"
-with psycopg.connect(os.environ["CLAUDE_CHATS_DB_URL"], autocommit=True) as conn:
-    conn.execute(
-        "INSERT INTO facts (text, kind, subject, attribute, observed_at, last_confirmed, "
-        "conversation_id, first_seq, last_seq, host, extractor, embedding) "
-        "SELECT %s, %s, %s, %s, now(), now(), id, 0, 1, host, %s, %s::vector "
-        "FROM conversations WHERE session_id = %s",
-        (text, "config", "espresso machine", "descaling", "smoke", vec, "smoke-session"))
 # "garage" is in no fact and full-text needs every word: only the vector
-# half can find it, so this proves the embedded fact is searchable.
+# half can find it, so this proves the fact was embedded as queries are.
 out = recall_facts("how is the espresso machine descaled in the garage")
 print(out["status"], out["read_from"], [r["text"] for r in out["results"]])
 assert out["read_from"] == "primary", out

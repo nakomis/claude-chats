@@ -18,6 +18,7 @@ the same licence so the boundary stays simple.
 | `prompts.py` | The system prompt (fixed, cached) and the per-exchange user prompt |
 | `extract.py` | `Extractor.extract(...)`: one exchange in, a list of `Fact`s out; plus the adapter `facts_eval` uses |
 | `claude_code.py` | `ClaudeCodeExtractor`: the same contract, through `claude -p` on the user's own Claude Code login |
+| `single_machine.py` | One service run for the single-machine edition: reads `~/.claude-chats/config.env`, takes a lock, runs the service (CHATS-39; see [`localhost/INSTALL.md`](../localhost/INSTALL.md#claude-facts-recall_facts)) |
 | `service.py` | The extractor service: new exchanges to facts, then embeddings (see below) |
 
 Each fact carries `text`, `kind` (`identity` / `config` / `situation` / `event`),
@@ -53,6 +54,13 @@ with every fact (`facts.extractor`).
   `FACTS_CLAUDE_CODE_WORKERS` (sessions in parallel, default 3: each call is a
   whole process).
 
+- `bedrock` (CHATS-39): the same `Extractor` with the SDK's `AnthropicBedrock`
+  client and the AWS credentials in the environment (`AWS_PROFILE`, `AWS_REGION`
+  or `AWS_DEFAULT_REGION`). Haiku 5.5 on Bedrock needs an inference profile; the
+  default model is `global.anthropic.claude-haiku-5-5` (`eu.` / `us.` to stay in
+  one geography). `FACTS_EFFORT=none` for a model that takes no effort setting.
+- `off`: the service does nothing.
+
 The facts are tagged with the same `facts.extractor` value either way
 (`<model>+<PROMPT_VERSION>`): same model, same prompt.
 
@@ -74,11 +82,19 @@ units live in home-infra, `mace/deployment/facts/`). Each run:
    about the exchange (auth, billing, rate limits, 5xx, network, a lost database
    connection) are **not** attempts: after 3 in a row the run stops, and the next
    tick tries again, so an outage cannot make the service give up on anything;
-3. embeds facts with no vector through Ollama (`mxbai-q8`, 800 characters,
-   `truncate: true`, as Cal's embedding-consumer does) and tags `facts.embedder`;
+3. embeds facts with no vector and tags `facts.embedder`. With
+   `FACTS_EMBEDDER=ollama` (the default, Mace): through Cal's Ollama (`mxbai-q8`,
+   800 characters, `truncate: true`, as Cal's embedding-consumer does). With
+   `FACTS_EMBEDDER=hook` (the single machine): through `hook.embed` and the
+   `CLAUDE_CHATS_PROVIDER` / `_MODEL` the installer recorded, which is what embeds
+   that machine's messages and queries, tagged `<provider>-<model>`;
 4. prints a `facts-run {...}` JSON line: exchanges, facts, errors, tokens. The
    exit status is non-zero when the run had errors and produced nothing (so a
    systemd oneshot unit fails and the failed-unit alert fires).
+
+Conversations are taken oldest first. With `FACTS_PRIORITY_SINCE` set (the single
+machine sets it to its install time), those with unprocessed messages from then on
+go first, so a backfill of older history never holds up new conversations.
 
 A conversation whose tail cannot yet form an exchange (a last message of Martin's
 with no reply) is looked at again on each run. That is harmless: one indexed read
@@ -95,8 +111,9 @@ default `/conversation-memory/prod/facts/anthropic-api-key`), `FACTS_EMBED_URL`
 `FACTS_MAX_EXCHANGES` (40), `FACTS_IDLE_MINUTES` (30), `FACTS_MAX_ATTEMPTS` (3),
 `FACTS_MAX_RUNTIME_SECONDS` (780), `FACTS_EMBED_BATCH` (200),
 `FACTS_MAX_SYSTEMIC_ERRORS` (3), `FACTS_API_TIMEOUT_SECONDS` (120),
-`FACTS_STATEMENT_TIMEOUT_MS` (60000), `FACTS_MODEL` and `FACTS_PROVIDER` (above;
-with `claude-code` no API key is used).
+`FACTS_STATEMENT_TIMEOUT_MS` (60000), `FACTS_MODEL`, `FACTS_PROVIDER` (above;
+with `claude-code` no API key is used), `FACTS_EFFORT` (`low`), `FACTS_EMBEDDER`
+(`ollama`; `hook` needs no `FACTS_EMBED_URL`) and `FACTS_PRIORITY_SINCE`.
 
 **`FACTS_SINCE` is required for a real run.** It is an ISO date or time; messages
 before it are ignored. An empty or missing value is an error (the run refuses

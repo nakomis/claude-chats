@@ -20,6 +20,7 @@ import shlex
 import stat
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,12 @@ fi""",
     # Claims the model is present, so nothing is "pulled".
     "ollama": '[[ "$1" == list ]] && echo "mxbai-embed-large:latest  abc  669 MB"',
     "uname": 'echo "$FAKE_UNAME"; exit 0',
+    # `claude auth status --json`: logged in unless the test says otherwise. Records
+    # whether it could see an API key, which install.sh must hide from it.
+    "claude": """if [[ "$1 $2" == "auth status" ]]; then
+  echo "key=${ANTHROPIC_API_KEY:-none}" >> "$STUB_DIR/auth-env"
+  echo "{\\"loggedIn\\": ${FAKE_CLAUDE_LOGGED_IN:-true}}"
+fi""",
 }
 
 
@@ -166,6 +173,15 @@ def _assert_installed(sandbox, result):
                for c in _calls(sandbox, "docker"))
     assert f"uv sync --project {ROOT / 'hook'}" in _calls(sandbox, "uv")
     assert f"uv sync --project {ROOT / 'mcp'}" in _calls(sandbox, "uv")
+    assert f"uv sync --project {ROOT / 'localhost' / 'facts'}" in _calls(sandbox, "uv")
+
+
+def _config(home):
+    lines = (home / ".claude-chats" / "config.env").read_text().splitlines()
+    return dict(ln.split("=", 1) for ln in lines if ln and not ln.startswith("#"))
+
+
+FACTS_PLIST = "com.nakomis.claude-chats-facts.plist"
 
 
 def test_fresh_install_on_macos(sandbox):
@@ -263,7 +279,7 @@ def test_everything_written_stays_inside_home(sandbox):
     assert _run(sandbox).returncode == 0
     written = {p for p in set(tmp_path.rglob("*")) - before}
     outside = sorted(str(p) for p in written
-                     if home not in p.parents and p.name not in ("calls.log", "applied.sql", "applies"))
+                     if home not in p.parents and p.name not in ("calls.log", "applied.sql", "applies", "auth-env"))
     assert outside == []
 
 
@@ -338,3 +354,161 @@ def test_bedrock_and_tls_settings_survive_a_re_run(sandbox):
         assert line in config
     add = [c for c in _calls(sandbox, "claude") if c.startswith("claude mcp add")][-1]
     assert "AWS_PROFILE=convmem" in add and "SSL_CERT_FILE=/etc/ssl/house.pem" in add
+
+
+# ── Claude Facts (CHATS-39) ─────────────────────────────────────────────────────
+
+def test_facts_default_to_the_claude_code_login_on_macos(sandbox):
+    _, home, bindir = sandbox
+    result = _run(sandbox, extra_env={"ANTHROPIC_API_KEY": "sk-not-for-config"})  # secret-check:allow (fake)
+    _assert_installed(sandbox, result)
+    config = _config(home)
+    assert config["FACTS_PROVIDER"] == config["FACTS_PROVIDER_REQUESTED"] == "claude-code"
+    assert config["FACTS_CLAUDE_BIN"] == str(bindir / "claude")  # absolute: launchd's PATH lacks it
+    assert config["FACTS_MAX_EXCHANGES"] == "10"
+    assert config["FACTS_SINCE"] == config["FACTS_INSTALLED_AT"]
+    datetime.fromisoformat(config["FACTS_SINCE"])
+    # The key in the shell is not written down, and the login check never saw it.
+    assert "ANTHROPIC_API_KEY" not in config
+    assert (sandbox[0] / "auth-env").read_text().splitlines() == ["key=none"]
+
+    plist = plistlib.loads((home / "Library" / "LaunchAgents" / FACTS_PLIST).read_bytes())
+    assert plist["ProgramArguments"] == [
+        str(bindir / "uv"), "run", "--project", str(ROOT / "localhost" / "facts"), "python", "-m",
+        "facts.single_machine", "--env-file", str(home / ".claude-chats" / "config.env")]
+    assert plist["WorkingDirectory"] == str(ROOT)
+    assert plist["StartInterval"] == 900 and not plist.get("RunAtLoad")
+    assert f"launchctl bootstrap gui/{os.getuid()} {home / 'Library' / 'LaunchAgents' / FACTS_PLIST}" \
+        in _calls(sandbox, "launchctl")
+    # The hook and the drain know nothing of facts.
+    assert "facts.single_machine" not in json.dumps(_settings(home))
+    drain = plistlib.loads((home / "Library" / "LaunchAgents" /
+                            "com.nakomis.claude-chats-drain.plist").read_bytes())
+    assert "facts.single_machine" not in drain["ProgramArguments"]
+
+
+def test_facts_timer_on_linux(sandbox):
+    _, home, bindir = sandbox
+    _assert_installed(sandbox, _run(sandbox, uname="Linux"))
+    units = home / ".config" / "systemd" / "user"
+    service = (units / "claude-chats-facts.service").read_text()
+    assert f"WorkingDirectory={ROOT}" in service
+    assert (f'ExecStart="{bindir / "uv"}" run --project "{ROOT / "localhost" / "facts"}" python -m '
+            f'facts.single_machine --env-file "{home / ".claude-chats" / "config.env"}"') in service
+    timer = (units / "claude-chats-facts.timer").read_text()
+    assert "OnActiveSec=" in timer and "OnUnitActiveSec=15min" in timer
+    assert "systemctl --user enable --now claude-chats-facts.timer" in _calls(sandbox, "systemctl")
+
+
+def test_not_logged_in_turns_facts_off_and_a_later_run_turns_them_on(sandbox):
+    _, home, _ = sandbox
+    result = _run(sandbox, extra_env={"FAKE_CLAUDE_LOGGED_IN": "false"})
+    _assert_installed(sandbox, result)  # the install itself goes ahead
+    assert "Claude Facts is off" in result.stdout and "not logged in" in result.stdout
+    config = _config(home)
+    assert config["FACTS_PROVIDER"] == "off" and config["FACTS_PROVIDER_REQUESTED"] == "claude-code"
+    assert "FACTS_SINCE" not in config
+    assert not (home / "Library" / "LaunchAgents" / FACTS_PLIST).exists()
+
+    _assert_installed(sandbox, _run(sandbox))  # logged in now
+    config = _config(home)
+    assert config["FACTS_PROVIDER"] == "claude-code" and config["FACTS_SINCE"]
+    assert (home / "Library" / "LaunchAgents" / FACTS_PLIST).exists()
+
+
+def test_facts_since_is_kept_on_re_runs(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox))
+    first = _config(home)
+    _assert_installed(sandbox, _run(sandbox, extra_env={"FACTS_SINCE": "all"}))  # ignored
+    again = _config(home)
+    assert again["FACTS_SINCE"] == first["FACTS_SINCE"]
+    assert again["FACTS_INSTALLED_AT"] == first["FACTS_INSTALLED_AT"]
+
+
+def test_anthropic_provider_needs_a_key_and_keeps_it_privately(sandbox):
+    _, home, _ = sandbox
+    result = _run(sandbox, extra_env={"FACTS_PROVIDER": "anthropic"})
+    _assert_installed(sandbox, result)
+    assert "needs ANTHROPIC_API_KEY" in result.stdout and _config(home)["FACTS_PROVIDER"] == "off"
+
+    key = "sk-fake-facts-key"  # secret-check:allow (fake)
+    _assert_installed(sandbox, _run(sandbox, extra_env={"FACTS_PROVIDER": "anthropic",
+                                                        "ANTHROPIC_API_KEY": key}))
+    _assert_installed(sandbox, _run(sandbox))  # remembered: provider and key
+    config = _config(home)
+    assert config["FACTS_PROVIDER"] == "anthropic" and config["ANTHROPIC_API_KEY"] == key
+    add = [c for c in _calls(sandbox, "claude") if c.startswith("claude mcp add")][-1]
+    assert key not in add  # the MCP server is not given it
+
+
+def test_bedrock_facts_keep_the_aws_settings_with_another_embedder(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox, extra_env={
+        "FACTS_PROVIDER": "bedrock", "AWS_PROFILE": "facts", "AWS_REGION": "eu-west-2"}))
+    _assert_installed(sandbox, _run(sandbox))
+    config = _config(home)
+    assert config["CLAUDE_CHATS_PROVIDER"] == "ollama" and config["FACTS_PROVIDER"] == "bedrock"
+    assert config["AWS_PROFILE"] == "facts" and config["AWS_REGION"] == "eu-west-2"
+
+
+def test_facts_off_removes_the_schedule(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox))
+    assert (home / "Library" / "LaunchAgents" / FACTS_PLIST).exists()
+    _assert_installed(sandbox, _run(sandbox, extra_env={"FACTS_PROVIDER": "off"}))
+    assert not (home / "Library" / "LaunchAgents" / FACTS_PLIST).exists()
+    assert f"launchctl bootout gui/{os.getuid()}/com.nakomis.claude-chats-facts" in _calls(sandbox, "launchctl")
+    _assert_installed(sandbox, _run(sandbox))  # stays off: that was a choice
+    assert _config(home)["FACTS_PROVIDER"] == "off"
+
+
+def test_an_unknown_facts_provider_stops_the_install(sandbox):
+    result = _run(sandbox, extra_env={"FACTS_PROVIDER": "ollama"})
+    assert result.returncode != 0 and "Unknown FACTS_PROVIDER" in result.stderr
+
+
+def test_backfill_is_opt_in_and_can_be_stopped(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox))
+    installed_at = _config(home)["FACTS_INSTALLED_AT"]
+    mode = stat.S_IMODE((home / ".claude-chats" / "config.env").stat().st_mode)
+
+    result = _run(sandbox, "--facts-backfill", "--since", "2026-01-01")
+    assert result.returncode == 0, result.stderr
+    assert _config(home)["FACTS_SINCE"] == "2026-01-01" and "10 exchanges per 15-minute run" in result.stdout
+    assert _run(sandbox, "--facts-backfill").returncode == 0
+    assert _config(home)["FACTS_SINCE"] == "all"
+    _assert_installed(sandbox, _run(sandbox))  # a re-run keeps the backfill going
+    assert _config(home)["FACTS_SINCE"] == "all"
+
+    assert _run(sandbox, "--facts-backfill-stop").returncode == 0
+    config = _config(home)
+    assert config["FACTS_SINCE"] == config["FACTS_INSTALLED_AT"] == installed_at
+    assert stat.S_IMODE((home / ".claude-chats" / "config.env").stat().st_mode) == mode == 0o600
+
+    bad = _run(sandbox, "--facts-backfill", "--since", "last tuesday")
+    assert bad.returncode != 0 and "is not a date" in bad.stderr
+    assert _config(home)["FACTS_SINCE"] == installed_at
+
+
+def test_backfill_refuses_when_facts_are_off(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox, extra_env={"FACTS_PROVIDER": "off"}))
+    result = _run(sandbox, "--facts-backfill")
+    assert result.returncode != 0 and "Claude Facts is off" in result.stderr
+
+
+def test_facts_now_runs_the_same_command_as_the_schedule(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox))
+    assert _run(sandbox, "--facts").returncode == 0
+    assert (f"uv run --project {ROOT / 'localhost' / 'facts'} python -m facts.single_machine "
+            f"--env-file {home / '.claude-chats' / 'config.env'}") in _calls(sandbox, "uv")
+
+
+def test_uninstall_removes_the_facts_schedule(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox))
+    assert _run(sandbox, "--uninstall").returncode == 0
+    assert not (home / "Library" / "LaunchAgents" / FACTS_PLIST).exists()

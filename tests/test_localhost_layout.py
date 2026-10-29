@@ -5,11 +5,13 @@ Within a month the copies had fallen behind the originals — missing mid-turn
 capture, author/tool/model capture, most of the schema — while a header still
 claimed they were identical. So localhost/ now holds only what is genuinely
 specific to running on one machine, and the code is the repository's own.
-These tests keep it that way. Stdlib only.
+These tests keep it that way. Stdlib and pytest only.
 """
 
 import os
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 LOCALHOST = ROOT / "localhost"
@@ -30,7 +32,7 @@ def test_no_python_or_sql_under_localhost():
 
 def test_localhost_holds_only_install_files_and_docs():
     allowed_top = {"install.sh", "docker-compose.yml", "README.md", "INSTALL.md",
-                   "launchd", "systemd", "docs", "hook"}
+                   "launchd", "systemd", "docs", "hook", "facts"}
     assert {p.name for p in LOCALHOST.iterdir()} <= allowed_top
 
 
@@ -41,6 +43,16 @@ def test_localhost_hook_is_only_the_upgrade_shim():
     shim = LOCALHOST / "hook"
     assert {p.name for p in shim.iterdir()} - {"uv.lock", ".venv"} == {"pyproject.toml"}
     text = (shim / "pyproject.toml").read_text()
+    assert 'claude-chats-hook = { path = "../../hook", editable = true }' in text
+    assert "package = false" in text
+
+
+def test_localhost_facts_is_only_an_environment():
+    """localhost/facts supplies the dependencies Claude Facts runs with (CHATS-39);
+    the code is ../../facts. A pyproject and its lock, and uv's .venv."""
+    env = LOCALHOST / "facts"
+    assert {p.name for p in env.iterdir()} - {".venv"} == {"pyproject.toml", "uv.lock"}
+    text = (env / "pyproject.toml").read_text()
     assert 'claude-chats-hook = { path = "../../hook", editable = true }' in text
     assert "package = false" in text
 
@@ -82,9 +94,9 @@ def test_nothing_imports_the_deleted_copies():
     assert hits == []
 
 
-def _timer_settings():
+def _timer_settings(name="claude-chats-drain.timer"):
     settings = {}
-    for line in (LOCALHOST / "systemd" / "claude-chats-drain.timer").read_text().splitlines():
+    for line in (LOCALHOST / "systemd" / name).read_text().splitlines():
         line = line.strip()
         if line and not line.startswith(("#", "[")) and "=" in line:
             key, value = line.split("=", 1)
@@ -92,11 +104,12 @@ def _timer_settings():
     return settings
 
 
-def test_the_drain_timer_starts_whenever_it_is_enabled():
+@pytest.mark.parametrize("name", ["claude-chats-drain.timer", "claude-chats-facts.timer"])
+def test_the_timers_start_whenever_they_are_enabled(name):
     """OnUnitActiveSec only repeats; something must fire first, measured from
     a moment that has not already passed when install.sh runs `enable --now`.
     OnBootSec alone fails that the moment the machine has been up a minute."""
-    timer = _timer_settings()
+    timer = _timer_settings(name)
     assert "OnUnitActiveSec" in timer
     starters = {"OnActiveSec", "OnCalendar"} & set(timer)
     assert starters, f"nothing starts the chain: {timer}"

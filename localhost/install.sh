@@ -36,6 +36,24 @@
 #
 #   CLAUDE_CHATS_DIMENSIONS  output dimensions (default: 1024, matching init.sql)
 #
+# ── Claude Facts ──────────────────────────────────────────────────────────────
+#
+#   Every 15 minutes a separate LaunchAgent / systemd timer extracts durable
+#   facts from new conversations with Claude Haiku (recall_facts finds them).
+#   Never from the hook or the drain. See INSTALL.md, "Claude Facts".
+#
+#   FACTS_PROVIDER=claude-code  (default) — your own Claude Code login, run
+#                     headlessly (`claude -p`); no API key. Counts towards
+#                     your subscription's usage allowance.
+#   FACTS_PROVIDER=anthropic    — ANTHROPIC_API_KEY must be set
+#   FACTS_PROVIDER=bedrock      — your AWS credentials / profile
+#                     (FACTS_MODEL default: global.anthropic.claude-haiku-5-5)
+#   FACTS_PROVIDER=off          — no extraction
+#
+#   Only conversations from the moment facts were first installed are read.
+#   Older history is opt-in: ./install.sh --facts-backfill [--since DATE].
+#   FACTS_MAX_EXCHANGES  exchanges per 15-minute run (default: 10)
+#
 # Re-running is safe — every step is idempotent. Re-running also upgrades an
 # install made from an older checkout: the hook command and MCP registration are
 # rewritten to point at ../hook and ../mcp, whatever they pointed at before.
@@ -51,6 +69,11 @@ STATE_DIR="${HOME}/.claude-chats"
 CONFIG_FILE="${STATE_DIR}/config.env"
 SETTINGS_FILE="${HOME}/.claude/settings.json"
 LABEL="com.nakomis.claude-chats-drain"
+FACTS_LABEL="com.nakomis.claude-chats-facts"
+FACTS_PLIST_DEST="${HOME}/Library/LaunchAgents/${FACTS_LABEL}.plist"
+FACTS_UNIT="claude-chats-facts"
+FACTS_DIR="${ROOT_DIR}/localhost/facts"
+DEFAULT_FACTS_MAX_EXCHANGES=10
 PLIST_SRC="${LOCALHOST_DIR}/launchd/${LABEL}.plist"
 PLIST_DEST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 SYSTEMD_SRC="${LOCALHOST_DIR}/systemd"
@@ -79,7 +102,15 @@ Maintenance:
   ./install.sh --replay-fallback   recover messages from the fallback file
   ./install.sh --backup [path]     dump the database to a local file
   ./install.sh --restore [file]    restore from a dump, then backfill
-  ./install.sh --uninstall         remove the hook, MCP and drain schedule
+  ./install.sh --uninstall         remove the hook, MCP, drain and facts schedules
+
+Claude Facts:
+  ./install.sh --facts             run one fact extraction now
+  ./install.sh --facts-backfill [--since YYYY-MM-DD]
+                                   also extract from older history (default: all
+                                   of it), at FACTS_MAX_EXCHANGES per run
+  ./install.sh --facts-backfill-stop
+                                   back to conversations since install only
 USAGE
 }
 
@@ -113,12 +144,22 @@ write_config() {
         case "$PROVIDER" in
             ollama) echo "OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}" ;;
             openai) echo "OPENAI_API_KEY=${OPENAI_API_KEY}" ;;
-            bedrock)
-                [[ -n "${AWS_PROFILE:-}" ]] && echo "AWS_PROFILE=${AWS_PROFILE}"
-                [[ -n "${AWS_REGION:-}"  ]] && echo "AWS_REGION=${AWS_REGION}"
-                [[ -n "${AWS_DEFAULT_REGION:-}" ]] && echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}"
-                ;;
         esac
+        if [[ "$PROVIDER" == "bedrock" || "$FACTS_PROVIDER" == "bedrock" ]]; then
+            [[ -n "${AWS_PROFILE:-}" ]] && echo "AWS_PROFILE=${AWS_PROFILE}"
+            [[ -n "${AWS_REGION:-}"  ]] && echo "AWS_REGION=${AWS_REGION}"
+            [[ -n "${AWS_DEFAULT_REGION:-}" ]] && echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}"
+        fi
+        # Claude Facts. FACTS_PROVIDER is what runs; FACTS_PROVIDER_REQUESTED what
+        # was asked for, so a re-run after logging in turns it back on.
+        echo "FACTS_PROVIDER=${FACTS_PROVIDER}"
+        echo "FACTS_PROVIDER_REQUESTED=${FACTS_PROVIDER_REQUESTED}"
+        [[ -n "${FACTS_INSTALLED_AT:-}" ]] && echo "FACTS_INSTALLED_AT=${FACTS_INSTALLED_AT}"
+        [[ -n "${FACTS_SINCE:-}" ]] && echo "FACTS_SINCE=${FACTS_SINCE}"
+        echo "FACTS_MAX_EXCHANGES=${FACTS_MAX_EXCHANGES}"
+        [[ -n "${FACTS_MODEL:-}" ]] && echo "FACTS_MODEL=${FACTS_MODEL}"
+        [[ -n "${FACTS_CLAUDE_BIN:-}" ]] && echo "FACTS_CLAUDE_BIN=${FACTS_CLAUDE_BIN}"
+        [[ "$FACTS_PROVIDER" == "anthropic" ]] && echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
         [[ -n "${SSL_CERT_FILE:-}" ]] && echo "SSL_CERT_FILE=${SSL_CERT_FILE}"
         # The guarded echo above is the last command in this block; without a
         # trailing success `set -e` would abort here whenever it is skipped.
@@ -141,6 +182,30 @@ config_env() {
         [[ -n "${!key:-}" ]] && continue
         CONFIG_ENV+=("$line")
     done < "$CONFIG_FILE"
+}
+
+# Set one key in the config file in place (the backfill switches), keeping the
+# rest and the file's permissions.
+config_set() {
+    [[ -f "$CONFIG_FILE" ]] || die "No ${CONFIG_FILE}: run ./install.sh first."
+    python3 - "$CONFIG_FILE" "$1" "$2" <<'PYEOF'
+import os, sys
+
+path, key, value = sys.argv[1:4]
+lines = [l for l in open(path).read().splitlines() if not l.startswith(key + "=")]
+lines.append(f"{key}={value}")
+tmp = f"{path}.tmp.{os.getpid()}"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write("\n".join(lines) + "\n")
+os.replace(tmp, path)
+PYEOF
+}
+
+# Run one facts service run with the recorded configuration, as the timer does.
+run_facts() {
+    (cd "$ROOT_DIR" && uv run --project "$FACTS_DIR" python -m facts.single_machine \
+        --env-file "$CONFIG_FILE" "$@")
 }
 
 # Run a hook console script with the recorded configuration.
@@ -232,22 +297,38 @@ open(dest, "w").write(text)
 PYEOF
 }
 
-remove_schedule() {
+# Remove one schedule: a LaunchAgent label on macOS, a systemd unit pair on Linux.
+remove_one_schedule() {
+    local label="$1" unit="$2"
     case "$(uname -s)" in
         Darwin)
-            launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
-            rm -f "$PLIST_DEST"
+            launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+            rm -f "${HOME}/Library/LaunchAgents/${label}.plist"
             ;;
         Linux)
             if command -v systemctl &>/dev/null; then
-                systemctl --user disable --now "${SYSTEMD_UNIT}.timer" 2>/dev/null || true
+                systemctl --user disable --now "${unit}.timer" 2>/dev/null || true
             fi
-            rm -f "${SYSTEMD_DEST}/${SYSTEMD_UNIT}.service" "${SYSTEMD_DEST}/${SYSTEMD_UNIT}.timer"
+            rm -f "${SYSTEMD_DEST}/${unit}.service" "${SYSTEMD_DEST}/${unit}.timer"
             if command -v systemctl &>/dev/null; then
                 systemctl --user daemon-reload 2>/dev/null || true
             fi
             ;;
     esac
+}
+
+remove_schedule() {
+    remove_one_schedule "$LABEL" "$SYSTEMD_UNIT"
+    remove_one_schedule "$FACTS_LABEL" "$FACTS_UNIT"
+}
+
+# Is `claude` logged in to an account (not just holding an API key)? The key is
+# removed first, as the extractor removes it from every claude -p it starts.
+claude_logged_in() {
+    local status
+    status="$(env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$1" auth status --json 2>/dev/null)" || return 1
+    python3 -c 'import json, sys; sys.exit(0 if json.loads(sys.argv[1]).get("loggedIn") is True else 1)' \
+        "$status" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -256,6 +337,7 @@ remove_schedule() {
 
 ACTION="install"
 EXTRA_ARG=""
+BACKFILL_SINCE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -276,6 +358,11 @@ while [[ $# -gt 0 ]]; do
         --backup)          ACTION="backup"; EXTRA_ARG="${2:-}"; [[ -n "$EXTRA_ARG" ]] && shift; shift ;;
         --restore)         ACTION="restore"; EXTRA_ARG="${2:-}"; [[ -n "$EXTRA_ARG" ]] && shift; shift ;;
         --uninstall)       ACTION="uninstall"; shift ;;
+        --facts)           ACTION="facts"; shift ;;
+        --facts-backfill)  ACTION="facts-backfill"; shift ;;
+        --facts-backfill-stop) ACTION="facts-backfill-stop"; shift ;;
+        --since)           BACKFILL_SINCE="${2:-}"; [[ -n "$BACKFILL_SINCE" ]] || die "--since needs a date (YYYY-MM-DD)."; shift 2 ;;
+        --since=*)         BACKFILL_SINCE="${1#*=}"; shift ;;
         -h|--help)         usage; exit 0 ;;
         *)                 die "Unknown argument '$1'. Try --help." ;;
     esac
@@ -318,10 +405,39 @@ case "$ACTION" in
         exec env ${CONFIG_ENV[@]+"${CONFIG_ENV[@]}"} \
             "${ROOT_DIR}/scripts/restore.sh" --local ${EXTRA_ARG:+"$EXTRA_ARG"}
         ;;
+    facts)
+        step "Extracting facts now"
+        run_facts
+        exit $?
+        ;;
+    facts-backfill)
+        [[ "$(config_get FACTS_PROVIDER)" =~ ^(claude-code|anthropic|bedrock)$ ]] \
+            || die "Claude Facts is off. Turn it on first, e.g. FACTS_PROVIDER=claude-code ./install.sh"
+        if [[ -z "$BACKFILL_SINCE" || "$BACKFILL_SINCE" == "all" ]]; then
+            BACKFILL_SINCE="all"
+        else
+            python3 -c 'import sys; from datetime import datetime; datetime.fromisoformat(sys.argv[1])' \
+                "$BACKFILL_SINCE" 2>/dev/null || die "--since '${BACKFILL_SINCE}' is not a date (YYYY-MM-DD)."
+        fi
+        config_set FACTS_SINCE "$BACKFILL_SINCE"
+        RATE="$(config_get FACTS_MAX_EXCHANGES)"
+        ok "Backfill on: facts from ${BACKFILL_SINCE/#all/all of your history} onwards"
+        echo "  At most ${RATE:-$DEFAULT_FACTS_MAX_EXCHANGES} exchanges per 15-minute run (FACTS_MAX_EXCHANGES), new"
+        echo "  conversations first. Progress is kept, so stopping and starting loses nothing."
+        echo "  Stop it with:  ./install.sh --facts-backfill-stop"
+        exit 0
+        ;;
+    facts-backfill-stop)
+        INSTALLED_AT="$(config_get FACTS_INSTALLED_AT)"
+        [[ -n "$INSTALLED_AT" ]] || die "Claude Facts has not been installed: nothing to stop."
+        config_set FACTS_SINCE "$INSTALLED_AT"
+        ok "Backfill stopped: back to conversations since ${INSTALLED_AT}"
+        exit 0
+        ;;
     uninstall)
-        step "Removing the drain schedule"
+        step "Removing the drain and facts schedules"
         remove_schedule
-        ok "Drain schedule removed"
+        ok "Schedules removed"
 
         step "Unregistering the MCP server"
         claude mcp remove conversation-memory --scope user  2>/dev/null || true
@@ -372,6 +488,29 @@ if [[ "$PROVIDER" == "bedrock" ]]; then
     AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$(config_get AWS_DEFAULT_REGION)}"
 fi
 SSL_CERT_FILE="${SSL_CERT_FILE:-$(config_get SSL_CERT_FILE)}"
+
+# Claude Facts: the same order. What was asked for is remembered separately from
+# what runs, so an install that fell back to off retries the choice next time.
+FACTS_PROVIDER_REQUESTED="${FACTS_PROVIDER:-$(config_get FACTS_PROVIDER_REQUESTED)}"
+FACTS_PROVIDER_REQUESTED="${FACTS_PROVIDER_REQUESTED:-$(config_get FACTS_PROVIDER)}"
+FACTS_PROVIDER_REQUESTED="${FACTS_PROVIDER_REQUESTED:-claude-code}"
+FACTS_PROVIDER="$FACTS_PROVIDER_REQUESTED"
+FACTS_MAX_EXCHANGES="${FACTS_MAX_EXCHANGES:-$(config_get FACTS_MAX_EXCHANGES)}"
+FACTS_MAX_EXCHANGES="${FACTS_MAX_EXCHANGES:-$DEFAULT_FACTS_MAX_EXCHANGES}"
+[[ "$FACTS_MAX_EXCHANGES" =~ ^[1-9][0-9]*$ ]] || die "FACTS_MAX_EXCHANGES must be a whole number above 0."
+FACTS_MODEL="${FACTS_MODEL:-$(config_get FACTS_MODEL)}"
+# Never from the environment: FACTS_SINCE is set once, when facts are first
+# installed, and afterwards only by --facts-backfill / --facts-backfill-stop.
+FACTS_INSTALLED_AT="$(config_get FACTS_INSTALLED_AT)"
+FACTS_SINCE="$(config_get FACTS_SINCE)"
+if [[ "$FACTS_PROVIDER" == "anthropic" ]]; then
+    ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(config_get ANTHROPIC_API_KEY)}"
+fi
+if [[ "$FACTS_PROVIDER" == "bedrock" && "$PROVIDER" != "bedrock" ]]; then
+    AWS_PROFILE="${AWS_PROFILE:-$(config_get AWS_PROFILE)}"
+    AWS_REGION="${AWS_REGION:-$(config_get AWS_REGION)}"
+    AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$(config_get AWS_DEFAULT_REGION)}"
+fi
 
 _DEFAULT_MODELS_ollama="mxbai-embed-large"
 _DEFAULT_MODELS_bedrock="amazon.titan-embed-text-v2:0"
@@ -437,6 +576,51 @@ case "$PROVIDER" in
         ;;
 esac
 
+# Claude Facts: anything missing turns extraction off with a warning; it never
+# stops the install (capture and search do not need it).
+facts_off() {
+    warn "Claude Facts is off: $*"
+    FACTS_PROVIDER="off"
+}
+FACTS_CLAUDE_BIN=""
+case "$FACTS_PROVIDER" in
+    claude-code)
+        # The absolute path: launchd and systemd run with a PATH that may not have it.
+        FACTS_CLAUDE_BIN="$(command -v claude)"
+        if claude_logged_in "$FACTS_CLAUDE_BIN"; then
+            ok "Claude Facts: claude-code (your Claude Code login)"
+        else
+            facts_off "\`claude auth status\` says Claude Code is not logged in to an account.
+   Log in (run \`claude\`, then /login), then re-run ./install.sh to turn it on."
+        fi
+        ;;
+    anthropic)
+        if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+            ok "Claude Facts: anthropic (ANTHROPIC_API_KEY is set)"
+        else
+            facts_off "FACTS_PROVIDER=anthropic needs ANTHROPIC_API_KEY. Set it and re-run ./install.sh."
+        fi
+        ;;
+    bedrock)
+        if [[ -z "${AWS_PROFILE:-}" && -z "${AWS_ACCESS_KEY_ID:-}" && ! -f "${HOME}/.aws/credentials" && ! -f "${HOME}/.aws/config" ]]; then
+            facts_off "FACTS_PROVIDER=bedrock found no AWS credentials. Configure AWS_PROFILE and re-run ./install.sh."
+        else
+            ok "Claude Facts: bedrock (${FACTS_MODEL:-global.anthropic.claude-haiku-5-5}; needs model access in your account)"
+        fi
+        ;;
+    off)
+        ok "Claude Facts: off"
+        ;;
+    *)
+        die "Unknown FACTS_PROVIDER '${FACTS_PROVIDER}'. Expected claude-code, anthropic, bedrock or off."
+        ;;
+esac
+if [[ "$FACTS_PROVIDER" != "off" && -z "$FACTS_SINCE" ]]; then
+    # First time facts are on: only conversations from now are read.
+    FACTS_INSTALLED_AT="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+    FACTS_SINCE="$FACTS_INSTALLED_AT"
+fi
+
 # ---------------------------------------------------------------------------
 # 2. Start PostgreSQL
 # ---------------------------------------------------------------------------
@@ -500,6 +684,10 @@ ok "hook deps installed"
 step "Installing MCP dependencies"
 uv sync --project "$MCP_DIR"
 ok "MCP deps installed"
+
+step "Installing Claude Facts dependencies"
+uv sync --project "$FACTS_DIR"
+ok "facts deps installed"
 
 # ---------------------------------------------------------------------------
 # 5. Record the configuration
@@ -596,6 +784,40 @@ case "$(uname -s)" in
 esac
 
 # ---------------------------------------------------------------------------
+# 9. The Claude Facts schedule — every 15 minutes, never from the hook or drain
+# ---------------------------------------------------------------------------
+if [[ "$FACTS_PROVIDER" == "off" ]]; then
+    remove_one_schedule "$FACTS_LABEL" "$FACTS_UNIT"
+else
+    case "$(uname -s)" in
+        Darwin)
+            step "Installing the Claude Facts LaunchAgent"
+            render_template "${LOCALHOST_DIR}/launchd/${FACTS_LABEL}.plist" "$FACTS_PLIST_DEST"
+            plutil -lint "$FACTS_PLIST_DEST" >/dev/null
+            launchctl bootout "gui/$(id -u)/${FACTS_LABEL}" 2>/dev/null || true
+            launchctl bootstrap "gui/$(id -u)" "$FACTS_PLIST_DEST"
+            ok "Facts are extracted every 15 minutes (log: /tmp/claude-chats-facts.log)"
+            ;;
+        Linux)
+            step "Installing the Claude Facts systemd user timer"
+            mkdir -p "$SYSTEMD_DEST"
+            render_template "${SYSTEMD_SRC}/${FACTS_UNIT}.service" "${SYSTEMD_DEST}/${FACTS_UNIT}.service"
+            cp "${SYSTEMD_SRC}/${FACTS_UNIT}.timer" "${SYSTEMD_DEST}/${FACTS_UNIT}.timer"
+            if command -v systemctl &>/dev/null && systemctl --user daemon-reload 2>/dev/null; then
+                systemctl --user enable --now "${FACTS_UNIT}.timer"
+                ok "Facts are extracted every 15 minutes (log: journalctl --user -u ${FACTS_UNIT})"
+            else
+                warn "No systemd user session; the facts units are in ${SYSTEMD_DEST} but not enabled."
+                warn "Run ./install.sh --facts to extract by hand."
+            fi
+            ;;
+        *)
+            warn "No facts schedule for $(uname -s); run ./install.sh --facts to extract by hand."
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 echo ""
@@ -605,6 +827,7 @@ echo "  Provider     : ${PROVIDER}"
 echo "  Model        : ${MODEL}"
 echo "  Dimensions   : ${DIMENSIONS}"
 echo "  Database     : ${DB_URL}"
+echo "  Claude Facts : ${FACTS_PROVIDER}${FACTS_SINCE:+ (conversations since ${FACTS_SINCE}, ${FACTS_MAX_EXCHANGES} exchanges per run)}"
 echo "  MCP tools    : search_memory · get_conversation · list_recent_sessions · recall_facts"
 echo ""
 echo "  Messages land in ${STATE_DIR}/outbox.db and reach Postgres within"

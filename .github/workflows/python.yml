@@ -125,20 +125,28 @@ jobs:
       - name: The systemd units are valid
         run: |
           mkdir -p /tmp/units
-          sed -e "s|UV_PATH|$(command -v true)|" -e "s|REPO_PATH|${GITHUB_WORKSPACE}|" \
-              -e "s|CONFIG_PATH|/tmp/config.env|" localhost/systemd/claude-chats-drain.service \
-              > /tmp/units/claude-chats-drain.service
-          cp localhost/systemd/claude-chats-drain.timer /tmp/units/
-          systemd-analyze verify /tmp/units/claude-chats-drain.timer /tmp/units/claude-chats-drain.service
+          for unit in claude-chats-drain claude-chats-facts; do
+            sed -e "s|UV_PATH|$(command -v true)|" -e "s|REPO_PATH|${GITHUB_WORKSPACE}|" \
+                -e "s|CONFIG_PATH|/tmp/config.env|" "localhost/systemd/${unit}.service" \
+                > "/tmp/units/${unit}.service"
+            cp "localhost/systemd/${unit}.timer" /tmp/units/
+            systemd-analyze verify "/tmp/units/${unit}.timer" "/tmp/units/${unit}.service"
+          done
+      - name: The launchd agents are valid plists
+        run: |
+          for plist in localhost/launchd/*.plist; do
+            python3 -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$plist"
+          done
       - name: docker-compose.yml resolves the shared init.sql
         run: |
           docker compose -f localhost/docker-compose.yml config > /tmp/compose.yml
           grep -q "source: ${GITHUB_WORKSPACE}/init.sql" /tmp/compose.yml
-      - name: Sync the hook and the MCP server
+      - name: Sync the hook, the MCP server and the facts environment
         run: |
           uv sync --locked --project hook
           uv sync --locked --project mcp
-      - name: Hook → outbox → drain → Postgres → MCP search
+          uv sync --locked --project localhost/facts
+      - name: Hook → outbox → drain → Postgres → MCP search → facts → recall_facts
         run: scripts/smoke-localhost.sh
 
   upgrade-docker:

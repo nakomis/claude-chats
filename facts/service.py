@@ -16,8 +16,10 @@ Meant to be fired by a systemd timer every ~15 minutes. Each run:
    An exchange whose extraction fails is left unprocessed and retried next run, up to
    FACTS_MAX_ATTEMPTS times; after that it is logged and skipped so one poison exchange
    cannot block its conversation.
-3. Embeds facts that have no vector yet, the way CM embeds messages (Ollama, mxbai-q8,
-   800 characters, truncate=true) and tags them in facts.embedder.
+3. Embeds facts that have no vector yet, the way CM embeds messages, and tags them in
+   facts.embedder. Distributed edition (FACTS_EMBEDDER=ollama, the default): Cal's
+   Ollama, mxbai-q8, 800 characters, truncate=true. Single machine (FACTS_EMBEDDER=hook):
+   hook.embed with the provider install.sh recorded, which is what embeds the queries.
 4. Prints one `facts-run {...}` JSON line of counts (exchanges, facts, errors, tokens).
 
 Configuration is environment only; see Config. Raw prompts and model replies are never
@@ -37,6 +39,12 @@ from facts.extract import ALREADY_EXTRACTED, EARLIER_MESSAGES, Extractor, is_sys
 from facts_eval.export import MAX_CHARS, split_exchanges
 
 DEFAULT_KEY_PARAM = "/conversation-memory/prod/facts/anthropic-api-key"
+PROVIDERS = ("anthropic", "claude-code", "bedrock", "off")
+EMBEDDERS = ("ollama", "hook")
+# Claude Haiku 5.5 on Bedrock is only reachable through an inference profile. The global
+# one works from any region; FACTS_MODEL=eu.anthropic.claude-haiku-5-5 (or us.) keeps the
+# request in one geography.
+BEDROCK_DEFAULT_MODEL = "global.anthropic.claude-haiku-5-5"
 LOCK_KEY = 0x66616374  # "fact": one service run at a time per database
 DEFAULT_KIND = "situation"  # for the rare fact the model gave no valid kind
 
@@ -65,7 +73,16 @@ class Config:
     api_timeout: float = 120.0         # seconds, per Anthropic request or claude -p run
     statement_timeout_ms: int = 60000  # per SQL statement
     model: str = ""                    # blank = the Extractor's default
-    provider: str = "anthropic"        # or "claude-code": `claude -p` on the user's own login (CHATS-39)
+    # anthropic: the API (the distributed service); claude-code: `claude -p` on the user's own
+    # login; bedrock: Haiku on Bedrock with the AWS credentials in the environment; off (CHATS-39).
+    provider: str = "anthropic"
+    # Conversations with unprocessed messages from this ISO time on go first, so a backfill of
+    # older history (FACTS_SINCE earlier than this) never holds up new conversations. Empty: oldest first.
+    priority_since: str = ""
+    effort: str = "low"                # "" or "none": send no effort (models that do not take one)
+    # ollama: POST {embed_url}/api/embed as Cal's consumer does (the distributed edition).
+    # hook: hook.embed with CLAUDE_CHATS_PROVIDER/MODEL, as the single-machine edition embeds queries.
+    embedder: str = "ollama"
 
     @classmethod
     def from_env(cls, env=None):
@@ -89,6 +106,9 @@ class Config:
             statement_timeout_ms=int(env.get("FACTS_STATEMENT_TIMEOUT_MS", d.statement_timeout_ms)),
             model=env.get("FACTS_MODEL", ""),
             provider=env.get("FACTS_PROVIDER", d.provider).strip() or d.provider,
+            effort=env.get("FACTS_EFFORT", d.effort).strip(),
+            priority_since=env.get("FACTS_PRIORITY_SINCE", "").strip(),
+            embedder=env.get("FACTS_EMBEDDER", d.embedder).strip() or d.embedder,
         )
 
 
@@ -104,6 +124,17 @@ def since_sql(cfg):
     except ValueError:
         raise ConfigError(f"FACTS_SINCE={cfg.since!r} is not an ISO date or time (or 'all')") from None
     return cfg.since
+
+
+def priority_sql(cfg):
+    """FACTS_PRIORITY_SINCE as the query takes it: '' = none. Raises ConfigError if unusable."""
+    if not cfg.priority_since:
+        return ""
+    try:
+        datetime.fromisoformat(cfg.priority_since)
+    except ValueError:
+        raise ConfigError(f"FACTS_PRIORITY_SINCE={cfg.priority_since!r} is not an ISO date or time") from None
+    return cfg.priority_since
 
 
 @dataclass
@@ -157,17 +188,52 @@ def anthropic_api_key(env=None, ssm_client=None):
 
 
 def make_extractor(cfg, env=None):
+    effort = None if cfg.effort.lower() in ("", "none") else cfg.effort
     if cfg.provider == "claude-code":
         from facts.claude_code import ClaudeCodeExtractor
 
         # No API key at all: the user's Claude Code login pays. api_timeout bounds each claude -p run.
-        return ClaudeCodeExtractor(timeout=cfg.api_timeout, env=env, **({"model": cfg.model} if cfg.model else {}))
+        return ClaudeCodeExtractor(timeout=cfg.api_timeout, env=env, effort=effort or "low",
+                                   **({"model": cfg.model} if cfg.model else {}))
+    if cfg.provider == "bedrock":
+        import anthropic
+
+        env = os.environ if env is None else env
+        # Credentials the AWS way (AWS_PROFILE, SSO, instance role ...); the region from the
+        # environment, else the profile's, else the SDK's default.
+        client = anthropic.AnthropicBedrock(
+            aws_profile=env.get("AWS_PROFILE") or None,
+            aws_region=env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or None,
+            max_retries=6, timeout=cfg.api_timeout)
+        return Extractor(client, model=cfg.model or BEDROCK_DEFAULT_MODEL, effort=effort)
     if cfg.provider != "anthropic":
-        raise ConfigError(f"FACTS_PROVIDER={cfg.provider!r}: want anthropic or claude-code")
+        raise ConfigError(f"FACTS_PROVIDER={cfg.provider!r}: want one of {', '.join(PROVIDERS)}")
     import anthropic
 
     client = anthropic.Anthropic(api_key=anthropic_api_key(env), max_retries=6, timeout=cfg.api_timeout)
-    return Extractor(client, **({"model": cfg.model} if cfg.model else {}))
+    return Extractor(client, effort=effort, **({"model": cfg.model} if cfg.model else {}))
+
+
+def make_hook_embedder(cfg, env=None):
+    """(cfg with its embedder tag, text -> vector) through hook.embed, as the single-machine edition
+    embeds messages and queries, so facts and the queries that search them share a vector space.
+
+    hook.embed reads CLAUDE_CHATS_PROVIDER / _MODEL / _DIMENSIONS when it is first imported,
+    so the environment must be complete before this is called.
+    """
+    from hook import embed as hook_embed
+
+    env = os.environ if env is None else env
+    if not env.get("FACTS_EMBED_TAG"):
+        cfg = replace(cfg, embed_tag=f"{hook_embed.PROVIDER}-{hook_embed.MODEL}")
+
+    def embed(text):
+        vec = hook_embed.get_embedding(text)
+        if len(vec) != cfg.embed_dims:
+            raise ValueError(f"embedding has {len(vec)} dimensions, expected {cfg.embed_dims}")
+        return vec
+
+    return cfg, embed
 
 
 def make_embedder(cfg):
@@ -207,9 +273,12 @@ def pending_conversations(conn, cfg):
                         WHERE m.conversation_id = c.id AND m.author IN ('martin', 'claude')
                           AND m.sequence_num > COALESCE(p.last_seq, -1)
                           AND m.created_at >= COALESCE(NULLIF(%(since)s, '')::timestamptz, '-infinity'))
-         ORDER BY c.started_at, c.id
+         ORDER BY EXISTS (SELECT 1 FROM messages m
+                           WHERE m.conversation_id = c.id AND m.sequence_num > COALESCE(p.last_seq, -1)
+                             AND m.created_at >= COALESCE(NULLIF(%(priority)s, '')::timestamptz, 'infinity')) DESC,
+                  c.started_at, c.id
         """,
-        {"idle": cfg.idle_minutes, "since": since_sql(cfg)},
+        {"idle": cfg.idle_minutes, "since": since_sql(cfg), "priority": priority_sql(cfg)},
     ).fetchall()
 
 
@@ -444,15 +513,23 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = Config.from_env()
+    if cfg.provider == "off":
+        log("facts extraction is off (FACTS_PROVIDER=off)")
+        return
     if not cfg.dsn:
         sys.exit("FACTS_DATABASE_URL (or CM_DATABASE_URL) is not set")
-    if not cfg.embed_url and not args.dry_run:
+    if cfg.embedder not in EMBEDDERS:
+        sys.exit(f"FACTS_EMBEDDER={cfg.embedder!r}: want one of {', '.join(EMBEDDERS)}")
+    if cfg.embedder == "ollama" and not cfg.embed_url and not args.dry_run:
         sys.exit("FACTS_EMBED_URL (or OLLAMA_BASE_URL) is not set")
     try:
         if not args.dry_run:
             since_sql(cfg)  # fail before paying for anything
         extractor = make_extractor(cfg)
-        embed = make_embedder(cfg) if cfg.embed_url else None
+        if cfg.embedder == "hook":
+            cfg, embed = make_hook_embedder(cfg)
+        else:
+            embed = make_embedder(cfg) if cfg.embed_url else None
         with connect(cfg) as conn:
             stats = run(conn, cfg, extractor, embed, args.limit, args.dry_run)
     except ConfigError as e:
