@@ -19,6 +19,9 @@ So this mirrors the split the codebase already uses for exactly this problem:
   * `flush-images` moves staged files to the share, and when that fails the
     staging directory simply grows and drains later.
 
+The single-machine edition (localhost/) never runs `flush-images`: it has no
+share, so there the staging directory is the archive.
+
 Identity is the sha256 of the DECODED bytes, which is also the join key used by
 the conversation-memory markers (HOME-315) and recorded in the sidecar. Dedupe
 is by hash, never by filename: the hook's wall-clock and the transcript's

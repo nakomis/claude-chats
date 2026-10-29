@@ -21,6 +21,14 @@ So capture and delivery are split, and only capture has to be reliable:
   * the forwarder owns everything that *can* fail, and when it does the outbox
     simply grows and drains later.
 
+The single-machine edition (localhost/) has no forwarder: `drain-outbox`
+(hook/drain.py) does its job on the same machine. So that a message is
+searchable within seconds rather than at the next timer tick, its installer
+sets CLAUDE_CHATS_DRAIN_AFTER_CAPTURE=1 on the hook command line, and the hook
+then starts a drain in the background after appending. It never waits for it,
+and nothing the drain does can fail the hook. The distributed edition leaves
+the variable unset and never drains locally.
+
 Always exits 0 so Claude is never blocked from stopping. Failures are reported
 on stderr and fall back to a plain append-only file, rather than being swallowed.
 """
@@ -33,6 +41,7 @@ import os
 import re
 import socket
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -62,6 +71,20 @@ def _default_host() -> str:
 
 
 HOST = os.environ.get("CLAUDE_CHATS_HOST") or _default_host()
+
+# Single-machine edition only: start drain-outbox after each capture. See the
+# module docstring.
+DRAIN_AFTER_CAPTURE = os.environ.get(
+    "CLAUDE_CHATS_DRAIN_AFTER_CAPTURE", ""
+).strip().lower() in ("1", "true", "yes", "on")
+# Where install.sh records the provider and database settings the drain needs.
+# The hook command line deliberately carries none of them (one may be an API
+# key, and settings.json is no place for that), so the drain reads them here.
+CONFIG_PATH = os.environ.get(
+    "CLAUDE_CHATS_CONFIG", os.path.join(os.path.dirname(OUTBOX_PATH), "config.env")
+)
+DRAIN_LOG_PATH = os.path.join(os.path.dirname(OUTBOX_PATH), "drain.log")
+DRAIN_LOG_MAX_BYTES = 1_000_000
 
 # Schema shared with the Rust forwarder (mac/conversation-memory-forwarder in
 # nakomis/home-infra). Whichever process opens the file first creates it, so
@@ -448,7 +471,7 @@ def _write_fallback(records: list[dict], reason: str) -> None:
 
     A plain append to a text file has fewer moving parts than anything else we
     could reach for, so it is what stands between a broken outbox and a lost
-    conversation. Recover with scripts/replay-fallback.py.
+    conversation. Recover with `replay-fallback` (hook/replay_fallback.py).
     """
     path = FALLBACK_PATH
     try:
@@ -652,6 +675,43 @@ def _carry_titles(
     )
 
 
+def _start_drain() -> None:
+    """Start drain-outbox detached, and return at once.
+
+    Its own session, so it outlives the hook and is not caught by anything sent
+    to the hook's process group; and its output goes to a file, never to the
+    hook's stdout or stderr, because Claude Code waits for those pipes to close
+    and would wait for the drain too. Concurrent drains are the drain's problem
+    (it takes a lock), not this function's.
+    """
+    try:
+        os.makedirs(os.path.dirname(DRAIN_LOG_PATH), exist_ok=True)
+        try:
+            # One line per run that did anything; roll it over rather than let
+            # it grow for ever.
+            if os.path.getsize(DRAIN_LOG_PATH) > DRAIN_LOG_MAX_BYTES:
+                os.replace(DRAIN_LOG_PATH, DRAIN_LOG_PATH + ".1")
+        except OSError:
+            pass
+        cmd = [sys.executable, "-m", "hook.drain"]
+        if os.path.exists(CONFIG_PATH):
+            cmd += ["--env-file", CONFIG_PATH]
+        with open(DRAIN_LOG_PATH, "a") as log:
+            subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                cwd=os.path.dirname(DRAIN_LOG_PATH),
+                start_new_session=True,
+                close_fds=True,
+            )
+    except Exception as exc:
+        # The message is already safe in the outbox; the timer will drain it.
+        print(f"claude-chats: could not start a drain ({exc}); "
+              "the scheduled one will pick the message up", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -722,6 +782,9 @@ def main() -> None:
         # design exists to remove — but still exit 0, because blocking Claude
         # from stopping would be a worse outcome than a delayed message.
         _write_fallback(records, str(exc))
+    else:
+        if DRAIN_AFTER_CAPTURE:
+            _start_drain()
 
     sys.exit(0)
 
