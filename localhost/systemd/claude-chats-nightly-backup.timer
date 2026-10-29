@@ -1,0 +1,14 @@
+# Runs claude-chats-nightly-backup.service at 03:30 every night. Persistent=true
+# runs a night that was missed (the machine was off or asleep) as soon as the
+# timer is next active, so a laptop still gets its backup. The drain and facts
+# timers use OnActiveSec instead because they repeat every few minutes; a
+# nightly wants a time of day.
+[Unit]
+Description=Back up the claude-chats database nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

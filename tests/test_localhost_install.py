@@ -278,9 +278,59 @@ def test_uninstall_removes_ours_and_keeps_the_rest(sandbox):
 
 def test_backup_and_restore_use_the_shared_scripts():
     text = INSTALL.read_text()
-    assert '"${ROOT_DIR}/scripts/backup.sh" --local' in text
+    assert 'exec "${ROOT_DIR}/scripts/backup.sh" ${EXTRA_ARG:+"$EXTRA_ARG"}' in text
     assert '"${ROOT_DIR}/scripts/restore.sh" --local' in text
     assert not (ROOT / "localhost" / "scripts").exists()
+
+
+BACKUP_PLIST = "com.nakomis.claude-chats-nightly-backup.plist"
+
+
+def test_the_nightly_backup_is_scheduled_on_macos(sandbox):
+    """CHATS-41: the single-machine edition backs itself up every night."""
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox))
+    dest = home / "Library" / "LaunchAgents" / BACKUP_PLIST
+    plist = plistlib.loads(dest.read_bytes())
+    assert plist["Label"] == "com.nakomis.claude-chats-nightly-backup"
+    assert plist["ProgramArguments"] == ["/bin/bash", str(ROOT / "scripts" / "backup.sh")]
+    assert plist["StartCalendarInterval"] == {"Hour": 3, "Minute": 30}
+    assert f"launchctl bootstrap gui/{os.getuid()} {dest}" in _calls(sandbox, "launchctl")
+    # Never the retired agent's label, which backup.sh refuses to run beside.
+    assert not (home / "Library" / "LaunchAgents" / "com.nakomis.claude-chats-backup.plist").exists()
+
+
+def test_the_nightly_backup_timer_on_linux(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox, uname="Linux"))
+    units = home / ".config" / "systemd" / "user"
+    service = (units / "claude-chats-nightly-backup.service").read_text()
+    assert f'ExecStart=/bin/bash "{ROOT / "scripts" / "backup.sh"}"' in service
+    timer = (units / "claude-chats-nightly-backup.timer").read_text()
+    assert "OnCalendar=*-*-* 03:30:00" in timer and "Persistent=true" in timer
+    assert "systemctl --user enable --now claude-chats-nightly-backup.timer" in _calls(sandbox, "systemctl")
+
+
+def test_uninstall_removes_the_backup_schedule_but_not_the_backups(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox))
+    backups = home / ".claude-chats" / "backups" / "archive"
+    backups.mkdir(parents=True)
+    assert _run(sandbox, "--uninstall").returncode == 0
+    assert not (home / "Library" / "LaunchAgents" / BACKUP_PLIST).exists()
+    assert backups.exists()
+
+
+def test_the_retired_backup_agent_is_pointed_out(sandbox):
+    _, home, _ = sandbox
+    agents = home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    (agents / "com.nakomis.claude-chats-backup.plist").write_text("<old/>")
+    result = _run(sandbox)
+    _assert_installed(sandbox, result)
+    assert "retired Mac-to-S3 backup agent" in result.stdout + result.stderr
+    # Pointed out, not removed: it is not this installer's to remove.
+    assert (agents / "com.nakomis.claude-chats-backup.plist").exists()
 
 
 def test_everything_written_stays_inside_home(sandbox):

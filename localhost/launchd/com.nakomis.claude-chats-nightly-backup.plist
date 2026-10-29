@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    The nightly backup (CHATS-41): scripts/backup.sh archives each newly
+    complete month once into ~/.claude-chats/backups/archive/ (never pruned)
+    and writes a dump of everything not yet archived to
+    ~/.claude-chats/backups/nightly/ (the newest 14 kept). Restore with
+    install.sh's restore option.
+
+    Not com.nakomis.claude-chats-backup: that was the retired Mac-to-S3 agent,
+    and backup.sh refuses to run while its plist is still installed.
+
+    A calendar time rather than an interval: launchd runs a StartCalendarInterval
+    job missed while the Mac was asleep as soon as it wakes. Docker must be
+    running for it; a run that finds the container stopped fails and says so
+    in the log, and the next night's run covers the gap (the dump is of the
+    whole unarchived window, not of one day).
+
+    REPO_PATH is substituted at install time by install.sh.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nakomis.claude-chats-nightly-backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPO_PATH/scripts/backup.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-chats-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-chats-backup.log</string>
+</dict>
+</plist>

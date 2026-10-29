@@ -1,157 +1,122 @@
 #!/usr/bin/env bash
-# Dump the claude_chats database, excluding the embedding vectors.
+# Back up the claude_chats database to local disk: the single-machine
+# edition's nightly (CHATS-41), scheduled by localhost/install.sh.
 #
-# Usage: scripts/backup.sh [--s3 | --local [file-or-directory]]
+# Usage: scripts/backup.sh [DIR]
 #
-#   --s3     (default) upload the dump to s3://$CLAUDE_CHATS_BACKUP_BUCKET/$CLAUDE_CHATS_BACKUP_PREFIX/
-#            using the $BACKUP_AWS_PROFILE profile. The default because the
-#            installed com.nakomis.claude-chats-backup LaunchAgents run this
-#            script with no arguments, and must keep backing up offsite.
-#   --local  write the dump to disk, default ~/.claude-chats/backups/, and
-#            keep only the newest $CLAUDE_CHATS_BACKUP_KEEP (default 14)
-#            claude_chats_*.sql.gz there. The single-machine edition's
-#            `install.sh --backup` always passes this. A bare path with no
-#            flag also means --local.
+# DIR (default $CLAUDE_CHATS_BACKUP_DIR, else ~/.claude-chats/backups) gets:
 #
-# CLAUDE_CHATS_BACKUP_DEST=local|s3 overrides the default when no flag is given.
+#   archive/messages/  one file per complete month, written once by
+#                      convmem-archive.sh and never pruned
+#   nightly/           claude_chats_<timestamp>.sql.gz: the schema, every
+#                      other table whole (conversations, Claude Facts), and
+#                      the messages not yet archived; the newest
+#                      $CLAUDE_CHATS_BACKUP_KEEP (default 14) are kept
 #
-# Safe to run while the database is live — pg_dump takes a consistent snapshot.
-# Dumps *through the container* (docker exec): the host need not have a
-# Postgres client at all, only the image does.
+# Restore with scripts/restore.sh (or ./install.sh --restore): the newest
+# nightly plus every archived month before its cutoff.
+#
+# This is the same monthly-archive scheme Luke runs (HOME-458), from the same
+# scripts/convmem-archive.sh, pointed at a directory instead of S3. Luke's
+# nightly wrapper lives in home-infra, because its alerting is Luke's own.
+#
+# Embedding vectors are included, as on Luke: a restore is then minutes, not
+# the hours a re-embed of every message would take. Through `docker exec`
+# into claude-chats-db, so the host needs no Postgres client.
 set -euo pipefail
 
-DEST="${CLAUDE_CHATS_BACKUP_DEST:-s3}"
-DEST_ARG=""
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OLD_AGENT="${HOME}/Library/LaunchAgents/com.nakomis.claude-chats-backup.plist"
+
+die() { echo "[backup] ERROR: $*" >&2; exit 1; }
+say() { echo "[backup] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+
+# The Mac-to-S3 LaunchAgent (scripts/setup-backup.sh, retired in CHATS-41) ran
+# `backup.sh --s3` every night. Luke backs conversation-memory up offsite now,
+# so that path is gone, but a machine still carrying the agent should hear
+# about it rather than quietly stop backing up: refuse, say why, and on a Mac
+# put it in Notification Centre too, since the agent's log is rarely read.
+retired() {
+    local msg="$1"
+    echo "[backup] REFUSED: ${msg}" >&2
+    if [[ "$(uname -s)" == "Darwin" && "${CLAUDE_CHATS_BACKUP_NOTIFY:-1}" != 0 ]] \
+            && command -v osascript >/dev/null; then
+        osascript -e "display notification \"${msg//\"/}\" with title \"claude-chats backup\"" \
+            >/dev/null 2>&1 || true
+    fi
+    exit 3
+}
+old_agent_message="the com.nakomis.claude-chats-backup LaunchAgent (Mac to S3) is retired: \
+Luke backs conversation-memory up offsite now. Remove it with \
+'launchctl bootout gui/\$(id -u)/com.nakomis.claude-chats-backup; rm ${OLD_AGENT}'. \
+The single-machine edition's own nightly is installed by localhost/install.sh."
+
+DIR="${CLAUDE_CHATS_BACKUP_DIR:-${HOME}/.claude-chats/backups}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --local) DEST="local"; shift
-                 if [[ $# -gt 0 && "$1" != --* ]]; then DEST_ARG="$1"; shift; fi ;;
-        --s3)    DEST="s3"; shift ;;
-        -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        --*)     echo "[backup] unknown option '$1'" >&2; exit 2 ;;
-        *)       DEST="local"; DEST_ARG="$1"; shift ;;   # a bare path, as install.sh used to pass
+        --s3)      retired "$old_agent_message" ;;
+        --local)   shift ;;   # what install.sh passed before CHATS-41; local is all there is
+        -h|--help) sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --*)       die "unknown option '$1'" ;;
+        *)         DIR="$1"; shift ;;
     esac
 done
-[[ "$DEST" == "local" || "$DEST" == "s3" ]] || {
-    echo "[backup] CLAUDE_CHATS_BACKUP_DEST must be 'local' or 's3' (got '$DEST')" >&2; exit 2; }
+[[ -f "$OLD_AGENT" ]] && retired "$old_agent_message"
+[[ "$DIR" == *.sql.gz ]] && die "give a directory, not a file: backups are a directory of months and nightlies now"
 
-CONTAINER="${CLAUDE_CHATS_CONTAINER:-claude-chats-db}"
 KEEP="${CLAUDE_CHATS_BACKUP_KEEP:-14}"
-[[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || { echo "[backup] CLAUDE_CHATS_BACKUP_KEEP must be a positive integer" >&2; exit 2; }
-DB_NAME="claude_chats"
-DB_USER="claude"
+[[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || die "CLAUDE_CHATS_BACKUP_KEEP must be a positive integer"
 
-BUCKET="${CLAUDE_CHATS_BACKUP_BUCKET:-nakomis-taiga-backups}"
-PREFIX="${CLAUDE_CHATS_BACKUP_PREFIX:-conversation-memory}"
-BACKUP_AWS_PROFILE="${BACKUP_AWS_PROFILE:-claude-chats-backup}"
-REGION="${CLAUDE_CHATS_BACKUP_REGION:-eu-west-2}"
+# launchd and systemd run this with a minimal PATH, which lacks Docker's
+# usual homes on a Mac.
+export PATH="${PATH}:/usr/local/bin:/opt/homebrew/bin:${HOME}/.docker/bin"
 
-# launchd runs this with a minimal PATH that lacks Homebrew and Docker's
-# binaries, so fall back to where they usually live rather than failing.
-DOCKER="$(command -v docker || echo /usr/local/bin/docker)"
-AWS="$(command -v aws || echo /opt/homebrew/bin/aws)"
+export CONVMEM_TARGET=local
+export CONVMEM_ARCHIVE_DIR="${DIR%/}/archive"
+ARCHIVER="${SCRIPTS}/convmem-archive.sh"
+NIGHTLY_DIR="${DIR%/}/nightly"
+mkdir -p "$NIGHTLY_DIR" "$CONVMEM_ARCHIVE_DIR"
 
-TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-FILENAME="claude_chats_${TIMESTAMP}.sql.gz"
+# The nightly is written beside its final name and renamed into place only
+# once it has passed every check, so a failed run never leaves a dump that
+# looks finished.
+OUT="${NIGHTLY_DIR}/claude_chats_$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+PART="${OUT}.partial"
+trap 'rm -f "$PART"' EXIT
 
-PRUNE_DIR=""
-if [[ "$DEST" == "local" ]]; then
-    DEST_ARG="${DEST_ARG:-${HOME}/.claude-chats/backups}"
-    if [[ -d "$DEST_ARG" || "$DEST_ARG" != *.sql.gz ]]; then
-        mkdir -p "$DEST_ARG"
-        OUTFILE="${DEST_ARG%/}/${FILENAME}"
-        # Only a directory of our own timestamped dumps is pruned; a dump
-        # written to a named file is the caller's to keep.
-        PRUNE_DIR="${DEST_ARG%/}"
-    else
-        mkdir -p "$(dirname "$DEST_ARG")"
-        OUTFILE="$DEST_ARG"
+say "starting conversation-memory backup to ${DIR}"
+
+# Archive newly complete months first, so the nightly is as small as the archive
+# allows. Not fatal, exactly as on Luke: a failed archive leaves the cutoff
+# where it was and the nightly below covers more, never less.
+if ! "$ARCHIVER" archive; then
+    echo "[backup] WARNING: archiving old months failed; this nightly covers from $("$ARCHIVER" cutoff 2>/dev/null || echo "an unknown cutoff")" >&2
+fi
+
+EXPECTED_ROWS="$("$ARCHIVER" expect)"
+say "window holds ${EXPECTED_ROWS} messages"
+
+"$ARCHIVER" dump | gzip >"$PART"
+
+# A partial stream still compresses; the floor is per row, as on Luke, because
+# the window is a few rows on the 1st of the month and a month's worth by the
+# 31st. A truncated gzip is the case no floor can see.
+SIZE="$(wc -c <"$PART" | tr -d ' ')"
+FLOOR=$((EXPECTED_ROWS * ${CONVMEM_MIN_BYTES_PER_ROW:-1024}))
+[[ "$SIZE" -ge "$FLOOR" ]] \
+    || die "the dump is only ${SIZE} bytes for ${EXPECTED_ROWS} messages (floor ${FLOOR}): treating it as failed"
+gzip -t "$PART" || die "the dump is not a complete gzip stream"
+mv -f "$PART" "$OUT"
+
+# Newest first by name (the timestamp sorts), so the one just written is always
+# kept. No mapfile: macOS ships bash 3.2.
+n=0
+while IFS= read -r old; do
+    n=$((n + 1))
+    if [[ $n -gt $KEEP ]]; then
+        rm -f -- "$old"
+        say "pruned $(basename "$old") (keeping the newest ${KEEP})"
     fi
-else
-    # macOS mktemp requires X's at the end — use a tmp dir, then name the file inside it
-    TMPDIR_BACKUP="$(mktemp -d /tmp/claude-chats-backup-XXXXXX)"
-    trap 'rm -rf "$TMPDIR_BACKUP"' EXIT
-    OUTFILE="${TMPDIR_BACKUP}/${FILENAME}"
-fi
+done < <(ls -1 "$NIGHTLY_DIR"/claude_chats_*.sql.gz 2>/dev/null | sort -r)
 
-# Fail early rather than writing or uploading an empty or partial dump.
-if ! "$DOCKER" ps --filter "name=^/${CONTAINER}$" --filter "status=running" \
-        --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-    echo "[backup] ERROR: container '$CONTAINER' is not running — aborting" >&2
-    exit 1
-fi
-
-# The messages.embedding column is deliberately excluded. The vectors are
-# incompressible floats that dominate the dump (~144 MB of ~210 MB when this
-# was measured), and they are fully regenerable from message content —
-# restore.sh repopulates them via backfill-embeddings and rebuilds the ivfflat
-# index. pg_dump cannot exclude a single column, so we:
-#   1. dump schema + all data EXCEPT the messages rows (and the regenerable
-#      bakeoff tables, which are normally absent — the excludes are no-ops then);
-#   2. append the messages rows via an explicit column list.
-# The appended COPY lands after pg_dump's CREATE INDEX statements, so a plain
-# `psql < dump` restores cleanly with embeddings left NULL, ready for backfill.
-#
-# The column list is read from the database rather than written out, so a
-# column added to init.sql is carried without anyone remembering to add it here
-# (a fixed list once silently dropped author, tool_name and model). Left out:
-#   * embedding, for the reason above;
-#   * generated columns (content_tsv), which are recomputed on insert;
-#   * embedder, embedder_board, embedder_fw, which describe the vector — the
-#     restore's backfill makes a new one, and a tag left behind would claim it
-#     came from wherever the old one did.
-MSG_COLS="$("$DOCKER" exec "$CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -At -c "
-    SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position)
-    FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'messages'
-      AND is_generated = 'NEVER'
-      AND column_name NOT IN ('embedding', 'embedder', 'embedder_board', 'embedder_fw')")"
-[[ -n "$MSG_COLS" ]] || { echo "[backup] ERROR: could not read the messages columns" >&2; exit 1; }
-
-echo "[backup] dumping ${DB_NAME} (via ${CONTAINER}, embedding vectors excluded) → ${OUTFILE}"
-{
-    "$DOCKER" exec "$CONTAINER" pg_dump -U "$DB_USER" "$DB_NAME" \
-        --exclude-table='message_embeddings' \
-        --exclude-table='embedding_perf' \
-        --exclude-table-data='messages'
-    printf '\n--\n-- messages data (embedding column excluded; repopulated by backfill-embeddings)\n--\n'
-    printf 'COPY public.messages (%s) FROM stdin;\n' "$MSG_COLS"
-    "$DOCKER" exec "$CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -q \
-        -c "COPY (SELECT ${MSG_COLS} FROM messages) TO STDOUT"
-    printf '\\.\n'
-} | gzip -9 > "$OUTFILE"
-
-# Sanity check: a valid gzipped SQL dump is never this small.
-BYTES="$(wc -c < "$OUTFILE" | tr -d ' ')"
-if [[ "$BYTES" -lt 1000 ]]; then
-    echo "[backup] ERROR: dump is only ${BYTES} bytes — likely failed, discarding" >&2
-    rm -f "$OUTFILE"
-    exit 1
-fi
-SIZE="$(du -h "$OUTFILE" | cut -f1)"
-
-if [[ "$DEST" == "local" ]]; then
-    echo "[backup] done: ${OUTFILE} (${SIZE})"
-    if [[ -n "$PRUNE_DIR" ]]; then
-        # Newest first by name (the timestamp sorts), so the one just written
-        # is always kept. No mapfile/xargs -d: macOS ships bash 3.2 and BSD xargs.
-        n=0
-        while IFS= read -r old; do
-            n=$((n + 1))
-            if [[ $n -gt $KEEP ]]; then
-                rm -f -- "$old"
-                echo "[backup] pruned $(basename "$old") (keeping the newest ${KEEP})"
-            fi
-        done < <(ls -1 "$PRUNE_DIR"/claude_chats_*.sql.gz 2>/dev/null | sort -r)
-    fi
-    exit 0
-fi
-
-S3_KEY="${PREFIX}/${FILENAME}"
-echo "[backup] uploading → s3://${BUCKET}/${S3_KEY}"
-"$AWS" s3 cp "$OUTFILE" "s3://${BUCKET}/${S3_KEY}" \
-    --profile "$BACKUP_AWS_PROFILE" \
-    --region "$REGION" \
-    --no-progress
-
-echo "[backup] done: s3://${BUCKET}/${S3_KEY} (${SIZE})"
+say "backup finished: ${OUT} (${SIZE} bytes); $(ls -1 "${CONVMEM_ARCHIVE_DIR}/messages" 2>/dev/null | wc -l | tr -d ' ') archived month(s)"

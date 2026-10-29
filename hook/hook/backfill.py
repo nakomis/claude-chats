@@ -1,9 +1,9 @@
 """
 Backfill embeddings for messages that have none.
 
-Used after restoring a backup produced *without* the embedding column
-(see scripts/backup.sh, which excludes the ~144 MB of incompressible vectors
-to keep dumps small). Re-embeds every message whose embedding IS NULL using the
+Used after restoring a backup produced *without* the embedding column (local
+dumps from before CHATS-41 excluded the vectors; backups now carry them, so
+scripts/restore.sh runs this only when rows lack one). Re-embeds every message whose embedding IS NULL using the
 same provider/model as the live hook (hook.embed — Ollama / mxbai-embed-large by
 default), then rebuilds the ivfflat index so its centroids are trained on the
 full, populated vector set rather than an empty table.

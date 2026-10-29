@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# A stand-in for `docker` that runs the backup scripts' `docker exec` against a
+# Postgres reached over TCP instead of inside a container: the client tool
+# named after the container is run from $STUB_PG_BIN (or PATH), with the
+# in-container socket (`-h /var/run/postgresql`) replaced by PGHOST/PGPORT.
+#
+# For running tests/test_convmem_backup.py on a machine without Docker. CI uses
+# the real `docker exec` into the pgvector service container instead.
+#
+#   STUB_PG_HOST, STUB_PG_PORT   where the server listens
+#   STUB_PG_BIN                  directory of psql/pg_dump matching the server
+#   STUB_CONTAINER               the name `docker ps` reports (default claude-chats-db)
+set -euo pipefail
+
+case "${1:-}" in
+    ps)
+        echo "${STUB_CONTAINER:-claude-chats-db}"
+        ;;
+    exec)
+        shift
+        [ "${1:-}" = "-i" ] && shift
+        shift   # the container
+        tool="$1"; shift
+        args=()
+        while [ $# -gt 0 ]; do
+            if [ "$1" = "-h" ] && [ "${2:-}" = "/var/run/postgresql" ]; then
+                shift 2
+                continue
+            fi
+            args+=("$1"); shift
+        done
+        export PGHOST="${STUB_PG_HOST:-localhost}" PGPORT="${STUB_PG_PORT:-5432}"
+        exec "${STUB_PG_BIN:+${STUB_PG_BIN}/}${tool}" ${args[@]+"${args[@]}"}
+        ;;
+    *)
+        echo "docker-pg-stub: unsupported: $*" >&2
+        exit 2
+        ;;
+esac
