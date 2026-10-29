@@ -59,10 +59,17 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # tests/test_localhost_upgrade.py installs the single-machine edition
+          # from an old commit, then upgrades it.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - uses: astral-sh/setup-uv@v6
+      - name: Install the Postgres client
+        if: matrix.suite == 'root'
+        run: sudo apt-get update -q && sudo apt-get install -y -q postgresql-client
       # One suite per job, and pytest without xdist: no parallel workers.
       # -rs lists every skip with its reason; a database test skipping here,
       # where the DSNs are set, means the gate is broken, so it fails the job.
@@ -109,8 +116,10 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q postgresql-client
       - name: Shell scripts parse
         run: |
-          bash -n localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/smoke-localhost.sh
-          shellcheck -S error localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/smoke-localhost.sh
+          bash -n localhost/install.sh scripts/backup.sh scripts/restore.sh scripts/smoke-localhost.sh \
+              scripts/upgrade-check-localhost.sh
+          shellcheck -S error localhost/install.sh scripts/backup.sh scripts/restore.sh \
+              scripts/smoke-localhost.sh scripts/upgrade-check-localhost.sh
       - name: The systemd units are valid
         run: |
           mkdir -p /tmp/units
@@ -129,3 +138,20 @@ jobs:
           uv sync --locked --project mcp
       - name: Hook → outbox → drain → Postgres → MCP search
         run: scripts/smoke-localhost.sh
+
+  upgrade-docker:
+    name: Single-machine upgrade (Docker Compose)
+    runs-on: ubuntu-latest
+    # The root suite runs tests/test_localhost_upgrade.py against the service
+    # container; this runs it again with both installers' real `docker compose`
+    # and container, unmodified (CHATS-37).
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Old install, used, then upgraded in place
+        run: scripts/upgrade-check-localhost.sh
