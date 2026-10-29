@@ -595,11 +595,13 @@ def _append_to_outbox(
     session_id: str,
     name: str | None,
     ai_title: str | None = None,
-) -> None:
+) -> bool:
+    """Append new rows and carry titles; True if the outbox changed at all."""
     conn = sqlite3.connect(OUTBOX_PATH, timeout=10)
     try:
         conn.executescript(SCHEMA)
         _migrate(conn)
+        before = conn.total_changes
         with conn:
             # INSERT OR IGNORE against the UNIQUE message_uuid is what makes
             # this safe to run on every Stop: the hook re-reads the entire
@@ -621,6 +623,9 @@ def _append_to_outbox(
             )
             if name or ai_title:
                 _carry_titles(conn, records, session_id, name, ai_title)
+        # INSERT OR IGNORE counts only the rows it inserted, so a re-read
+        # transcript with nothing new reports no change.
+        return conn.total_changes > before
     finally:
         conn.close()
 
@@ -776,14 +781,16 @@ def main() -> None:
 
     try:
         os.makedirs(os.path.dirname(OUTBOX_PATH), exist_ok=True)
-        _append_to_outbox(records, session_id, name, ai_title)
+        changed = _append_to_outbox(records, session_id, name, ai_title)
     except Exception as exc:
         # Never swallow this. A silent failure here is exactly the bug this
         # design exists to remove — but still exit 0, because blocking Claude
         # from stopping would be a worse outcome than a delayed message.
         _write_fallback(records, str(exc))
     else:
-        if DRAIN_AFTER_CAPTURE:
+        # Only when there is something to deliver: the hook runs on every
+        # prompt, and most re-reads of the transcript find nothing new.
+        if DRAIN_AFTER_CAPTURE and changed:
             _start_drain()
 
     sys.exit(0)

@@ -97,6 +97,17 @@ def test_starts_a_detached_drain_after_appending(hook_env, monkeypatch):
     conn.close()
 
 
+def test_no_drain_when_the_transcript_had_nothing_new(hook_env, monkeypatch):
+    """The hook re-reads the whole transcript on every prompt."""
+    _, started = hook_env
+    monkeypatch.setattr(rec, "DRAIN_AFTER_CAPTURE", True)
+    _run()
+    assert len(started) == 1
+    monkeypatch.setattr(sys, "stdin", _Stdin(_payload(hook_env[0])))
+    _run()
+    assert len(started) == 1
+
+
 def test_no_env_file_argument_when_there_is_no_config(hook_env, monkeypatch):
     _, started = hook_env
     monkeypatch.setattr(rec, "DRAIN_AFTER_CAPTURE", True)
