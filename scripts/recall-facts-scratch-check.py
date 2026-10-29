@@ -67,7 +67,7 @@ def main() -> int:
               file=sys.stderr)
         return 2
     from conversation_memory_mcp import server
-    from conversation_memory_mcp.embed import get_embedding
+    from hook.embed import get_embedding  # the MCP project depends on hook/
 
     scratch = "recall_scratch_" + uuid.uuid4().hex[:12]
     assert scratch != "claude_chats"

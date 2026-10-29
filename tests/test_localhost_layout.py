@@ -54,3 +54,18 @@ def test_install_sh_uses_the_shared_packages():
     assert 'MCP_DIR="${ROOT_DIR}/mcp"' in text
     assert "${ROOT_DIR}/init.sql" in text
     assert os.access(LOCALHOST / "install.sh", os.X_OK)
+
+
+def test_nothing_imports_the_deleted_copies():
+    """conversation_memory_mcp.embed and localhost/{hook,mcp,scripts} are gone."""
+    stale = ("conversation_memory_mcp.embed", "conversation_memory_mcp import embed")
+    hits = []
+    for p in ROOT.rglob("*.py"):
+        rel = p.relative_to(ROOT)
+        if {".venv", ".git", ".claude", "node_modules"} & set(rel.parts):
+            continue
+        if rel == Path(__file__).relative_to(ROOT):
+            continue
+        text = p.read_text(errors="replace")
+        hits += [f"{rel}: {s}" for s in stale if s in text]
+    assert hits == []
