@@ -1,0 +1,13 @@
+{
+ "sessions": [
+  {
+   "session_id": "example",
+   "name": "Example: cats and the catcam",
+   "facts": {
+    "X1": "Kappa is the son of Tau (mother) and Chi (father), and has Chi's long fluffy fur.",
+    "X2": "Kappa likes to sleep on the radiator next to Tau.",
+    "X3": "Wolf, a grey and white stuffed toy used for testing, is on the catcam's ignore list so it no longer triggers the sprayer."
+   }
+  }
+ ]
+}

@@ -72,6 +72,8 @@ The `server/` directory — the ActiveMQ container, the Node STOMP worker, `serv
 | `mcp/` | The MCP server — hybrid search, transcript retrieval, session listing |
 | `init.sql` | Source of truth for the Postgres schema |
 | `scripts/` | Backup/restore, LaunchAgent setup, embedding evaluation harnesses, and `cjump` (jump to a past conversation: raise its Terminal window, or `claude --resume` it) |
+| `facts/` | Claude Facts: durable facts extracted from each exchange by Claude Haiku (CHATS-21). **Apache-2.0**, adapted from Mem0 |
+| `facts_eval/` | Scores a fact extractor (Mem0, or our own) against a hand-checked reference set: [one command](facts_eval/README.md) (CHATS-22) |
 | `localhost/` | The self-contained [single-machine edition](localhost/README.md) |
 | `docs/architecture/` | The diagram above, as `.drawio` source and exported SVG |
 | `server/` | **Superseded** — the previous ActiveMQ/worker design, kept for reference |
@@ -128,13 +130,60 @@ How many of the ivfflat index's 100 lists a vector search visits (default `20`, 
 
 ## MCP tools
 
-Once installed, three tools are available inside Claude Code:
+Once installed, these tools are available inside Claude Code:
 
 | Tool | Description |
 |---|---|
 | `search_memory` | Hybrid semantic + full-text search across all recorded messages, fused with Reciprocal Rank Fusion. Returns the most relevant excerpts with surrounding context. Also accepts `mode` (`hybrid` / `semantic` / `fulltext`) and `since` (how far back to look — default the last 3 months; see below). |
 | `get_conversation` | Fetch the full transcript for a session by ID. Supports pagination via `start_seq` / `end_seq`. |
 | `list_recent_sessions` | List recent sessions, newest first. Optionally filter by project path. |
+| `recall_facts` | Recall durable facts ("Mace has 32 GB of RAM") extracted from conversations, rather than the conversations themselves. Hybrid vector + full-text search fused with RRF, then weighted by age; no LLM call. Filters: `since`, `host`, `project_path`, `kind`, `limit`, `include_history`. See below. |
+
+### Recalling facts
+
+`recall_facts` searches the `facts` table (CHATS-21) the same way `search_memory`
+searches messages: the query is embedded locally and fused with a full-text match
+by Reciprocal Rank Fusion. (The full-text half uses `websearch_to_tsquery`, so
+every term must match; a natural-language question is carried by the vector half.)
+The fused relevance is then multiplied by
+`2^(-age / half_life)`, with age counted from the fact's `last_confirmed`, so a
+fact someone keeps relying on stays fresh.
+
+| kind | half-life |
+|---|---|
+| `identity` | 10 years |
+| `config` | 9 months |
+| `situation` | 2 weeks |
+| `event` | never decays |
+
+The values live in `FACT_HALF_LIFE_DAYS` in `server.py`, the one place to
+replace them with learned ones. Soft-deleted facts are never returned;
+superseded ones (`valid_to` set) only with `include_history=True`, which also
+shows what replaced them.
+
+Each result carries the text, kind, subject, attribute, an age phrase (`stated
+27 Sep 2026, confirmed 3 Oct 2026`), the still-true probability as a percentage
+(the decay factor; 0 once superseded), `labels`, and where it came from:
+`session_id` plus `first_seq` / `last_seq`, which go straight into
+`get_conversation`'s `start_seq` / `end_seq`, or a `source` path for facts mined
+from docs and playbooks. A temporary fact shows its `expected_until`, and is
+labelled **possibly resolved** once that date has passed with nothing
+superseding it.
+
+`since` takes the same forms as in `search_memory` and applies to
+`last_confirmed`, but defaults to `all`: decay already discounts old facts, and
+an identity fact may be years old. `project_path` matches the fact's
+conversation, so docs and playbook facts never match it.
+
+Set `CLAUDE_CHATS_READ_DB_URL` to read facts from a different database, such as
+the read replica (CHATS-29). Unset, or the replica failing in any way
+(unreachable within three seconds, a query over five seconds, missing tables), the
+whole query is retried on `CLAUDE_CHATS_DB_URL`; the result's `read_from` says which one
+answered. Only `recall_facts` uses it.
+
+`scripts/recall-facts-scratch-check.py` exercises the tool end to end against a
+throwaway database on the server its admin DSN points at (applies `init.sql`,
+inserts sample facts, drops the database again).
 
 ### The `since` window
 
@@ -198,6 +247,12 @@ Note: HyDE is most beneficial when using a model with a long context window. Wit
 ```bash
 ollama pull nomic-embed-text
 ```
+
+## Licence
+
+CC0 (see [`LICENSE`](LICENSE)), **except [`facts/`](facts/)**, which is Apache-2.0:
+its extraction prompt is adapted from [Mem0](https://github.com/mem0ai/mem0), and
+the folder carries Mem0's licence.
 
 ## Support
 

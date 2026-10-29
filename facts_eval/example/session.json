@@ -1,0 +1,10 @@
+{
+ "_comment": "A made-up session in the shape CM stores: (author, content) rows in sequence order. Used by the tests and as a format example.",
+ "messages": [
+  ["martin", "Kappa has been sleeping on the radiator next to Tau all day. Can you remind me which of them is his mum?"],
+  ["claude", "Tau is Kappa's mother and Chi is his father. Kappa took after Chi with the long, fluffy fur."],
+  ["tool", "this is tool output and must never reach the extractor"],
+  ["martin", "Right. And I want the catcam to ignore Wolf from now on, he's only the stuffed test cat."],
+  ["claude", "Done: Wolf is now on the catcam's ignore list, so detections of the grey and white toy no longer trigger the sprayer."]
+ ]
+}
