@@ -7,12 +7,17 @@
 # hook's `record-conversation` on a fixture transcript under a throwaway HOME
 # (set up as localhost/install.sh would leave it, with the drain-after-capture
 # switch on), runs `drain-outbox` as the timer would, checks the rows in
-# Postgres, then asks the MCP server's search_memory to find them. Embeddings
+# Postgres, then asks the MCP server's search_memory to find them, and its
+# recall_facts to find a fact seeded from that conversation. Embeddings
 # come from a fake Ollama (hook/tests/support.py), so no model and no network.
 # The scratch database is dropped at the end, pass or fail.
 #
 # CI runs this against a pgvector service container. Needs uv and psql.
 set -euo pipefail
+
+# Nothing from the caller's shell decides which provider, database or replica
+# the hook, the drain and the MCP server use: only what this script sets.
+while IFS= read -r var; do unset "$var"; done < <(compgen -e | grep '^CLAUDE_CHATS_' | grep -v '^CLAUDE_CHATS_TEST_ADMIN_DSN$')
 
 : "${CLAUDE_CHATS_TEST_ADMIN_DSN:?set it to a Postgres (with pgvector) where the role can CREATE DATABASE}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -106,6 +111,36 @@ out = search_memory("descale espresso machine", since="all")
 print(out["status"], [(r["session_id"], r["name"]) for r in out["results"]])
 assert out["results"] and out["results"][0]["session_id"] == "smoke-session", out
 assert out["results"][0]["name"] == "Espresso descaling", out
+'
+
+step "Recalling a seeded fact through the MCP server (one database, no replica)"
+# Facts are written by extraction (CHATS-39); until then the table is empty on a
+# single machine, so this seeds one, from the conversation captured above, the
+# way the extractor would. The MCP server is started without
+# CLAUDE_CHATS_READ_DB_URL, as install.sh registers it.
+CLAUDE_CHATS_DB_URL="$DSN" OLLAMA_BASE_URL="$OLLAMA_URL" \
+    uv run --project "${ROOT}/mcp" python -c '
+import os
+import psycopg
+from hook.embed import get_embedding
+from conversation_memory_mcp.server import READ_DB_URL, recall_facts
+assert READ_DB_URL is None, READ_DB_URL
+text = "The workshop espresso machine is descaled with citric acid"
+vec = "[" + ",".join(map(str, get_embedding(text))) + "]"
+with psycopg.connect(os.environ["CLAUDE_CHATS_DB_URL"], autocommit=True) as conn:
+    conn.execute(
+        "INSERT INTO facts (text, kind, subject, attribute, observed_at, last_confirmed, "
+        "conversation_id, first_seq, last_seq, host, extractor, embedding) "
+        "SELECT %s, %s, %s, %s, now(), now(), id, 0, 1, host, %s, %s::vector "
+        "FROM conversations WHERE session_id = %s",
+        (text, "config", "espresso machine", "descaling", "smoke", vec, "smoke-session"))
+# "garage" is in no fact and full-text needs every word: only the vector
+# half can find it, so this proves the embedded fact is searchable.
+out = recall_facts("how is the espresso machine descaled in the garage")
+print(out["status"], out["read_from"], [r["text"] for r in out["results"]])
+assert out["read_from"] == "primary", out
+assert out["results"] and out["results"][0]["text"] == text, out
+assert out["results"][0]["source"]["session_id"] == "smoke-session", out
 '
 
 echo

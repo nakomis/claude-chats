@@ -91,6 +91,36 @@ docker exec claude-chats-db psql -U claude -d claude_chats \
 Then ask Claude to search its memory — it should call `search_memory` and find
 the message you just sent.
 
+## Claude Facts (`recall_facts`)
+
+`recall_facts` answers "what is X?" questions from standalone facts rather than
+whole conversations: "the workshop lathe is a Myford ML7", each with the date
+it was stated and the date it was last confirmed. It searches them by meaning
+and by words, and discounts old ones at a rate that depends on the kind of fact.
+For the conversation a fact came from, use `get_conversation`.
+
+The `facts`, `fact_events` and `facts_progress` tables come from `../init.sql`,
+so every install and upgrade has them. Facts are written by extraction, which a
+model does by reading your conversations. The installer does not set that up
+yet (CHATS-39), so the table stays empty and `recall_facts` returns
+`no_results` until it does. That is expected, not a fault. The extractor can
+be run by hand meanwhile (see [`../facts/README.md`](../facts/README.md)); if
+you do, have it embed facts with the same model as your messages, or the
+vector half of `recall_facts` will not line up with your queries.
+
+On a single machine it reads the one local database. The distributed edition
+can point it at a read replica with `CLAUDE_CHATS_READ_DB_URL`; the installer
+never sets that here, and with it unset every read goes to the primary
+(`read_from: "primary"` in the result). Don't export it in your shell either:
+Claude Code passes its own environment on to MCP servers.
+
+To see how many facts you have:
+
+```bash
+docker exec claude-chats-db psql -U claude -d claude_chats \
+  -c 'SELECT kind, count(*) FROM facts WHERE deleted_at IS NULL GROUP BY kind'
+```
+
 ## Maintenance
 
 All of it hangs off the same script:
