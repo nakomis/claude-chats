@@ -151,6 +151,23 @@ def test_single_machine_settings_fill_in_but_never_override():
     assert env["FACTS_PROVIDER"] == "claude-code" and env["FACTS_DATABASE_URL"] == "postgresql://one/db"
     assert env["FACTS_EMBEDDER"] == "hook" and env["FACTS_EMBED_DIMS"] == "768"
     assert env["FACTS_PRIORITY_SINCE"] == "2026-10-29T11:00:00+00:00"
+    assert env["FACTS_SINCE_SCOPE"] == "conversation"
+    assert service.Config.from_env({}).since_scope == "message"  # Mace: unchanged
+    with pytest.raises(service.ConfigError):
+        service.since_sql(service.Config(since="all", since_scope="session"))
+
+
+def test_the_recorded_claude_and_its_directory_are_used(tmp_path, capsys):
+    claude = tmp_path / "nvm" / "bin" / "claude"
+    claude.parent.mkdir(parents=True)
+    claude.write_text("#!/usr/bin/env node\n")
+    claude.chmod(0o755)
+    env = {"FACTS_CLAUDE_BIN": str(claude), "PATH": "/usr/bin:/bin"}
+    single_machine.claude_bin(env)
+    assert env["PATH"] == f"{claude.parent}:/usr/bin:/bin"  # so its `node` is found
+    env = {"FACTS_CLAUDE_BIN": str(tmp_path / "gone"), "PATH": "/usr/bin"}
+    single_machine.claude_bin(env)
+    assert "FACTS_CLAUDE_BIN" not in env and "is gone" in capsys.readouterr().err
 
 
 def test_one_run_at_a_time(tmp_path):

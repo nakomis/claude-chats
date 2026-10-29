@@ -113,7 +113,11 @@ default `/conversation-memory/prod/facts/anthropic-api-key`), `FACTS_EMBED_URL`
 `FACTS_MAX_SYSTEMIC_ERRORS` (3), `FACTS_API_TIMEOUT_SECONDS` (120),
 `FACTS_STATEMENT_TIMEOUT_MS` (60000), `FACTS_MODEL`, `FACTS_PROVIDER` (above;
 with `claude-code` no API key is used), `FACTS_EFFORT` (`low`), `FACTS_EMBEDDER`
-(`ollama`; `hook` needs no `FACTS_EMBED_URL`) and `FACTS_PRIORITY_SINCE`.
+(`ollama`; `hook` needs no `FACTS_EMBED_URL`), `FACTS_PRIORITY_SINCE` and
+`FACTS_SINCE_SCOPE` (`message`: `FACTS_SINCE` filters messages by time;
+`conversation`, as the single machine sets it: it selects whole conversations by
+when they started, so moving it earlier for a backfill never leaves a
+conversation read from the middle).
 
 **`FACTS_SINCE` is required for a real run.** It is an ISO date or time; messages
 before it are ignored. An empty or missing value is an error (the run refuses

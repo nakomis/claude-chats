@@ -22,7 +22,8 @@ CODE_SUFFIXES = {".py", ".sql"}
 def test_no_python_or_sql_under_localhost():
     found = sorted(
         str(p.relative_to(ROOT)) for p in LOCALHOST.rglob("*")
-        if p.is_file() and p.suffix in CODE_SUFFIXES
+        # uv's environments (localhost/facts/.venv on any install) hold other people's code.
+        if p.is_file() and p.suffix in CODE_SUFFIXES and ".venv" not in p.relative_to(LOCALHOST).parts
     )
     assert found == [], (
         "localhost/ must not carry code of its own; use ../hook, ../mcp and "

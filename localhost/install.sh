@@ -322,11 +322,16 @@ remove_schedule() {
     remove_one_schedule "$FACTS_LABEL" "$FACTS_UNIT"
 }
 
-# Is `claude` logged in to an account (not just holding an API key)? The key is
-# removed first, as the extractor removes it from every claude -p it starts.
+# Is `claude` logged in to an account (not just holding an API key)? Asked the
+# way the facts schedule will run it: no API key (the extractor removes it), and
+# the near-empty environment of launchd or systemd, with only claude's own
+# directory added to the PATH (which is what facts.single_machine does), so a
+# claude that needs `node` from beside it is caught here rather than every 15
+# minutes in a log.
 claude_logged_in() {
     local status
-    status="$(env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$1" auth status --json 2>/dev/null)" || return 1
+    status="$(env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" \
+        PATH="$(dirname "$1"):/usr/bin:/bin:/usr/sbin:/sbin" "$1" auth status --json 2>/dev/null)" || return 1
     python3 -c 'import json, sys; sys.exit(0 if json.loads(sys.argv[1]).get("loggedIn") is True else 1)' \
         "$status" 2>/dev/null
 }
@@ -362,7 +367,7 @@ while [[ $# -gt 0 ]]; do
         --facts-backfill)  ACTION="facts-backfill"; shift ;;
         --facts-backfill-stop) ACTION="facts-backfill-stop"; shift ;;
         --since)           BACKFILL_SINCE="${2:-}"; [[ -n "$BACKFILL_SINCE" ]] || die "--since needs a date (YYYY-MM-DD)."; shift 2 ;;
-        --since=*)         BACKFILL_SINCE="${1#*=}"; shift ;;
+        --since=*)         BACKFILL_SINCE="${1#*=}"; [[ -n "$BACKFILL_SINCE" ]] || die "--since needs a date (YYYY-MM-DD)."; shift ;;
         -h|--help)         usage; exit 0 ;;
         *)                 die "Unknown argument '$1'. Try --help." ;;
     esac
@@ -374,6 +379,9 @@ done
 
 if [[ "$ACTION" == "install" || "$ACTION" == "uninstall" ]]; then
     check_settings
+fi
+if [[ -n "$BACKFILL_SINCE" && "$ACTION" != "facts-backfill" ]]; then
+    die "--since only goes with --facts-backfill."
 fi
 
 case "$ACTION" in
@@ -498,7 +506,11 @@ FACTS_PROVIDER="$FACTS_PROVIDER_REQUESTED"
 FACTS_MAX_EXCHANGES="${FACTS_MAX_EXCHANGES:-$(config_get FACTS_MAX_EXCHANGES)}"
 FACTS_MAX_EXCHANGES="${FACTS_MAX_EXCHANGES:-$DEFAULT_FACTS_MAX_EXCHANGES}"
 [[ "$FACTS_MAX_EXCHANGES" =~ ^[1-9][0-9]*$ ]] || die "FACTS_MAX_EXCHANGES must be a whole number above 0."
-FACTS_MODEL="${FACTS_MODEL:-$(config_get FACTS_MODEL)}"
+# A remembered model only belongs to the provider it was given for: a Bedrock
+# inference profile passed to `claude --model` would fail every run.
+if [[ -z "${FACTS_MODEL:-}" && "$(config_get FACTS_PROVIDER_REQUESTED)" == "$FACTS_PROVIDER_REQUESTED" ]]; then
+    FACTS_MODEL="$(config_get FACTS_MODEL)"
+fi
 # Never from the environment: FACTS_SINCE is set once, when facts are first
 # installed, and afterwards only by --facts-backfill / --facts-backfill-stop.
 FACTS_INSTALLED_AT="$(config_get FACTS_INSTALLED_AT)"
@@ -590,7 +602,8 @@ case "$FACTS_PROVIDER" in
         if claude_logged_in "$FACTS_CLAUDE_BIN"; then
             ok "Claude Facts: claude-code (your Claude Code login)"
         else
-            facts_off "\`claude auth status\` says Claude Code is not logged in to an account.
+            facts_off "\`claude auth status\` says Claude Code is not logged in to an account (or it
+   cannot run from a scheduled job's environment).
    Log in (run \`claude\`, then /login), then re-run ./install.sh to turn it on."
         fi
         ;;

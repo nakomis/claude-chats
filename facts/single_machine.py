@@ -27,12 +27,32 @@ def single_machine_env(env):
     if env.get("CLAUDE_CHATS_DB_URL"):
         env.setdefault("FACTS_DATABASE_URL", env["CLAUDE_CHATS_DB_URL"])
     env.setdefault("FACTS_EMBEDDER", "hook")
+    # Whole conversations, by when they started: a conversation going on at install time is
+    # left for a backfill, which then reads it from the start rather than from the middle.
+    env.setdefault("FACTS_SINCE_SCOPE", "conversation")
     # New conversations before any backfilled history (./install.sh --facts-backfill).
     if env.get("FACTS_INSTALLED_AT"):
         env.setdefault("FACTS_PRIORITY_SINCE", env["FACTS_INSTALLED_AT"])
     if env.get("CLAUDE_CHATS_DIMENSIONS"):
         env.setdefault("FACTS_EMBED_DIMS", env["CLAUDE_CHATS_DIMENSIONS"])
     return env
+
+
+def claude_bin(env):
+    """Make the recorded `claude` runnable from launchd's or systemd's bare environment.
+
+    Its own directory goes on the PATH, because an npm-installed claude is a script that
+    runs `node` from beside it. If the recorded path has gone (claude reinstalled
+    elsewhere), fall back to whatever `claude` the PATH finds.
+    """
+    recorded = env.get("FACTS_CLAUDE_BIN")
+    if not recorded:
+        return
+    if os.access(recorded, os.X_OK):
+        env["PATH"] = os.pathsep.join(p for p in (os.path.dirname(recorded), env.get("PATH")) if p)
+    else:
+        print(f"claude-chats facts: {recorded} is gone; trying claude on the PATH", file=sys.stderr)
+        del env["FACTS_CLAUDE_BIN"]
 
 
 def take_lock(path):
@@ -64,6 +84,7 @@ def main(argv=None):
     except OSError as e:
         sys.exit(f"claude-chats facts: cannot read {args.env_file} ({e})")
     env = single_machine_env(os.environ)
+    claude_bin(env)
     if env["FACTS_PROVIDER"] == "off":
         print("claude-chats facts: extraction is off (FACTS_PROVIDER=off in the config)", file=sys.stderr)
         return

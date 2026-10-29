@@ -79,6 +79,10 @@ class Config:
     # Conversations with unprocessed messages from this ISO time on go first, so a backfill of
     # older history (FACTS_SINCE earlier than this) never holds up new conversations. Empty: oldest first.
     priority_since: str = ""
+    # message (default): FACTS_SINCE filters messages by time. conversation: it selects whole
+    # conversations by when they started, read from their first message (the single machine), so
+    # a later, earlier FACTS_SINCE (a backfill) never finds a conversation half-read.
+    since_scope: str = "message"
     effort: str = "low"                # "" or "none": send no effort (models that do not take one)
     # ollama: POST {embed_url}/api/embed as Cal's consumer does (the distributed edition).
     # hook: hook.embed with CLAUDE_CHATS_PROVIDER/MODEL, as the single-machine edition embeds queries.
@@ -108,6 +112,7 @@ class Config:
             provider=env.get("FACTS_PROVIDER", d.provider).strip() or d.provider,
             effort=env.get("FACTS_EFFORT", d.effort).strip(),
             priority_since=env.get("FACTS_PRIORITY_SINCE", "").strip(),
+            since_scope=env.get("FACTS_SINCE_SCOPE", "message").strip() or "message",
             embedder=env.get("FACTS_EMBEDDER", d.embedder).strip() or d.embedder,
         )
 
@@ -117,6 +122,8 @@ def since_sql(cfg):
     if not cfg.since:
         raise ConfigError("FACTS_SINCE is not set. Give an ISO date or time (messages before it are ignored), "
                           "or FACTS_SINCE=all to process the whole history deliberately.")
+    if cfg.since_scope not in ("message", "conversation"):
+        raise ConfigError(f"FACTS_SINCE_SCOPE={cfg.since_scope!r}: want message or conversation")
     if cfg.since.lower() == "all":
         return ""
     try:
@@ -272,13 +279,18 @@ def pending_conversations(conn, cfg):
          WHERE EXISTS (SELECT 1 FROM messages m
                         WHERE m.conversation_id = c.id AND m.author IN ('martin', 'claude')
                           AND m.sequence_num > COALESCE(p.last_seq, -1)
-                          AND m.created_at >= COALESCE(NULLIF(%(since)s, '')::timestamptz, '-infinity'))
-         ORDER BY EXISTS (SELECT 1 FROM messages m
-                           WHERE m.conversation_id = c.id AND m.sequence_num > COALESCE(p.last_seq, -1)
-                             AND m.created_at >= COALESCE(NULLIF(%(priority)s, '')::timestamptz, 'infinity')) DESC,
+                          AND (%(by_conv)s OR m.created_at >= COALESCE(NULLIF(%(since)s, '')::timestamptz, '-infinity')))
+           AND (NOT %(by_conv)s OR c.started_at >= COALESCE(NULLIF(%(since)s, '')::timestamptz, '-infinity'))
+         ORDER BY CASE WHEN %(priority)s = '' THEN false
+                       WHEN %(by_conv)s THEN c.started_at >= NULLIF(%(priority)s, '')::timestamptz
+                       ELSE EXISTS (SELECT 1 FROM messages m
+                                     WHERE m.conversation_id = c.id AND m.author IN ('martin', 'claude')
+                                       AND m.sequence_num > COALESCE(p.last_seq, -1)
+                                       AND m.created_at >= NULLIF(%(priority)s, '')::timestamptz) END DESC,
                   c.started_at, c.id
         """,
-        {"idle": cfg.idle_minutes, "since": since_sql(cfg), "priority": priority_sql(cfg)},
+        {"idle": cfg.idle_minutes, "since": since_sql(cfg), "priority": priority_sql(cfg),
+         "by_conv": cfg.since_scope == "conversation"},
     ).fetchall()
 
 
@@ -287,10 +299,10 @@ def pending_exchanges(conn, cfg, conv_id, last_seq):
         """
         SELECT author, content, created_at, sequence_num FROM messages
          WHERE conversation_id = %(c)s AND author IN ('martin', 'claude') AND sequence_num > %(seq)s
-           AND created_at >= COALESCE(NULLIF(%(since)s, '')::timestamptz, '-infinity')
+           AND (%(by_conv)s OR created_at >= COALESCE(NULLIF(%(since)s, '')::timestamptz, '-infinity'))
          ORDER BY sequence_num
         """,
-        {"c": conv_id, "seq": last_seq, "since": since_sql(cfg)},
+        {"c": conv_id, "seq": last_seq, "since": since_sql(cfg), "by_conv": cfg.since_scope == "conversation"},
     ).fetchall()
     return split_exchanges(rows)
 

@@ -122,7 +122,7 @@ Chosen when you install, like the embedding provider, and remembered in
 
 | `FACTS_PROVIDER` | Needs | Costs |
 |---|---|---|
-| `claude-code` (default) | Claude Code, logged in to your account (`claude auth status`) | Nothing extra: it uses your Claude subscription's usage allowance |
+| `claude-code` (default) | Claude Code, logged in to your account (`claude auth status`) | No extra money: it uses your Claude subscription's usage allowance and rate limits (see below) |
 | `anthropic` | `ANTHROPIC_API_KEY` | Haiku API pricing, billed to that key |
 | `bedrock` | AWS credentials (`AWS_PROFILE`, `AWS_REGION`), and access to Claude Haiku in your Bedrock account | Bedrock's Haiku pricing, billed to your AWS account |
 | `off` | | Nothing; `recall_facts` finds nothing |
@@ -145,6 +145,8 @@ The default, `global.anthropic.claude-haiku-5-5`, works from any region; to keep
 requests within one geography, set `FACTS_MODEL=eu.anthropic.claude-haiku-5-5`
 (or `us.`) when you install. Your account needs access to the model: a
 `403 ... is not available for this account` in the facts log means it does not.
+For a model that takes no effort setting (Haiku 4.5, say), add `FACTS_EFFORT=none`.
+A model you set belongs to that provider: switching provider drops it.
 
 There is no Ollama option. Extraction is a harder task than embedding, and in a
 comparison on 28 Oct 2026 local 7–8B models found 73% of the facts in a
@@ -173,10 +175,14 @@ and use the `anthropic` or `bedrock` provider if they do not suit.
 
 ### Older history (backfill)
 
-Only conversations from the moment facts were first installed are read. That
+Only conversations started after facts were first installed are read. That
 moment is recorded as `FACTS_INSTALLED_AT` (and `FACTS_SINCE`) in `config.env`
 and is kept on every re-run, so upgrading never starts reading your whole
-history. To extract from older conversations too:
+history. A conversation that was already going at that moment is left for a
+backfill even if you carry on with it, so that when it is read, it is read from
+its first message rather than from the middle. Turning facts off and on again
+keeps the starting point: conversations from while they were off are read when
+they come back on. To extract from older conversations too:
 
 ```bash
 ./install.sh --facts-backfill                    # all of it

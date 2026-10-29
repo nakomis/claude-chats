@@ -463,3 +463,23 @@ def test_new_conversations_go_before_a_backfill(conn):
     cfg = service.Config(embed_url="x", since="all", priority_since=(T0 + timedelta(minutes=300)).isoformat())
     service.run(conn, cfg, ex, fake_embed, limit=1)
     assert [c.messages[0]["content"] for c in ex.calls] == ["new m1"]
+
+
+@needs_db
+def test_a_conversation_scoped_since_reads_whole_conversations(conn):
+    """The single machine (FACTS_SINCE_SCOPE=conversation): a conversation going on at install
+    time is left alone, and a backfill later reads it from its first message, not its middle."""
+    seed(conn, "straddles", [("martin", "before m1", 0), ("claude", "before c1", 1),
+                             ("martin", "after m2", 120), ("claude", "after c2", 121), ("martin", "after m3", 125)])
+    install = (T0 + timedelta(minutes=60)).isoformat()
+    ex = FakeExtractor()
+    service.run(conn, service.Config(embed_url="x", since=install, since_scope="conversation"), ex, fake_embed)
+    assert ex.calls == []
+    # The message-scoped default would have started in the middle.
+    ex = FakeExtractor()
+    service.run(conn, service.Config(embed_url="x", since=install), ex, fake_embed, dry_run=True, out=lambda *_: None)
+    assert [c.messages[0]["content"] for c in ex.calls] == ["after m2"]
+
+    ex = FakeExtractor()  # --facts-backfill: everything
+    service.run(conn, service.Config(embed_url="x", since="all", since_scope="conversation"), ex, fake_embed)
+    assert [c.messages[0]["content"] for c in ex.calls] == ["before m1", "after m2"]

@@ -45,13 +45,20 @@ fi""",
     # Claims the model is present, so nothing is "pulled".
     "ollama": '[[ "$1" == list ]] && echo "mxbai-embed-large:latest  abc  669 MB"',
     "uname": 'echo "$FAKE_UNAME"; exit 0',
-    # `claude auth status --json`: logged in unless the test says otherwise. Records
-    # whether it could see an API key, which install.sh must hide from it.
-    "claude": """if [[ "$1 $2" == "auth status" ]]; then
-  echo "key=${ANTHROPIC_API_KEY:-none}" >> "$STUB_DIR/auth-env"
-  echo "{\\"loggedIn\\": ${FAKE_CLAUDE_LOGGED_IN:-true}}"
-fi""",
 }
+
+# install.sh asks `claude auth status --json` from a launchd-like empty environment,
+# so this stub finds its directory from its own path, not STUB_DIR. Logged in unless
+# the test wrote "false" to claude-logged-in; records what environment it saw.
+CLAUDE_STUB = """#!/bin/bash
+dir="$(cd "$(dirname "$0")/.." && pwd)"
+echo "claude $*" >> "$dir/calls.log"
+if [[ "$1 $2" == "auth status" ]]; then
+  echo "key=${ANTHROPIC_API_KEY:-none} path=$PATH stub_dir=${STUB_DIR:-none}" >> "$dir/auth-env"
+  echo "{\\"loggedIn\\": $(cat "$dir/claude-logged-in" 2>/dev/null || echo true)}"
+fi
+exit 0
+"""
 
 
 @pytest.fixture
@@ -65,6 +72,8 @@ def sandbox(tmp_path):
         body = STUB_BODIES.get(name, "")
         if name == "uname":
             f.write_text(f"#!/bin/bash\n{body}\n")
+        elif name == "claude":
+            f.write_text(CLAUDE_STUB)
         else:
             f.write_text(STUB.format(name=name, body=body))
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
@@ -73,8 +82,9 @@ def sandbox(tmp_path):
     return tmp_path, home, bindir
 
 
-def _run(sandbox, *args, uname="Darwin", extra_env=None):
+def _run(sandbox, *args, uname="Darwin", extra_env=None, logged_in=True):
     tmp_path, home, bindir = sandbox
+    (tmp_path / "claude-logged-in").write_text("true" if logged_in else "false")
     env = {
         "HOME": str(home),
         "PATH": f"{bindir}:/usr/bin:/bin",
@@ -279,7 +289,8 @@ def test_everything_written_stays_inside_home(sandbox):
     assert _run(sandbox).returncode == 0
     written = {p for p in set(tmp_path.rglob("*")) - before}
     outside = sorted(str(p) for p in written
-                     if home not in p.parents and p.name not in ("calls.log", "applied.sql", "applies", "auth-env"))
+                     if home not in p.parents and p.name not in ("calls.log", "applied.sql", "applies", "auth-env",
+                                                              "claude-logged-in"))
     assert outside == []
 
 
@@ -370,7 +381,9 @@ def test_facts_default_to_the_claude_code_login_on_macos(sandbox):
     datetime.fromisoformat(config["FACTS_SINCE"])
     # The key in the shell is not written down, and the login check never saw it.
     assert "ANTHROPIC_API_KEY" not in config
-    assert (sandbox[0] / "auth-env").read_text().splitlines() == ["key=none"]
+    # …and was asked as the schedule will run it: nothing of this shell's environment.
+    (seen,) = (sandbox[0] / "auth-env").read_text().splitlines()
+    assert seen == f"key=none path={bindir}:/usr/bin:/bin:/usr/sbin:/sbin stub_dir=none"
 
     plist = plistlib.loads((home / "Library" / "LaunchAgents" / FACTS_PLIST).read_bytes())
     assert plist["ProgramArguments"] == [
@@ -402,7 +415,7 @@ def test_facts_timer_on_linux(sandbox):
 
 def test_not_logged_in_turns_facts_off_and_a_later_run_turns_them_on(sandbox):
     _, home, _ = sandbox
-    result = _run(sandbox, extra_env={"FAKE_CLAUDE_LOGGED_IN": "false"})
+    result = _run(sandbox, logged_in=False)
     _assert_installed(sandbox, result)  # the install itself goes ahead
     assert "Claude Facts is off" in result.stdout and "not logged in" in result.stdout
     config = _config(home)
@@ -512,3 +525,20 @@ def test_uninstall_removes_the_facts_schedule(sandbox):
     _assert_installed(sandbox, _run(sandbox))
     assert _run(sandbox, "--uninstall").returncode == 0
     assert not (home / "Library" / "LaunchAgents" / FACTS_PLIST).exists()
+
+
+def test_a_remembered_model_does_not_follow_a_change_of_provider(sandbox):
+    _, home, _ = sandbox
+    _assert_installed(sandbox, _run(sandbox, extra_env={
+        "FACTS_PROVIDER": "bedrock", "AWS_PROFILE": "facts", "FACTS_MODEL": "eu.anthropic.claude-haiku-5-5"}))
+    _assert_installed(sandbox, _run(sandbox))
+    assert _config(home)["FACTS_MODEL"] == "eu.anthropic.claude-haiku-5-5"  # same provider: kept
+    _assert_installed(sandbox, _run(sandbox, extra_env={"FACTS_PROVIDER": "claude-code"}))
+    assert "FACTS_MODEL" not in _config(home)
+
+
+def test_since_only_goes_with_a_backfill(sandbox):
+    _assert_installed(sandbox, _run(sandbox))
+    for args in (["--since", "2026-01-01"], ["--facts-backfill", "--since="]):
+        result = _run(sandbox, *args)
+        assert result.returncode != 0, args

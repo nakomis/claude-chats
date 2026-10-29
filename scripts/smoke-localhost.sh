@@ -87,7 +87,7 @@ chmod +x "${WORK}/bin/claude"
 
 cat > "${STATE}/config.env" <<EOF
 CLAUDE_CHATS_PROVIDER=ollama
-CLAUDE_CHATS_MODEL=mxbai-embed-large
+CLAUDE_CHATS_MODEL=smoke-embedder
 CLAUDE_CHATS_DB_URL=${DSN}
 OLLAMA_BASE_URL=${OLLAMA_URL}
 FACTS_PROVIDER=claude-code
@@ -152,8 +152,9 @@ done
 if grep -q -- "--bare" "${WORK}/claude.log"; then echo "claude -p was run with --bare" >&2; exit 1; fi
 psql "$DSN" -c "SELECT text, kind, embedder, embedding IS NOT NULL AS embedded, extractor FROM facts"
 FACT="$(psql "$DSN" -At -c "SELECT embedder || '|' || (embedding IS NOT NULL) FROM facts")"
-[[ "$FACT" == "ollama-mxbai-embed-large|true" ]] \
-    || { echo "expected one fact, embedded by the hook's provider; got ${FACT}" >&2; exit 1; }
+# Not hook.embed's default model: proves the facts run embedded with config.env's.
+[[ "$FACT" == "ollama-smoke-embedder|true" ]] \
+    || { echo "expected one fact, embedded by config.env's provider and model; got ${FACT}" >&2; exit 1; }
 DONE="$(psql "$DSN" -At -c "SELECT p.last_seq FROM facts_progress p
     JOIN conversations c ON c.id = p.conversation_id WHERE c.session_id = 'smoke-session'")"
 [[ -n "$DONE" ]] || { echo "facts_progress did not advance" >&2; exit 1; }
