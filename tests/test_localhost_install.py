@@ -34,7 +34,13 @@ exit 0
 """
 STUB_BODIES = {
     # `docker exec -i … psql` is the schema being applied: keep what it was fed.
-    "docker": '[[ "$1 $2" == "exec -i" ]] && cat > "$STUB_DIR/applied.sql"',
+    "docker": """if [[ "$1 $2" == "exec -i" ]]; then
+  cat > "$STUB_DIR/applied.sql"
+  echo apply >> "$STUB_DIR/applies"
+  if [[ -n "${APPLY_FAILS:-}" && $(wc -l < "$STUB_DIR/applies") -le ${APPLY_FAILS} ]]; then
+    echo "ERROR:  ${APPLY_ERROR:-canceling statement due to lock timeout}" >&2; exit 3
+  fi
+fi""",
     # Claims the model is present, so nothing is "pulled".
     "ollama": '[[ "$1" == list ]] && echo "mxbai-embed-large:latest  abc  669 MB"',
     "uname": 'echo "$FAKE_UNAME"; exit 0',
@@ -134,7 +140,9 @@ def _assert_installed(sandbox, result):
         assert len(ours) == 1, (event, commands[event])
         words = shlex.split(ours[0])
         assert words[0] == "CLAUDE_CHATS_DRAIN_AFTER_CAPTURE=1"
-        assert words[1:] == ["uv", "run", "--project", str(ROOT / "hook"), "record-conversation"]
+        # Optionally SSL_CERT_FILE, the one setting the hook process itself uses.
+        words = [w for w in words[1:] if not w.startswith("SSL_CERT_FILE=")]
+        assert words == ["uv", "run", "--project", str(ROOT / "hook"), "record-conversation"]
 
     flat = json.dumps(_settings(home))
     for stale in ("localhost/hook", "CAPTURE_MODE", "CLAUDE_CHATS_DB_URL"):
@@ -251,5 +259,63 @@ def test_everything_written_stays_inside_home(sandbox):
     assert _run(sandbox).returncode == 0
     written = {p for p in set(tmp_path.rglob("*")) - before}
     outside = sorted(str(p) for p in written
-                     if home not in p.parents and p.name not in ("calls.log", "applied.sql"))
+                     if home not in p.parents and p.name not in ("calls.log", "applied.sql", "applies"))
     assert outside == []
+
+
+def test_invalid_settings_json_changes_nothing(sandbox):
+    _, home, _ = sandbox
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text('{"hooks": {,}')
+    result = _run(sandbox)
+    assert result.returncode != 0
+    assert "not valid JSON" in result.stderr
+    assert (home / ".claude" / "settings.json").read_text() == '{"hooks": {,}'
+    assert _calls(sandbox, "claude") == [] and _calls(sandbox, "docker") == []
+    assert not (home / ".claude-chats").exists()
+
+
+def test_settings_keep_shared_groups_unicode_and_indentation(sandbox):
+    _, home, _ = sandbox
+    (home / ".claude").mkdir()
+    original = json.dumps({
+        "statusLine": "café ✓",
+        "hooks": {"Stop": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "echo mine"},
+            {"type": "command", "command": OLD_HOOK},
+        ]}]},
+    }, indent=4, ensure_ascii=False) + "\n"
+    (home / ".claude" / "settings.json").write_text(original, encoding="utf-8")
+
+    _assert_installed(sandbox, _run(sandbox))
+    text = (home / ".claude" / "settings.json").read_text(encoding="utf-8")
+    assert "café ✓" in text
+    assert '\n    "hooks": {' in text  # still four-space indented
+    stop = json.loads(text)["hooks"]["Stop"]
+    assert stop[0]["hooks"] == [{"type": "command", "command": "echo mine"}]
+    assert (home / ".claude" / "settings.json.bak").read_text(encoding="utf-8") == original
+
+
+def test_config_is_private_even_when_it_was_not(sandbox):
+    _, home, _ = sandbox
+    state = home / ".claude-chats"
+    state.mkdir()
+    (state / "config.env").write_text("CLAUDE_CHATS_PROVIDER=ollama\n")
+    (state / "config.env").chmod(0o644)
+    _assert_installed(sandbox, _run(sandbox))  # asserts mode 600
+    assert not list(state.glob("config.env.tmp*"))
+
+
+def test_bedrock_and_tls_settings_survive_a_re_run(sandbox):
+    _, home, _ = sandbox
+    first = _run(sandbox, extra_env={
+        "CLAUDE_CHATS_PROVIDER": "bedrock", "AWS_PROFILE": "convmem",
+        "AWS_REGION": "eu-west-2", "SSL_CERT_FILE": "/etc/ssl/house.pem"})
+    _assert_installed(sandbox, first)
+    _assert_installed(sandbox, _run(sandbox))  # nothing in the environment this time
+    config = (home / ".claude-chats" / "config.env").read_text()
+    for line in ("CLAUDE_CHATS_PROVIDER=bedrock", "AWS_PROFILE=convmem",
+                 "AWS_REGION=eu-west-2", "SSL_CERT_FILE=/etc/ssl/house.pem"):
+        assert line in config
+    add = [c for c in _calls(sandbox, "claude") if c.startswith("claude mcp add")][-1]
+    assert "AWS_PROFILE=convmem" in add and "SSL_CERT_FILE=/etc/ssl/house.pem" in add

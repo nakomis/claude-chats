@@ -98,6 +98,12 @@ config_get() {
 
 write_config() {
     mkdir -p "$STATE_DIR"
+    local tmp="${CONFIG_FILE}.tmp.$$"
+    # umask first, and a new file renamed into place: it may hold an API key,
+    # and neither a fresh file nor a truncated old one should be readable by
+    # anyone else, even for the moment before a chmod.
+    (
+    umask 077
     {
         echo "# Written by claude-chats localhost/install.sh — edit via a re-run."
         echo "CLAUDE_CHATS_PROVIDER=${PROVIDER}"
@@ -110,14 +116,17 @@ write_config() {
             bedrock)
                 [[ -n "${AWS_PROFILE:-}" ]] && echo "AWS_PROFILE=${AWS_PROFILE}"
                 [[ -n "${AWS_REGION:-}"  ]] && echo "AWS_REGION=${AWS_REGION}"
+                [[ -n "${AWS_DEFAULT_REGION:-}" ]] && echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}"
                 ;;
         esac
         [[ -n "${SSL_CERT_FILE:-}" ]] && echo "SSL_CERT_FILE=${SSL_CERT_FILE}"
         # The guarded echo above is the last command in this block; without a
         # trailing success `set -e` would abort here whenever it is skipped.
         true
-    } > "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"   # it may hold an API key
+    } > "$tmp"
+    )
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
 }
 
 # The recorded configuration as KEY=VALUE words for `env`, leaving out anything
@@ -142,26 +151,50 @@ run_hook_cmd() {
     env ${CONFIG_ENV[@]+"${CONFIG_ENV[@]}"} uv run --project "$HOOK_DIR" "$@"
 }
 
-# Drop every hook entry that runs record-conversation, whichever checkout or
-# edition it points at, from Stop / UserPromptSubmit / SessionEnd. With a
-# command given, add that back as the one entry for each event.
+# Fail before changing anything if settings.json is there but is not JSON:
+# rewriting it would mean either refusing half-way through an install or
+# throwing away whatever the user had in it.
+check_settings() {
+    [[ -f "$SETTINGS_FILE" ]] || return 0
+    python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' \
+        "$SETTINGS_FILE" 2>/dev/null \
+        || die "${SETTINGS_FILE} is not valid JSON. Fix it, then re-run; nothing was changed."
+}
+
+# Remove every hook that runs record-conversation, whichever checkout or
+# edition it points at, from Stop / UserPromptSubmit / SessionEnd — just that
+# hook, not the rest of a group it shares. With a command given, add that back
+# as the one entry for each event. The original is kept as settings.json.bak,
+# the new file is written beside it and renamed into place, and its
+# indentation and any non-ASCII text are kept as they were.
 rewrite_hooks() {
     python3 - "$SETTINGS_FILE" "${1:-}" <<'PYEOF'
-import json, sys
+import json, os, re, shutil, sys
 
 settings_path, hook_cmd = sys.argv[1], sys.argv[2]
-with open(settings_path) as f:
-    data = json.load(f)
+with open(settings_path, encoding="utf-8") as f:
+    original = f.read()
+data = json.loads(original) if original.strip() else {}
+
+# The indentation the file already uses: the first indented line's.
+m = re.search(r"\n([ \t]+)\S", original)
+indent = m.group(1) if m else 2
+if isinstance(indent, str) and set(indent) == {" "}:
+    indent = len(indent)
+
+def ours(h):
+    return isinstance(h, dict) and "record-conversation" in h.get("command", "")
 
 hooks = data.setdefault("hooks", {})
 for event in ("Stop", "UserPromptSubmit", "SessionEnd"):
-    kept = [
-        g for g in hooks.get(event, [])
-        if not any(
-            isinstance(h, dict) and "record-conversation" in h.get("command", "")
-            for h in g.get("hooks", [])
-        )
-    ]
+    kept = []
+    for g in hooks.get(event, []):
+        if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+            rest = [h for h in g["hooks"] if not ours(h)]
+            if not rest:
+                continue  # the group was only ours
+            g = {**g, "hooks": rest}
+        kept.append(g)
     if hook_cmd:
         kept.append({
             "matcher": "",
@@ -171,10 +204,18 @@ for event in ("Stop", "UserPromptSubmit", "SessionEnd"):
         hooks[event] = kept
     else:
         hooks.pop(event, None)
+if not hooks:
+    data.pop("hooks", None)
 
-with open(settings_path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
+text = json.dumps(data, indent=indent, ensure_ascii=False) + "\n"
+if text == original:
+    sys.exit(0)
+shutil.copy2(settings_path, settings_path + ".bak")
+tmp = f"{settings_path}.tmp.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(text)
+shutil.copymode(settings_path, tmp)
+os.replace(tmp, settings_path)
 PYEOF
 }
 
@@ -243,6 +284,10 @@ done
 # ---------------------------------------------------------------------------
 # Maintenance actions — these do not reinstall anything
 # ---------------------------------------------------------------------------
+
+if [[ "$ACTION" == "install" || "$ACTION" == "uninstall" ]]; then
+    check_settings
+fi
 
 case "$ACTION" in
     drain)
@@ -321,6 +366,12 @@ fi
 if [[ "$PROVIDER" == "openai" ]]; then
     OPENAI_API_KEY="${OPENAI_API_KEY:-$(config_get OPENAI_API_KEY)}"
 fi
+if [[ "$PROVIDER" == "bedrock" ]]; then
+    AWS_PROFILE="${AWS_PROFILE:-$(config_get AWS_PROFILE)}"
+    AWS_REGION="${AWS_REGION:-$(config_get AWS_REGION)}"
+    AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$(config_get AWS_DEFAULT_REGION)}"
+fi
+SSL_CERT_FILE="${SSL_CERT_FILE:-$(config_get SSL_CERT_FILE)}"
 
 _DEFAULT_MODELS_ollama="mxbai-embed-large"
 _DEFAULT_MODELS_bedrock="amazon.titan-embed-text-v2:0"
