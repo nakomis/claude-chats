@@ -469,8 +469,11 @@ def test_new_conversations_go_before_a_backfill(conn):
 def test_a_conversation_scoped_since_reads_whole_conversations(conn):
     """The single machine (FACTS_SINCE_SCOPE=conversation): a conversation going on at install
     time is left alone, and a backfill later reads it from its first message, not its middle."""
-    seed(conn, "straddles", [("martin", "before m1", 0), ("claude", "before c1", 1),
-                             ("martin", "after m2", 120), ("claude", "after c2", 121), ("martin", "after m3", 125)])
+    cid = seed(conn, "straddles", [("martin", "before m1", 0), ("claude", "before c1", 1),
+                                   ("martin", "after m2", 120), ("claude", "after c2", 121),
+                                   ("martin", "after m3", 125)])
+    # As the drain records it: when the first message was sent.
+    conn.execute("UPDATE conversations SET started_at = %s WHERE id = %s", (T0, cid))
     install = (T0 + timedelta(minutes=60)).isoformat()
     ex = FakeExtractor()
     service.run(conn, service.Config(embed_url="x", since=install, since_scope="conversation"), ex, fake_embed)
