@@ -187,6 +187,34 @@ def test_local_round_trip(db):
 
 
 @needs_db
+def test_a_lone_backslash_dot_line_in_an_archived_month_restores(db):
+    """A message whose content has a line that is only `\\.` (19 Nov 2026).
+
+    psql treats such a line as the end of COPY data, even inside a quoted CSV
+    field and whichever way the data reaches it (stdin, pstdin, \\copy from a
+    file), so a month loaded through psql stopped there with "unterminated CSV
+    quoted field". It happened for real: a pg_dump excerpt pasted into a session
+    in September. The months are loaded by the server from a file instead.
+    """
+    import psycopg
+    dsn, env, tmp = db
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        oldest = _months_ago(conn, 2)
+        conn.execute(
+            "UPDATE messages SET content = 'COPY public.t (a) FROM stdin;' || chr(10) || '1' "
+            "|| chr(10) || '\\.' || chr(10) || 'after the marker' "
+            "WHERE message_uuid = (SELECT message_uuid FROM messages "
+            "WHERE to_char(created_at, 'YYYY-MM') = %s ORDER BY id LIMIT 1)",
+            (oldest,))
+    backups = tmp / "backups"
+    before = _snapshot(dsn)
+
+    _ok(_run(env, "backup.sh", str(backups)))
+    _ok(_run(env, "restore.sh", "--local", str(backups), "--yes", "--no-backfill"))
+    assert _snapshot(dsn) == before
+
+
+@needs_db
 def test_local_nightlies_are_pruned_but_months_never_are(db):
     dsn, env, tmp = db
     backups = tmp / "backups"

@@ -4,8 +4,9 @@
 # named after the container is run from $STUB_PG_BIN (or PATH), with the
 # in-container socket (`-h /var/run/postgresql`) replaced by PGHOST/PGPORT.
 #
-# For running tests/test_convmem_backup.py on a machine without Docker. CI uses
-# the real `docker exec` into the pgvector service container instead.
+# For running tests/test_convmem_backup.py on a machine without Docker, against
+# a server on this machine (restore.sh's COPY FROM reads a file the stub writes
+# locally). CI uses the real `docker exec` into the pgvector service container.
 #
 #   STUB_PG_HOST, STUB_PG_PORT   where the server listens
 #   STUB_PG_BIN                  directory of psql/pg_dump matching the server
@@ -21,6 +22,13 @@ case "${1:-}" in
         [ "${1:-}" = "-i" ] && shift
         shift   # the container
         tool="$1"; shift
+        # restore.sh stages each archived month as a file "in the container"
+        # (`sh -c 'cat > /tmp/…'`) for the server's COPY FROM, then removes it.
+        # Here the server is local (STUB_PG_HOST), so run those on this host:
+        # the server then reads the same path.
+        case "$tool" in
+            sh|rm) exec "$tool" "$@" ;;
+        esac
         args=()
         while [ $# -gt 0 ]; do
             if [ "$1" = "-h" ] && [ "${2:-}" = "/var/run/postgresql" ]; then
