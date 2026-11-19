@@ -36,7 +36,7 @@ Deduplication happens locally, because the hook re-reads the whole transcript on
 
 A message sent while Claude is still working isn't written as a message at all. Claude Code records it as a `queued_command` attachment, and until HOME-411 the hook dropped it, pictures and all. It is now captured like any other message. So that rows already delivered keep their numbers, it shares the `sequence_num` of the message before it, and `created_at` settles the order. `scripts/backfill-mid-turn.py` recovers the ones missed before the fix; run it on each Mac.
 
-Each row's `author` (`martin`, `claude` or `tool`) comes from the transcript's structure, not its text: see `classify_author`. Rows captured before that existed say `unknown`. `scripts/backfill-authors.py` sets them from whatever transcripts survive, including ones restored from Time Machine, and from `role` for assistant rows; it prints SQL to review and pipe into Postgres on Luke.
+Each row's `author` (`martin`, `claude` or `tool`) comes from the transcript's structure, not its text: see `classify_author`. Rows captured before that existed say `unknown`. `scripts/backfill-authors.py` sets them from whatever transcripts survive, including ones restored from Time Machine, and from `role` for assistant rows; it prints SQL to review and pipe into Postgres on Mace.
 
 ### Delivery — the ingest hop (lives in `home-infra`)
 
@@ -44,13 +44,13 @@ This half is **not in this repository**. It lives in [`nakomis/home-infra`](http
 
 A **Rust forwarder** (`mac/conversation-memory-forwarder`) runs on each Mac, drains the outbox and posts each message to an **SQS** queue, age-encrypted to the consumer's public key. Payloads over 200 KB go to an **S3 claim-check bucket** instead, with the message carrying the reference. It authenticates with **IAM Roles Anywhere** — an mTLS certificate from the home CA, pinned by CN per machine — so there are no static access keys, and its role is send-only: it cannot read back what it enqueued. It holds no database connection at all, which is precisely what keeps Postgres off the internet.
 
-An **embedding-consumer** on Cal polls the queue, decrypts, embeds via its local Ollama, and upserts into Luke's Postgres. It deletes the message only after the commit, so an at-least-once redelivery rewrites identical rows rather than losing one. Repeated failures land in a **DLQ**.
+An **embedding-consumer** on Cal polls the queue, decrypts, embeds with Ollama (Cere's, an M1, since 19 Nov 2026; Cal's own before that), and upserts into Postgres on Mace. It deletes the message only after the commit, so an at-least-once redelivery rewrites identical rows rather than losing one. Repeated failures land in a **DLQ**.
 
 That shape is what makes the roaming case work: an expired credential, or a train with no signal, becomes a *delay* rather than a lost message.
 
 ### Storage and recall
 
-**PostgreSQL + pgvector** on Luke holds `conversations` and `messages`, the latter carrying both a `vector(1024)` embedding (ivfflat, cosine) and a generated `tsvector` (GIN). The `host` column records which machine a conversation happened on, so search can span every machine or filter to one. It is reachable only on the LAN.
+**PostgreSQL + pgvector** on Mace holds `conversations` and `messages`, the latter carrying both a `vector(1024)` embedding (ivfflat, cosine) and a generated `tsvector` (GIN). The `host` column records which machine a conversation happened on, so search can span every machine or filter to one. It is reachable only on the LAN.
 
 The **MCP server** (`mcp/`) runs on the client and queries that Postgres **directly**, embedding only the search query locally — which is why a client still needs an embedding provider configured even though it never embeds a message. Recall therefore works on the LAN, not while roaming.
 
@@ -89,10 +89,10 @@ The distributed system is installed from two repositories, because it is built f
 **From here:** the hook and the MCP server on each client.
 
 ```bash
-SERVER_HOST=luke.local ./install-client.sh
+SERVER_HOST=mace.local ./install-client.sh
 ```
 
-That installs the dependencies, registers the MCP server against Luke's Postgres, and configures the `Stop` and `UserPromptSubmit` hooks. Re-running is safe — every step is idempotent.
+That installs the dependencies, registers the MCP server against Mace's Postgres (port 5432; `SERVER_PORT` overrides it), and configures the `Stop` and `UserPromptSubmit` hooks. Re-running is safe — every step is idempotent.
 
 Without the forwarder from `home-infra`, the outbox fills and nothing drains it — this repository is capture and recall, not delivery. If you want something that works end to end from a single checkout, use the [single-machine edition](localhost/README.md).
 
@@ -216,16 +216,16 @@ date bound is an ordinary predicate.
 
 ## Database
 
-PostgreSQL + pgvector runs in Docker on Luke, published on port 5433 and reachable only on the LAN — it is never exposed to the internet, which is the constraint the whole ingest design is built around.
+PostgreSQL + pgvector runs in Docker on Mace, published on port 5432 and reachable only on the LAN — it is never exposed to the internet, which is the constraint the whole ingest design is built around.
 
 ```bash
 # From anywhere on the home network
-psql -h luke.local -p 5433 -U claude claude_chats
+psql -h mace.local -p 5432 -U claude claude_chats
 ```
 
 `init.sql` is the source of truth for the schema. It is vendored into `home-infra` for the deployed copy, and `tests/test_pg_schema.py` pins a checksum of the DDL so the two cannot silently drift.
 
-Both editions back up the same way, from the same script: `scripts/convmem-archive.sh` (CHATS-41, from HOME-458). Each complete month of messages is exported once to a permanent archive, and the nightly dump carries the schema, every other table whole (conversations and Claude Facts) and only the messages not yet archived. The cutoff between the two is derived from what is verified present in the archive, so a failed archive makes the nightly bigger and never leaves a month in neither place. On Luke the target is S3 (`s3://nakomis-convmem-archive/` for months, `s3://nakomis-taiga-backups/conversation-memory/` for nightlies); `home-infra` vendors the script, pinned to the same checksum as `tests/test_convmem_backup.py`, and runs it from its own nightly service, which owns the alerting. The single-machine edition aims it at `~/.claude-chats/backups/` through `scripts/backup.sh`, scheduled nightly by `localhost/install.sh`. `scripts/restore.sh` restores either: the newest nightly plus every archived month before its cutoff (`--s3` reads as `nakom.is-admin`, since the backup identity cannot read objects). The old Mac-to-S3 LaunchAgent (`setup-backup.sh`) is retired; its `backup.sh --s3` run is now refused, and while its plist is still installed every local backup warns (in Notification Centre too) and says how to remove it.
+Both editions back up the same way, from the same script: `scripts/convmem-archive.sh` (CHATS-41, from HOME-458). Each complete month of messages is exported once to a permanent archive, and the nightly dump carries the schema, every other table whole (conversations and Claude Facts) and only the messages not yet archived. The cutoff between the two is derived from what is verified present in the archive, so a failed archive makes the nightly bigger and never leaves a month in neither place. On Mace the target is S3 (`s3://nakomis-convmem-archive/` for months, `s3://nakomis-taiga-backups/conversation-memory/` for nightlies); `home-infra` vendors the script, pinned to the same checksum as `tests/test_convmem_backup.py`, and runs it from its own nightly service, which owns the alerting. The single-machine edition aims it at `~/.claude-chats/backups/` through `scripts/backup.sh`, scheduled nightly by `localhost/install.sh`. `scripts/restore.sh` restores either: the newest nightly plus every archived month before its cutoff (`--s3` reads as `nakom.is-admin`, since the backup identity cannot read objects). Each archived month is loaded by the server from a file staged in the container, not through psql's stdin: psql ends COPY data at any line that is only `\.`, even inside a quoted CSV field, which cut a month short on the 19 Nov 2026 restore. The old Mac-to-S3 LaunchAgent (`setup-backup.sh`) is retired; its `backup.sh --s3` run is now refused, and while its plist is still installed every local backup warns (in Notification Centre too) and says how to remove it.
 
 ## Possible future enhancements
 

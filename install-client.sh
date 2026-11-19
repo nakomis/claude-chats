@@ -13,6 +13,7 @@
 #
 # Usage:
 #   SERVER_HOST=myserver.local bash install-client.sh
+#   SERVER_PORT=5432 (default)  the database's port on SERVER_HOST
 
 set -euo pipefail
 
@@ -68,7 +69,9 @@ _DEFAULT_MODELS_openai="text-embedding-3-small"
 _default_model_var="_DEFAULT_MODELS_${PROVIDER}"
 MODEL="${CLAUDE_CHATS_MODEL:-${!_default_model_var:-mxbai-embed-large}}"
 
-DB_URL="postgresql://claude:claude@${SERVER_HOST}:5433/claude_chats"
+# 5432: claude-chats-db's port on the database host (Mace; Luke before it).
+# 5433 was the superseded server/ design's, and never matched the real host.
+DB_URL="postgresql://claude:claude@${SERVER_HOST}:${SERVER_PORT:-5432}/claude_chats"
 QUEUE_URL="stomp://${SERVER_HOST}:61613"
 
 _SSL_PREFIX=""

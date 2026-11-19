@@ -72,7 +72,13 @@ die() { echo "[restore] ERROR: $*" >&2; exit 1; }
 say() { echo "[restore] $*"; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/claude-chats-restore-XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# Where each archived month is staged inside the container for COPY (see step 4).
+IN_CONTAINER_CSV="/tmp/convmem-restore-$$.csv"
+cleanup() {
+    rm -rf "$WORK"
+    "$DOCKER" exec "$CONTAINER" rm -f "$IN_CONTAINER_CSV" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 psql_in() {
     "$DOCKER" exec -i "$CONTAINER" psql -h /var/run/postgresql -U "$DB_USER" "$@"
@@ -240,8 +246,15 @@ while read -r month size name <&3; do
     # The file's own header is the column list, so a month cut before a column
     # existed still loads; HEADER match makes Postgres check it line for line.
     cols="$( (gunzip -c "$file" || true) | head -1 | sed 's/,/, /g')"
-    loaded="$(gunzip -c "$file" | psql_in -d "$DB_NAME" -v ON_ERROR_STOP=1 \
-        -c "COPY public.messages (${cols}) FROM stdin WITH (FORMAT csv, HEADER match)")"
+    # The server reads the month from a file in the container, not psql from
+    # stdin: psql ends COPY data at any line that is only `\.`, even inside a
+    # quoted CSV field (and \copy and pstdin do the same), so a message
+    # containing one, such as a pasted pg_dump, cut the month short with
+    # "unterminated CSV quoted field". The server's CSV parser honours quotes.
+    gunzip -c "$file" | "$DOCKER" exec -i "$CONTAINER" sh -c "cat > '${IN_CONTAINER_CSV}'"
+    loaded="$(psql_in -d "$DB_NAME" -v ON_ERROR_STOP=1 </dev/null \
+        -c "COPY public.messages (${cols}) FROM '${IN_CONTAINER_CSV}' WITH (FORMAT csv, HEADER match)")"
+    "$DOCKER" exec "$CONTAINER" rm -f "$IN_CONTAINER_CSV"
     [[ "$loaded" == "COPY ${rows}" ]] || die "${name}: expected ${rows} rows, Postgres said '${loaded}'"
     say "${month}: ${rows} messages"
     [[ "$SRC" == "s3" ]] && rm -f "$file"
